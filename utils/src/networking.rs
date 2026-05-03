@@ -7,7 +7,9 @@ use std::{
     net::{AddrParseError, IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr},
     ops::Deref,
     str::FromStr,
+    time::Duration,
 };
+use thiserror::Error;
 use uuid::Uuid;
 use wasm_bindgen::prelude::*;
 
@@ -341,6 +343,209 @@ impl Display for ContextualNetAddress {
         }
     }
 }
+
+/// Maximum wall-clock time for one DNS lookup attempt by
+/// [`PeerEndpoint::resolve`]. Bounded so a slow or unreachable
+/// resolver cannot stall the dial loop or the RPC handler.
+pub const PEER_ENDPOINT_RESOLVE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Errors from textual parsing of a [`PeerEndpoint`].
+#[derive(Error, Debug, PartialEq, Eq, Clone)]
+pub enum PeerEndpointParseError {
+    #[error("empty endpoint string")]
+    Empty,
+    #[error("invalid port `{0}`")]
+    InvalidPort(String),
+    #[error("invalid hostname: {reason}")]
+    InvalidHostname { reason: &'static str },
+}
+
+/// Errors from async DNS resolution of a [`PeerEndpoint`].
+#[derive(Error, Debug)]
+pub enum PeerEndpointResolveError {
+    #[error("DNS lookup of `{host}` timed out after {timeout:?}")]
+    Timeout { host: String, timeout: Duration },
+    #[error("DNS lookup of `{host}` failed: {source}")]
+    Lookup { host: String, source: std::io::Error },
+}
+
+/// Wrap a hostname-resolution future in the canonical
+/// [`PEER_ENDPOINT_RESOLVE_TIMEOUT`]. Extracted so unit tests can drive
+/// the timeout path with a synthetic future under
+/// [`tokio::time::pause`], independent of the OS resolver -- the
+/// previous in-tree test relied on a `.invalid` hostname returning
+/// NXDOMAIN in milliseconds, which never exercised the timeout wrapper.
+#[cfg(not(target_arch = "wasm32"))]
+async fn resolve_with_timeout<F>(host: &str, lookup: F) -> Result<Vec<NetAddress>, PeerEndpointResolveError>
+where
+    F: std::future::Future<Output = std::io::Result<Vec<SocketAddr>>>,
+{
+    let resolved = tokio::time::timeout(PEER_ENDPOINT_RESOLVE_TIMEOUT, lookup)
+        .await
+        .map_err(|_| PeerEndpointResolveError::Timeout { host: host.to_owned(), timeout: PEER_ENDPOINT_RESOLVE_TIMEOUT })?
+        .map_err(|source| PeerEndpointResolveError::Lookup { host: host.to_owned(), source })?;
+    Ok(resolved.into_iter().map(NetAddress::from).collect())
+}
+
+/// A peer endpoint as accepted from operator-facing inputs (`kaspad
+/// --addpeer/--connect`, the kaspa-cli interactive `addpeer`, the RPC
+/// `AddPeer` method).
+///
+/// Either a numeric IP literal (already resolved) or a textual
+/// hostname (resolved at dial time, never at parse time). The
+/// distinction is preserved as first-class state so the connection
+/// manager can periodically re-resolve hostname-origin entries and
+/// reconcile the resulting socket-address sets.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+pub enum PeerEndpoint {
+    /// Numeric IP literal -- no DNS required at any point in its lifecycle.
+    Address(ContextualNetAddress),
+    /// Textual hostname -- resolved by the connection manager.
+    Hostname { host: String, port: Option<u16> },
+}
+
+impl PeerEndpoint {
+    /// Textual parse only -- never performs DNS.
+    ///
+    /// Order of operations: try [`ContextualNetAddress::from_str`]
+    /// first (catches every numeric form including bracketed IPv6);
+    /// if that fails, treat the input as a hostname and validate it
+    /// under a strict RFC 1123 policy: total length 1..=253; labels
+    /// separated by `.`; each label 1..=63 ASCII letters, digits,
+    /// hyphens; no leading/trailing hyphen per label; no underscores;
+    /// no empty labels. Hostnames are stored ASCII-lowercased so
+    /// case-different inputs map to the same registry entry (RFC 1123
+    /// §2.1: hostnames are case-insensitive).
+    pub fn parse(s: &str) -> Result<Self, PeerEndpointParseError> {
+        let s = s.trim();
+        if s.is_empty() {
+            return Err(PeerEndpointParseError::Empty);
+        }
+        if let Ok(addr) = ContextualNetAddress::from_str(s) {
+            return Ok(Self::Address(addr));
+        }
+        let (host, port) = split_host_port(s)?;
+        validate_hostname_rfc1123(host)?;
+        Ok(Self::Hostname { host: host.to_ascii_lowercase(), port })
+    }
+
+    /// Async resolution to one or more [`NetAddress`] records.
+    ///
+    /// `Address` variants resolve trivially (no DNS). `Hostname`
+    /// variants call [`tokio::net::lookup_host`] wrapped in
+    /// [`tokio::time::timeout`] with [`PEER_ENDPOINT_RESOLVE_TIMEOUT`].
+    /// Multi-record results yield one `NetAddress` per resolved
+    /// socket address, in the order returned by the OS resolver.
+    pub async fn resolve(&self, default_port: u16) -> Result<Vec<NetAddress>, PeerEndpointResolveError> {
+        match self {
+            Self::Address(addr) => Ok(vec![addr.normalize(default_port)]),
+            Self::Hostname { host, port } => {
+                let port = port.unwrap_or(default_port);
+                let target = format!("{host}:{port}");
+                let lookup = async move {
+                    let iter = tokio::net::lookup_host(target).await?;
+                    Ok::<Vec<SocketAddr>, std::io::Error>(iter.collect())
+                };
+                resolve_with_timeout(host, lookup).await
+            }
+        }
+    }
+
+    /// Hostname for diagnostics; `None` for the `Address` variant.
+    pub fn hostname(&self) -> Option<&str> {
+        match self {
+            Self::Address(_) => None,
+            Self::Hostname { host, .. } => Some(host.as_str()),
+        }
+    }
+}
+
+impl Display for PeerEndpoint {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Address(addr) => addr.fmt(f),
+            Self::Hostname { host, port: None } => f.write_str(host),
+            Self::Hostname { host, port: Some(p) } => write!(f, "{host}:{p}"),
+        }
+    }
+}
+
+impl FromStr for PeerEndpoint {
+    type Err = PeerEndpointParseError;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        Self::parse(s)
+    }
+}
+
+impl TryFrom<&str> for PeerEndpoint {
+    type Error = PeerEndpointParseError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        Self::parse(s)
+    }
+}
+
+impl TryFrom<String> for PeerEndpoint {
+    type Error = PeerEndpointParseError;
+    fn try_from(s: String) -> Result<Self, Self::Error> {
+        Self::parse(&s)
+    }
+}
+
+/// Split a hostname-form input into `(host, optional port)`. IPv6
+/// numeric literals are caught earlier by the numeric parse path, so
+/// `s` here is guaranteed not to contain `[`/`]` brackets -- the only
+/// `:` that may appear is the port separator.
+fn split_host_port(s: &str) -> Result<(&str, Option<u16>), PeerEndpointParseError> {
+    match s.rfind(':') {
+        None => Ok((s, None)),
+        Some(idx) => {
+            let (host, rest) = s.split_at(idx);
+            let port_str = &rest[1..];
+            if port_str.is_empty() {
+                return Err(PeerEndpointParseError::InvalidPort(rest.to_owned()));
+            }
+            let port = port_str.parse::<u16>().map_err(|_| PeerEndpointParseError::InvalidPort(port_str.to_owned()))?;
+            Ok((host, Some(port)))
+        }
+    }
+}
+
+/// Validate a hostname under RFC 1123 with the strict policy used by
+/// `PeerEndpoint::parse`: total length 1..=253; labels separated by
+/// `.`; each label 1..=63 ASCII letters, digits, hyphens; no
+/// leading/trailing hyphen per label; no underscores; no empty
+/// labels. Strict so typos surface at parse time, not during DNS.
+fn validate_hostname_rfc1123(host: &str) -> Result<(), PeerEndpointParseError> {
+    const MAX_HOSTNAME: usize = 253;
+    const MAX_LABEL: usize = 63;
+    if host.is_empty() {
+        return Err(PeerEndpointParseError::InvalidHostname { reason: "empty hostname" });
+    }
+    if host.len() > MAX_HOSTNAME {
+        return Err(PeerEndpointParseError::InvalidHostname { reason: "hostname exceeds 253 characters" });
+    }
+    for label in host.split('.') {
+        if label.is_empty() {
+            return Err(PeerEndpointParseError::InvalidHostname { reason: "empty label (consecutive '.' or leading/trailing '.')" });
+        }
+        if label.len() > MAX_LABEL {
+            return Err(PeerEndpointParseError::InvalidHostname { reason: "label exceeds 63 characters" });
+        }
+        let bytes = label.as_bytes();
+        if bytes[0] == b'-' || bytes[bytes.len() - 1] == b'-' {
+            return Err(PeerEndpointParseError::InvalidHostname { reason: "label starts or ends with hyphen" });
+        }
+        for &b in bytes {
+            if !(b.is_ascii_alphanumeric() || b == b'-') {
+                return Err(PeerEndpointParseError::InvalidHostname {
+                    reason: "label contains non-LDH (non-letter/digit/hyphen) character",
+                });
+            }
+        }
+    }
+    Ok(())
+}
+
 #[derive(PartialEq, Eq, Hash, Copy, Clone, Serialize, Deserialize, Debug, Default)]
 #[repr(transparent)]
 pub struct PeerId(pub Uuid);
@@ -583,5 +788,255 @@ mod tests {
 
         // Broadcast ip
         assert!(!IpAddress::from_str("255.255.255.255").unwrap().is_publicly_routable());
+    }
+
+    // ---------------------------------------------------------------
+    // PeerEndpoint tests
+    // ---------------------------------------------------------------
+
+    fn assert_address(ep: &PeerEndpoint, ip: &str, port: Option<u16>) {
+        match ep {
+            PeerEndpoint::Address(a) => {
+                assert_eq!(a, &ContextualNetAddress::new(IpAddress::from_str(ip).unwrap(), port), "address mismatch");
+            }
+            other => panic!("expected Address variant, got {other:?}"),
+        }
+    }
+
+    fn assert_hostname(ep: &PeerEndpoint, host: &str, port: Option<u16>) {
+        match ep {
+            PeerEndpoint::Hostname { host: h, port: p } => {
+                assert_eq!(h, host);
+                assert_eq!(*p, port);
+            }
+            other => panic!("expected Hostname variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn peer_endpoint_parses_ipv4() {
+        assert_address(&PeerEndpoint::parse("1.2.3.4").unwrap(), "1.2.3.4", None);
+        assert_address(&PeerEndpoint::parse("1.2.3.4:16111").unwrap(), "1.2.3.4", Some(16111));
+    }
+
+    #[test]
+    fn peer_endpoint_parses_ipv6_bracketed() {
+        assert_address(&PeerEndpoint::parse("::1").unwrap(), "::1", None);
+        assert_address(&PeerEndpoint::parse("[::1]:16111").unwrap(), "::1", Some(16111));
+    }
+
+    #[test]
+    fn peer_endpoint_parses_hostname_no_port() {
+        assert_hostname(&PeerEndpoint::parse("node.example.com").unwrap(), "node.example.com", None);
+    }
+
+    #[test]
+    fn peer_endpoint_parses_hostname_with_port() {
+        assert_hostname(&PeerEndpoint::parse("node.example.com:16111").unwrap(), "node.example.com", Some(16111));
+    }
+
+    #[test]
+    fn peer_endpoint_parses_hostname_subdomain() {
+        assert_hostname(&PeerEndpoint::parse("pod-1.svc.cluster.local").unwrap(), "pod-1.svc.cluster.local", None);
+    }
+
+    #[test]
+    fn peer_endpoint_parses_hostname_lowercases_input() {
+        // RFC 1123 hostnames are case-insensitive; the parser canonicalises to
+        // ASCII-lowercase so case-different inputs map to the same registry entry.
+        assert_hostname(&PeerEndpoint::parse("Foo.Example.COM").unwrap(), "foo.example.com", None);
+        assert_hostname(&PeerEndpoint::parse("NODE.example.com:16111").unwrap(), "node.example.com", Some(16111));
+        assert_eq!(
+            PeerEndpoint::parse("Foo.Example.com").unwrap(),
+            PeerEndpoint::parse("foo.example.COM").unwrap(),
+            "case-different inputs must compare equal after parse",
+        );
+    }
+
+    #[test]
+    fn peer_endpoint_rejects_underscore() {
+        let err = PeerEndpoint::parse("host_with_underscore.example.com").unwrap_err();
+        assert!(matches!(err, PeerEndpointParseError::InvalidHostname { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn peer_endpoint_rejects_double_dot() {
+        let err = PeerEndpoint::parse("host..example.com").unwrap_err();
+        assert!(matches!(err, PeerEndpointParseError::InvalidHostname { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn peer_endpoint_rejects_label_too_long() {
+        let label = "a".repeat(64);
+        let input = format!("{label}.example.com");
+        let err = PeerEndpoint::parse(&input).unwrap_err();
+        assert!(matches!(err, PeerEndpointParseError::InvalidHostname { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn peer_endpoint_rejects_total_too_long() {
+        // 254 chars total, all valid LDH labels.
+        let label = "a".repeat(63);
+        // 63 + 1 + 63 + 1 + 63 + 1 + 63 = 255 chars, all-LDH labels.
+        let input = format!("{label}.{label}.{label}.{label}");
+        assert!(input.len() > 253);
+        let err = PeerEndpoint::parse(&input).unwrap_err();
+        assert!(matches!(err, PeerEndpointParseError::InvalidHostname { .. }), "got {err:?}");
+    }
+
+    #[test]
+    fn peer_endpoint_rejects_garbage() {
+        for input in
+            ["", "   ", "not a host", ":::", ":80", "host:", "host:abc", "-leadinghyphen.example.com", "trailinghyphen-.example.com"]
+        {
+            assert!(PeerEndpoint::parse(input).is_err(), "expected error parsing {input:?}");
+        }
+    }
+
+    #[test]
+    fn peer_endpoint_borsh_roundtrip_address() {
+        let ep = PeerEndpoint::parse("1.2.3.4:16111").unwrap();
+        let bytes = borsh::to_vec(&ep).unwrap();
+        let back: PeerEndpoint = BorshDeserialize::try_from_slice(&bytes).unwrap();
+        assert_eq!(ep, back);
+    }
+
+    #[test]
+    fn peer_endpoint_borsh_roundtrip_hostname() {
+        let ep = PeerEndpoint::parse("node.example.com:16111").unwrap();
+        let bytes = borsh::to_vec(&ep).unwrap();
+        let back: PeerEndpoint = BorshDeserialize::try_from_slice(&bytes).unwrap();
+        assert_eq!(ep, back);
+        let ep_no_port = PeerEndpoint::parse("node.example.com").unwrap();
+        let bytes = borsh::to_vec(&ep_no_port).unwrap();
+        let back: PeerEndpoint = BorshDeserialize::try_from_slice(&bytes).unwrap();
+        assert_eq!(ep_no_port, back);
+    }
+
+    #[test]
+    fn peer_endpoint_display_canonical() {
+        // For every supported textual form, Display::fmt round-trips through from_str.
+        for input in
+            ["1.2.3.4", "1.2.3.4:16111", "[::1]:16111", "node.example.com", "node.example.com:16111", "pod-1.svc.cluster.local"]
+        {
+            let parsed = PeerEndpoint::parse(input).unwrap();
+            let displayed = parsed.to_string();
+            let reparsed = PeerEndpoint::parse(&displayed).unwrap();
+            assert_eq!(parsed, reparsed, "Display round-trip failed for {input:?} -> {displayed:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn peer_endpoint_resolve_address_variant() {
+        let ep = PeerEndpoint::parse("1.2.3.4:16111").unwrap();
+        let addrs = ep.resolve(0).await.unwrap();
+        assert_eq!(addrs, vec![NetAddress::new(IpAddress::from_str("1.2.3.4").unwrap(), 16111)]);
+        // Address variant with no port falls back to the default_port argument.
+        let ep_no_port = PeerEndpoint::parse("1.2.3.4").unwrap();
+        let addrs = ep_no_port.resolve(16211).await.unwrap();
+        assert_eq!(addrs, vec![NetAddress::new(IpAddress::from_str("1.2.3.4").unwrap(), 16211)]);
+    }
+
+    #[tokio::test]
+    async fn peer_endpoint_resolve_localhost() {
+        let ep = PeerEndpoint::parse("localhost").unwrap();
+        let addrs = ep.resolve(0).await.expect("localhost must resolve via OS resolver");
+        assert!(!addrs.is_empty(), "expected at least one resolved address for localhost");
+        assert!(
+            addrs.iter().any(|a| a.ip == IpAddress::from_str("127.0.0.1").unwrap() || a.ip == IpAddress::from_str("::1").unwrap()),
+            "expected 127.0.0.1 or ::1 in {addrs:?}",
+        );
+    }
+
+    /// Drive the timeout path with a synthetic lookup future that pends
+    /// past [`PEER_ENDPOINT_RESOLVE_TIMEOUT`] under paused tokio time.
+    /// The wrapper must yield [`PeerEndpointResolveError::Timeout`] in
+    /// virtual time without blocking the runtime on real wall-clock
+    /// duration.
+    #[tokio::test(start_paused = true)]
+    async fn peer_endpoint_resolve_timeout_wrapper_fires() {
+        let host = "fake.kas947.example";
+        let lookup = async {
+            // Sleep one full second past the wrapper's deadline so the
+            // timeout arm wins the race deterministically. Under
+            // `start_paused`, tokio auto-advances virtual time when the
+            // runtime is otherwise idle.
+            tokio::time::sleep(PEER_ENDPOINT_RESOLVE_TIMEOUT + Duration::from_secs(1)).await;
+            Ok(Vec::new())
+        };
+        let start = tokio::time::Instant::now();
+        let result = resolve_with_timeout(host, lookup).await;
+        let elapsed = start.elapsed();
+        match result {
+            Err(PeerEndpointResolveError::Timeout { host: h, timeout }) => {
+                assert_eq!(h, host);
+                assert_eq!(timeout, PEER_ENDPOINT_RESOLVE_TIMEOUT);
+            }
+            other => panic!("expected Timeout error, got {other:?}"),
+        }
+        assert!(
+            elapsed >= PEER_ENDPOINT_RESOLVE_TIMEOUT,
+            "wrapper must wait at least the full timeout in virtual time before firing; elapsed = {elapsed:?}",
+        );
+        assert!(
+            elapsed < PEER_ENDPOINT_RESOLVE_TIMEOUT + Duration::from_secs(1),
+            "wrapper must fire at the timeout, not after the inner sleep finishes; elapsed = {elapsed:?}",
+        );
+    }
+
+    /// Counterpart to the timeout test: a lookup that resolves before
+    /// the deadline propagates its `Vec<SocketAddr>` payload through the
+    /// wrapper without spurious timeout errors.
+    #[tokio::test(start_paused = true)]
+    async fn peer_endpoint_resolve_timeout_wrapper_returns_payload() {
+        let host = "fake.kas947.example";
+        let payload: Vec<SocketAddr> = vec!["127.0.0.1:42101".parse().unwrap()];
+        let payload_clone = payload.clone();
+        let lookup = async move {
+            // Brief virtual-time delay well under the timeout.
+            tokio::time::sleep(Duration::from_millis(10)).await;
+            Ok(payload_clone)
+        };
+        let result = resolve_with_timeout(host, lookup).await.expect("wrapper must propagate the inner Ok payload");
+        let resolved_sockets: Vec<SocketAddr> = result.into_iter().map(SocketAddr::from).collect();
+        assert_eq!(resolved_sockets, payload);
+    }
+
+    /// An inner `io::Error` propagates as [`PeerEndpointResolveError::Lookup`]
+    /// with the host and source preserved -- the wrapper does NOT swallow
+    /// it as a spurious timeout.
+    #[tokio::test(start_paused = true)]
+    async fn peer_endpoint_resolve_timeout_wrapper_propagates_io_error() {
+        let host = "fake.kas947.example";
+        let lookup = async {
+            Err::<Vec<SocketAddr>, _>(std::io::Error::new(std::io::ErrorKind::ConnectionRefused, "synthetic lookup failure"))
+        };
+        match resolve_with_timeout(host, lookup).await {
+            Err(PeerEndpointResolveError::Lookup { host: h, source }) => {
+                assert_eq!(h, host);
+                assert_eq!(source.kind(), std::io::ErrorKind::ConnectionRefused);
+            }
+            other => panic!("expected Lookup error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn hostname_validator_accepts_rfc1123_examples() {
+        // Battery of RFC 1123 Sec.2.1 / RFC 952 examples that MUST pass the strict validator.
+        for host in [
+            "a",
+            "example",
+            "example.com",
+            "node1.example.com",
+            "pod-1.svc.cluster.local",
+            "kaspa-mainnet-01.eu-west-1.compute.internal",
+            "h.h.h.h.h.h.h.h.h.h",
+            "9-leading-digit.example.com",
+            "all-numeric-label.123.example",
+            // Maximum valid label (63 chars).
+            &format!("{}.example.com", "a".repeat(63)),
+        ] {
+            validate_hostname_rfc1123(host).unwrap_or_else(|e| panic!("expected `{host}` to validate, got {e:?}"));
+        }
     }
 }
