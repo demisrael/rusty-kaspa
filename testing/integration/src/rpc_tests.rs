@@ -812,3 +812,60 @@ async fn sanity_test() {
     drop(client);
     daemon.shutdown();
 }
+
+// =============================================================================
+// Hostname endpoint RPC tests
+// =============================================================================
+
+/// `add_peer` over gRPC accepts a hostname endpoint, resolves it, and returns
+/// success.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rpc_add_peer_hostname_localhost_success() {
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args { simnet: true, unsafe_rpc: true, disable_upnp: true, ..Default::default() };
+    let total_fd_limit = fd_budget::test_limit();
+    let mut daemon = Daemon::new_random_with_args(args, total_fd_limit);
+    let client = daemon.start().await;
+    let endpoint = PeerEndpoint::from_str("localhost").unwrap();
+    client.add_peer(endpoint, true).await.expect("hostname endpoint must succeed against the local resolver");
+    client.disconnect().await.unwrap();
+    drop(client);
+    daemon.shutdown();
+}
+
+/// `add_peer` over gRPC with an unresolvable hostname returns
+/// `RpcError::PeerHostResolutionFailed`; the node continues running.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rpc_add_peer_hostname_unresolvable_failure() {
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args { simnet: true, unsafe_rpc: true, disable_upnp: true, ..Default::default() };
+    let total_fd_limit = fd_budget::test_limit();
+    let mut daemon = Daemon::new_random_with_args(args, total_fd_limit);
+    let client = daemon.start().await;
+    let endpoint = PeerEndpoint::from_str("definitely-not-a-real-host-kas947.invalid").unwrap();
+    let err = client.add_peer(endpoint, true).await.expect_err("unresolvable hostname must return an error");
+    let msg = err.to_string();
+    assert!(msg.contains("PeerHostResolutionFailed") || msg.contains("hostname"), "expected resolution failure error, got: {msg}");
+    // Node still up: a follow-up RPC succeeds.
+    let _info = client.get_info_call(None, GetInfoRequest {}).await.expect("node must remain up after RPC failure");
+    client.disconnect().await.unwrap();
+    drop(client);
+    daemon.shutdown();
+}
+
+/// `add_peer` over gRPC with an IPv4 literal takes the same short-circuit
+/// path as before the hostname work landed; this is the IP-only regression
+/// guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn rpc_add_peer_ipv4_unchanged() {
+    use kaspa_utils::networking::{ContextualNetAddress, PeerEndpoint};
+    let args = Args { simnet: true, unsafe_rpc: true, disable_upnp: true, ..Default::default() };
+    let total_fd_limit = fd_budget::test_limit();
+    let mut daemon = Daemon::new_random_with_args(args, total_fd_limit);
+    let client = daemon.start().await;
+    let addr = ContextualNetAddress::from_str("1.2.3.4").unwrap();
+    client.add_peer(PeerEndpoint::Address(addr), true).await.expect("IPv4 literal must succeed");
+    client.disconnect().await.unwrap();
+    drop(client);
+    daemon.shutdown();
+}

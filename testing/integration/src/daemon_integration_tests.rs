@@ -379,3 +379,108 @@ async fn daemon_cleaning_test() {
     assert_eq!(async_runtime.strong_count(), 0);
     assert_eq!(core.strong_count(), 0);
 }
+
+// =============================================================================
+// Hostname endpoint integration tests
+// =============================================================================
+
+/// `--addpeer=localhost:<port>` parses, resolves via the OS resolver, and
+/// kaspad starts cleanly with the resulting socket addresses staged in the
+/// connection request set.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn kaspad_addpeer_hostname_localhost_starts() {
+    init_allocator_with_default_settings();
+    kaspa_core::log::try_init_logger("INFO");
+
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args {
+        devnet: true,
+        disable_upnp: true,
+        add_peers: vec![PeerEndpoint::from_str("localhost").expect("parse hostname")],
+        hostname_refresh_interval_sec: 0,
+        ..Default::default()
+    };
+    let total_fd_limit = 10;
+    let mut kaspad = Daemon::new_random_with_args(args, total_fd_limit);
+    let rpc_client = kaspad.start().await;
+    // If startup made it this far, hostname resolution succeeded and the
+    // node is up. A single round-trip RPC confirms the gRPC server reached
+    // the steady state.
+    assert!(rpc_client.handle_message_id(), "client did not collect server features after addpeer hostname startup");
+    rpc_client.disconnect().await.unwrap();
+    drop(rpc_client);
+    kaspad.shutdown();
+}
+
+/// `--addpeer=127.0.0.1:<port>` (numeric IPv4 literal) takes the same
+/// short-circuit path as before the hostname work landed; this is the
+/// IP-only regression guard.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn kaspad_addpeer_ipv4_unchanged() {
+    init_allocator_with_default_settings();
+    kaspa_core::log::try_init_logger("INFO");
+
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args {
+        devnet: true,
+        disable_upnp: true,
+        add_peers: vec![PeerEndpoint::from_str("127.0.0.1:12345").unwrap()],
+        hostname_refresh_interval_sec: 0,
+        ..Default::default()
+    };
+    let mut kaspad = Daemon::new_random_with_args(args, 10);
+    let rpc_client = kaspad.start().await;
+    assert!(rpc_client.handle_message_id());
+    rpc_client.disconnect().await.unwrap();
+    drop(rpc_client);
+    kaspad.shutdown();
+}
+
+/// `--addpeer=[::1]:<port>` (numeric IPv6 literal) regresses identically.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn kaspad_addpeer_ipv6_unchanged() {
+    init_allocator_with_default_settings();
+    kaspa_core::log::try_init_logger("INFO");
+
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args {
+        devnet: true,
+        disable_upnp: true,
+        add_peers: vec![PeerEndpoint::from_str("[::1]:12345").unwrap()],
+        hostname_refresh_interval_sec: 0,
+        ..Default::default()
+    };
+    let mut kaspad = Daemon::new_random_with_args(args, 10);
+    let rpc_client = kaspad.start().await;
+    assert!(rpc_client.handle_message_id());
+    rpc_client.disconnect().await.unwrap();
+    drop(rpc_client);
+    kaspad.shutdown();
+}
+
+/// `--hostname-refresh-interval=0` is honored: the connection manager
+/// instantiates without a periodic refresh task. Verified indirectly by
+/// successful startup with a hostname endpoint and `interval=0`.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn kaspad_periodic_refresh_disabled_with_zero_interval() {
+    init_allocator_with_default_settings();
+    kaspa_core::log::try_init_logger("INFO");
+
+    use kaspa_utils::networking::PeerEndpoint;
+    let args = Args {
+        devnet: true,
+        disable_upnp: true,
+        add_peers: vec![PeerEndpoint::from_str("localhost").unwrap()],
+        hostname_refresh_interval_sec: 0,
+        ..Default::default()
+    };
+    let mut kaspad = Daemon::new_random_with_args(args, 10);
+    let rpc_client = kaspad.start().await;
+    assert!(rpc_client.handle_message_id());
+    rpc_client.disconnect().await.unwrap();
+    drop(rpc_client);
+    kaspad.shutdown();
+}
+
+// FromStr is used for the hostname endpoints in the tests above.
+use std::str::FromStr;
