@@ -5,7 +5,7 @@ use kaspa_consensus_core::{
 };
 use kaspa_core::kaspad_env::version;
 use kaspa_notify::address::tracker::Tracker;
-use kaspa_utils::networking::ContextualNetAddress;
+use kaspa_utils::networking::{ContextualNetAddress, PeerEndpoint};
 use kaspa_wrpc_server::address::WrpcNetAddress;
 use serde::Deserialize;
 use serde_with::{DisplayFromStr, serde_as};
@@ -44,10 +44,10 @@ pub struct Args {
     pub async_threads: usize,
     #[serde(rename = "connect")]
     #[serde_as(as = "Vec<DisplayFromStr>")]
-    pub connect_peers: Vec<ContextualNetAddress>,
+    pub connect_peers: Vec<PeerEndpoint>,
     #[serde(rename = "addpeer")]
     #[serde_as(as = "Vec<DisplayFromStr>")]
-    pub add_peers: Vec<ContextualNetAddress>,
+    pub add_peers: Vec<PeerEndpoint>,
     #[serde_as(as = "Option<DisplayFromStr>")]
     pub listen: Option<ContextualNetAddress>,
     #[serde(rename = "uacomment")]
@@ -89,6 +89,10 @@ pub struct Args {
     pub disable_dns_seeding: bool,
     #[serde(rename = "nogrpc")]
     pub disable_grpc: bool,
+    /// Interval in seconds at which `--addpeer` / `--connect` hostnames are
+    /// re-resolved by the connection manager. `0` disables periodic
+    /// re-resolution; dial-failure-triggered re-resolution still runs.
+    pub hostname_refresh_interval_sec: u64,
     pub ram_scale: f64,
     pub retention_period_days: Option<f64>,
 
@@ -146,6 +150,7 @@ impl Default for Args {
             disable_upnp: false,
             disable_dns_seeding: false,
             disable_grpc: false,
+            hostname_refresh_interval_sec: 600,
             ram_scale: 1.0,
             retention_period_days: None,
             override_params_file: None,
@@ -273,21 +278,21 @@ pub fn cli() -> Command {
             Arg::new("connect-peers")
                 .long("connect")
                 .env("KASPAD_CONNECTPEERS")
-                .value_name("IP[:PORT]")
+                .value_name("HOST[:PORT]")
                 .action(ArgAction::Append)
                 .require_equals(true)
-                .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Connect only to the specified peers at startup."),
+                .value_parser(clap::value_parser!(PeerEndpoint))
+                .help("Connect only to the specified peers at startup. Accepts IPv4, IPv6, or hostnames; hostnames are resolved at dial time."),
         )
         .arg(
             Arg::new("add-peers")
                 .long("addpeer")
                 .env("KASPAD_ADDPEERS")
-                .value_name("IP[:PORT]")
+                .value_name("HOST[:PORT]")
                 .action(ArgAction::Append)
                 .require_equals(true)
-                .value_parser(clap::value_parser!(ContextualNetAddress))
-                .help("Add peers to connect with at startup."),
+                .value_parser(clap::value_parser!(PeerEndpoint))
+                .help("Add peers to connect with at startup. Accepts IPv4, IPv6, or hostnames; hostnames are resolved at dial time."),
         )
         .arg(
             Arg::new("listen")
@@ -392,6 +397,19 @@ Setting to 0 prevents the preallocation and sets the maximum to {}, leading to 0
         .arg(arg!(--"nodnsseed" "Disable DNS seeding for peers").env("KASPAD_NODNSSEED"))
         .arg(arg!(--"nogrpc" "Disable gRPC server").env("KASPAD_NOGRPC"))
         .arg(
+            Arg::new("hostname-refresh-interval")
+                .long("hostname-refresh-interval")
+                .env("KASPAD_HOSTNAME_REFRESH_INTERVAL_SEC")
+                .require_equals(true)
+                .value_name("SECONDS")
+                .value_parser(clap::value_parser!(u64))
+                .help(
+                    "Interval in seconds at which `--addpeer` / `--connect` hostnames are re-resolved. \
+                     Default: 600 (10 minutes). 0 disables periodic refresh; \
+                     dial-failure-triggered re-resolution still runs.",
+                ),
+        )
+        .arg(
             Arg::new("ram-scale")
                 .long("ram-scale")
                 .env("KASPAD_RAM_SCALE")
@@ -492,8 +510,8 @@ impl Args {
             wrpc_verbose: false,
             log_level: arg_match_unwrap_or::<String>(&m, "log_level", defaults.log_level),
             async_threads: arg_match_unwrap_or::<usize>(&m, "async_threads", defaults.async_threads),
-            connect_peers: arg_match_many_unwrap_or::<ContextualNetAddress>(&m, "connect-peers", defaults.connect_peers),
-            add_peers: arg_match_many_unwrap_or::<ContextualNetAddress>(&m, "add-peers", defaults.add_peers),
+            connect_peers: arg_match_many_unwrap_or::<PeerEndpoint>(&m, "connect-peers", defaults.connect_peers),
+            add_peers: arg_match_many_unwrap_or::<PeerEndpoint>(&m, "add-peers", defaults.add_peers),
             listen: m.get_one::<ContextualNetAddress>("listen").cloned().or(defaults.listen),
             outbound_target: arg_match_unwrap_or::<usize>(&m, "outpeers", defaults.outbound_target),
             inbound_limit: arg_match_unwrap_or::<usize>(&m, "maxinpeers", defaults.inbound_limit),
@@ -519,6 +537,11 @@ impl Args {
             disable_upnp: arg_match_unwrap_or::<bool>(&m, "disable-upnp", defaults.disable_upnp),
             disable_dns_seeding: arg_match_unwrap_or::<bool>(&m, "nodnsseed", defaults.disable_dns_seeding),
             disable_grpc: arg_match_unwrap_or::<bool>(&m, "nogrpc", defaults.disable_grpc),
+            hostname_refresh_interval_sec: arg_match_unwrap_or::<u64>(
+                &m,
+                "hostname-refresh-interval",
+                defaults.hostname_refresh_interval_sec,
+            ),
             ram_scale: arg_match_unwrap_or::<f64>(&m, "ram-scale", defaults.ram_scale),
             retention_period_days: m.get_one::<f64>("retention-period-days").cloned().or(defaults.retention_period_days),
 

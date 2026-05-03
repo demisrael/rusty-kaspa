@@ -29,7 +29,10 @@ use tokio::{
 };
 
 pub mod hostname;
-pub use hostname::{HostnameDelta, HostnameRegistry, HostnameRequest, HostnameResolver, TokioHostnameResolver};
+pub use hostname::{
+    HostnameDelta, HostnameMetrics, HostnameMetricsSnapshot, HostnameRegistry, HostnameRequest, HostnameResolver, ResolutionsTotal,
+    ResolveStatus, ResolveTrigger, TokioHostnameResolver,
+};
 
 /// Errors raised by [`ConnectionManager::add_endpoint_request`].
 #[derive(Error, Debug)]
@@ -66,6 +69,9 @@ pub struct ConnectionManager {
     /// duplicate registrations of the same host so the un-locked
     /// resolve phase never races a sibling caller's upsert.
     pending_registrations: ParkingLotMutex<HashSet<Arc<str>>>,
+    /// Counters for `peer_hostname_resolutions_total`. Gauges are computed
+    /// from the live `hostname_state` at snapshot time.
+    hostname_metrics: Arc<HostnameMetrics>,
     force_next_iteration: UnboundedSender<()>,
     /// Wake-up channel for the hostname refresh task; kept separate from
     /// `force_next_iteration` so the dial loop and the refresh loop never
@@ -118,6 +124,7 @@ impl ConnectionManager {
             hostname_refresh_interval,
             resolver,
             pending_registrations: Default::default(),
+            hostname_metrics: Arc::new(HostnameMetrics::default()),
             force_next_iteration: tx,
             force_hostname_refresh: refresh_tx,
             shutdown_signal: SingleTrigger::new(),
@@ -215,7 +222,16 @@ impl ConnectionManager {
 
                 // Resolve outside any registry-related lock so other
                 // consumers of `hostname_state` are not blocked.
-                let resolved = self.resolver.resolve(&host, port).await?;
+                let resolved = match self.resolver.resolve(&host, port).await {
+                    Ok(addrs) => {
+                        self.hostname_metrics.record(ResolveTrigger::Initial, ResolveStatus::Ok);
+                        addrs
+                    }
+                    Err(e) => {
+                        self.hostname_metrics.record(ResolveTrigger::Initial, ResolveStatus::Failed);
+                        return Err(AddEndpointError::Resolve(e));
+                    }
+                };
                 if resolved.is_empty() {
                     return Err(AddEndpointError::EmptyResult(host));
                 }
@@ -260,8 +276,8 @@ impl ConnectionManager {
                     break;
                 }
                 select! {
-                    _ = next_periodic_tick(&mut ticker) => self.clone().refresh_hostnames().await,
-                    _ = refresh_rx.recv() => self.clone().refresh_hostnames().await,
+                    _ = next_periodic_tick(&mut ticker) => self.clone().refresh_hostnames(ResolveTrigger::Periodic).await,
+                    _ = refresh_rx.recv() => self.clone().refresh_hostnames(ResolveTrigger::DialFailure).await,
                     _ = self.shutdown_signal.listener.clone() => break,
                 }
             }
@@ -281,8 +297,10 @@ impl ConnectionManager {
     /// DNS lookups run outside the `hostname_state` lock and in
     /// parallel via `join_all`, so a slow resolver does not block
     /// other consumers of the registry mutex (`add_endpoint_request`,
-    /// `host_for_socket`, metric snapshots).
-    pub async fn refresh_hostnames(self: Arc<Self>) {
+    /// `host_for_socket`, metric snapshots). Per-result metric
+    /// recording runs after the resolves complete and before the
+    /// re-acquisition of the registry lock.
+    pub async fn refresh_hostnames(self: Arc<Self>, trigger: ResolveTrigger) {
         // Phase 1: snapshot eligible hosts under lock; lock is dropped
         // before any DNS work begins.
         let snapshots = {
@@ -301,7 +319,12 @@ impl ConnectionManager {
             }
         });
         let results = join_all(resolves).await;
-        // Phase 3: re-acquire lock, apply results, capture permanence
+        // Phase 3a: record per-result metrics outside the registry lock.
+        for (_, result) in &results {
+            let status = if result.is_ok() { ResolveStatus::Ok } else { ResolveStatus::Failed };
+            self.hostname_metrics.record(trigger, status);
+        }
+        // Phase 3b: re-acquire lock, apply results, capture permanence
         // for delta reconciliation in one pass.
         let (deltas, permanence) = {
             let mut state = self.hostname_state.lock().await;
@@ -331,6 +354,18 @@ impl ConnectionManager {
 
     pub async fn stop(&self) {
         self.shutdown_signal.trigger.trigger()
+    }
+
+    /// Point-in-time snapshot of the hostname-related metrics (counters
+    /// from the live `HostnameMetrics`, gauges computed from the live
+    /// `HostnameRegistry`). Suitable for export to a metrics endpoint or
+    /// the existing `GetMetrics` RPC payload.
+    pub async fn hostname_metrics_snapshot(&self) -> HostnameMetricsSnapshot {
+        let mut snapshot = self.hostname_metrics.snapshot();
+        let state = self.hostname_state.lock().await;
+        snapshot.active = state.len() as u64;
+        snapshot.resolved_addrs = state.total_resolved_addrs() as u64;
+        snapshot
     }
 
     async fn handle_connection_requests(self: &Arc<Self>, peer_by_address: &HashMap<SocketAddr, Peer>) {
