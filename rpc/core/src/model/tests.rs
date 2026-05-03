@@ -463,6 +463,14 @@ mod mockery {
         }
     }
 
+    impl Mock for RpcPeerEndpoint {
+        fn mock() -> Self {
+            // Always exercise the v2 borsh string layout via the Address
+            // variant -- `String` payload, parses cleanly without DNS.
+            RpcPeerEndpoint::Address(mock())
+        }
+    }
+
     impl Mock for RpcPeerInfo {
         fn mock() -> Self {
             RpcPeerInfo {

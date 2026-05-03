@@ -396,12 +396,29 @@ where
 /// distinction is preserved as first-class state so the connection
 /// manager can periodically re-resolve hostname-origin entries and
 /// reconcile the resulting socket-address sets.
-#[derive(Clone, Debug, PartialEq, Eq, Hash, Serialize, Deserialize, BorshSerialize, BorshDeserialize)]
+///
+/// `Serialize`/`Deserialize` use the canonical [`Display`] form -- a
+/// flat string -- so JSON wire payloads, borsh v2 payloads, and the
+/// kaspad CLI all share the same textual representation.
+#[derive(Clone, Debug, PartialEq, Eq, Hash, BorshSerialize, BorshDeserialize)]
 pub enum PeerEndpoint {
     /// Numeric IP literal -- no DNS required at any point in its lifecycle.
     Address(ContextualNetAddress),
     /// Textual hostname -- resolved by the connection manager.
     Hostname { host: String, port: Option<u16> },
+}
+
+impl Serialize for PeerEndpoint {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.collect_str(self)
+    }
+}
+
+impl<'de> Deserialize<'de> for PeerEndpoint {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = <String as Deserialize>::deserialize(deserializer)?;
+        Self::parse(&s).map_err(serde::de::Error::custom)
+    }
 }
 
 impl PeerEndpoint {
