@@ -2332,6 +2332,78 @@ impl Deserializer for CustomMetricValue {
     }
 }
 
+/// Hostname-origin peer metrics, exported via [`GetMetricsResponse`].
+///
+/// `resolutions_total_*` are counters split across the six
+/// `(status, trigger)` buckets named in spec §6.8: `status` in
+/// `{ok, failed}`, `trigger` in `{initial, dial_failure, periodic}`.
+/// `active` and `resolved_addrs` are gauges over the live hostname
+/// registry.
+///
+/// Wire-level field names (JSON-RPC keys, gRPC field names) carry the
+/// `peerHostname*` prefix per spec §6.8 + D5 metric naming convention
+/// and are pinned via `#[serde(rename = ...)]` so the Rust-side field
+/// names below can drop the now-redundant prefix without breaking the
+/// wire contract.
+#[derive(Clone, Copy, Debug, Default, Serialize, Deserialize, PartialEq, Eq, BorshSerialize, BorshDeserialize)]
+pub struct PeerHostnameMetrics {
+    #[serde(rename = "peerHostnameResolutionsTotalInitialOk")]
+    pub resolutions_total_initial_ok: u64,
+    #[serde(rename = "peerHostnameResolutionsTotalInitialFailed")]
+    pub resolutions_total_initial_failed: u64,
+    #[serde(rename = "peerHostnameResolutionsTotalDialFailureOk")]
+    pub resolutions_total_dial_failure_ok: u64,
+    #[serde(rename = "peerHostnameResolutionsTotalDialFailureFailed")]
+    pub resolutions_total_dial_failure_failed: u64,
+    #[serde(rename = "peerHostnameResolutionsTotalPeriodicOk")]
+    pub resolutions_total_periodic_ok: u64,
+    #[serde(rename = "peerHostnameResolutionsTotalPeriodicFailed")]
+    pub resolutions_total_periodic_failed: u64,
+    #[serde(rename = "peerHostnameActive")]
+    pub active: u64,
+    #[serde(rename = "peerHostnameResolvedAddrs")]
+    pub resolved_addrs: u64,
+}
+
+impl Serializer for PeerHostnameMetrics {
+    fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
+        store!(u16, &1, writer)?;
+        store!(u64, &self.resolutions_total_initial_ok, writer)?;
+        store!(u64, &self.resolutions_total_initial_failed, writer)?;
+        store!(u64, &self.resolutions_total_dial_failure_ok, writer)?;
+        store!(u64, &self.resolutions_total_dial_failure_failed, writer)?;
+        store!(u64, &self.resolutions_total_periodic_ok, writer)?;
+        store!(u64, &self.resolutions_total_periodic_failed, writer)?;
+        store!(u64, &self.active, writer)?;
+        store!(u64, &self.resolved_addrs, writer)?;
+        Ok(())
+    }
+}
+
+impl Deserializer for PeerHostnameMetrics {
+    fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
+        let _version = load!(u16, reader)?;
+        let resolutions_total_initial_ok = load!(u64, reader)?;
+        let resolutions_total_initial_failed = load!(u64, reader)?;
+        let resolutions_total_dial_failure_ok = load!(u64, reader)?;
+        let resolutions_total_dial_failure_failed = load!(u64, reader)?;
+        let resolutions_total_periodic_ok = load!(u64, reader)?;
+        let resolutions_total_periodic_failed = load!(u64, reader)?;
+        let active = load!(u64, reader)?;
+        let resolved_addrs = load!(u64, reader)?;
+        Ok(Self {
+            resolutions_total_initial_ok,
+            resolutions_total_initial_failed,
+            resolutions_total_dial_failure_ok,
+            resolutions_total_dial_failure_failed,
+            resolutions_total_periodic_ok,
+            resolutions_total_periodic_failed,
+            active,
+            resolved_addrs,
+        })
+    }
+}
+
 #[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct GetMetricsResponse {
@@ -2341,11 +2413,13 @@ pub struct GetMetricsResponse {
     pub bandwidth_metrics: Option<BandwidthMetrics>,
     pub consensus_metrics: Option<ConsensusMetrics>,
     pub storage_metrics: Option<StorageMetrics>,
+    pub peer_hostname_metrics: Option<PeerHostnameMetrics>,
     // TODO: this is currently a placeholder
     pub custom_metrics: Option<HashMap<String, CustomMetricValue>>,
 }
 
 impl GetMetricsResponse {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         server_time: u64,
         process_metrics: Option<ProcessMetrics>,
@@ -2353,6 +2427,7 @@ impl GetMetricsResponse {
         bandwidth_metrics: Option<BandwidthMetrics>,
         consensus_metrics: Option<ConsensusMetrics>,
         storage_metrics: Option<StorageMetrics>,
+        peer_hostname_metrics: Option<PeerHostnameMetrics>,
         custom_metrics: Option<HashMap<String, CustomMetricValue>>,
     ) -> Self {
         Self {
@@ -2361,6 +2436,7 @@ impl GetMetricsResponse {
             bandwidth_metrics,
             consensus_metrics,
             storage_metrics,
+            peer_hostname_metrics,
             server_time,
             custom_metrics,
         }
@@ -2369,7 +2445,10 @@ impl GetMetricsResponse {
 
 impl Serializer for GetMetricsResponse {
     fn serialize<W: std::io::Write>(&self, writer: &mut W) -> std::io::Result<()> {
-        store!(u16, &1, writer)?;
+        // version 2 adds the optional `peer_hostname_metrics` block at the
+        // tail. v1 readers terminate before the new block; the field is
+        // not exposed via the v1 borsh frame.
+        store!(u16, &2, writer)?;
         store!(u64, &self.server_time, writer)?;
         serialize!(Option<ProcessMetrics>, &self.process_metrics, writer)?;
         serialize!(Option<ConnectionMetrics>, &self.connection_metrics, writer)?;
@@ -2377,6 +2456,7 @@ impl Serializer for GetMetricsResponse {
         serialize!(Option<ConsensusMetrics>, &self.consensus_metrics, writer)?;
         serialize!(Option<StorageMetrics>, &self.storage_metrics, writer)?;
         serialize!(Option<HashMap<String, CustomMetricValue>>, &self.custom_metrics, writer)?;
+        serialize!(Option<PeerHostnameMetrics>, &self.peer_hostname_metrics, writer)?;
 
         Ok(())
     }
@@ -2384,7 +2464,7 @@ impl Serializer for GetMetricsResponse {
 
 impl Deserializer for GetMetricsResponse {
     fn deserialize<R: std::io::Read>(reader: &mut R) -> std::io::Result<Self> {
-        let _version = load!(u16, reader)?;
+        let version = load!(u16, reader)?;
         let server_time = load!(u64, reader)?;
         let process_metrics = deserialize!(Option<ProcessMetrics>, reader)?;
         let connection_metrics = deserialize!(Option<ConnectionMetrics>, reader)?;
@@ -2392,6 +2472,7 @@ impl Deserializer for GetMetricsResponse {
         let consensus_metrics = deserialize!(Option<ConsensusMetrics>, reader)?;
         let storage_metrics = deserialize!(Option<StorageMetrics>, reader)?;
         let custom_metrics = deserialize!(Option<HashMap<String, CustomMetricValue>>, reader)?;
+        let peer_hostname_metrics = if version >= 2 { deserialize!(Option<PeerHostnameMetrics>, reader)? } else { None };
 
         Ok(Self {
             server_time,
@@ -2400,6 +2481,7 @@ impl Deserializer for GetMetricsResponse {
             bandwidth_metrics,
             consensus_metrics,
             storage_metrics,
+            peer_hostname_metrics,
             custom_metrics,
         })
     }

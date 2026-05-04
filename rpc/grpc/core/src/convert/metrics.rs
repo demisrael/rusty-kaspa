@@ -80,6 +80,19 @@ from!(item: &kaspa_rpc_core::StorageMetrics, protowire::StorageMetrics, {
     }
 });
 
+from!(item: &kaspa_rpc_core::PeerHostnameMetrics, protowire::PeerHostnameMetrics, {
+    Self {
+        peer_hostname_resolutions_total_initial_ok: item.resolutions_total_initial_ok,
+        peer_hostname_resolutions_total_initial_failed: item.resolutions_total_initial_failed,
+        peer_hostname_resolutions_total_dial_failure_ok: item.resolutions_total_dial_failure_ok,
+        peer_hostname_resolutions_total_dial_failure_failed: item.resolutions_total_dial_failure_failed,
+        peer_hostname_resolutions_total_periodic_ok: item.resolutions_total_periodic_ok,
+        peer_hostname_resolutions_total_periodic_failed: item.resolutions_total_periodic_failed,
+        peer_hostname_active: item.active,
+        peer_hostname_resolved_addrs: item.resolved_addrs,
+    }
+});
+
 // ----------------------------------------------------------------------------
 // protowire to rpc_core
 // ----------------------------------------------------------------------------
@@ -151,5 +164,18 @@ try_from!(item: &protowire::ConsensusMetrics, kaspa_rpc_core::ConsensusMetrics, 
 try_from!(item: &protowire::StorageMetrics, kaspa_rpc_core::StorageMetrics, {
     Self {
         storage_size_bytes: item.storage_size_bytes,
+    }
+});
+
+try_from!(item: &protowire::PeerHostnameMetrics, kaspa_rpc_core::PeerHostnameMetrics, {
+    Self {
+        resolutions_total_initial_ok: item.peer_hostname_resolutions_total_initial_ok,
+        resolutions_total_initial_failed: item.peer_hostname_resolutions_total_initial_failed,
+        resolutions_total_dial_failure_ok: item.peer_hostname_resolutions_total_dial_failure_ok,
+        resolutions_total_dial_failure_failed: item.peer_hostname_resolutions_total_dial_failure_failed,
+        resolutions_total_periodic_ok: item.peer_hostname_resolutions_total_periodic_ok,
+        resolutions_total_periodic_failed: item.peer_hostname_resolutions_total_periodic_failed,
+        active: item.peer_hostname_active,
+        resolved_addrs: item.peer_hostname_resolved_addrs,
     }
 });

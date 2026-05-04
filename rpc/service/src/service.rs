@@ -991,11 +991,15 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
         let Some(connection_manager) = self.flow_context.connection_manager() else {
             return Err(RpcError::NoConnectionManager);
         };
-        let host_for_error = request.peer_address.hostname().map(|h| h.to_owned());
-        connection_manager
-            .add_endpoint_request(request.peer_address, request.is_permanent, self.config.net.default_p2p_port())
-            .await
-            .map_err(|e| RpcError::PeerHostResolutionFailed { host: host_for_error.unwrap_or_default(), reason: e.to_string() })?;
+        // The connection manager registers hostnames for periodic retry on
+        // resolve failure; there is no error path the RPC handler
+        // propagates here. Parse failure is rejected upstream by the
+        // borsh / gRPC decoder via `RpcError::InvalidPeerEndpoint`.
+        //
+        // Source: https://github.com/bitcoin/bitcoin/blob/8f4a3ba8972dae9412ba975a040cea22c227f983/src/net.cpp#L3740
+        // (`CConnman::AddNode` — accepts the host even when its address
+        // is unresolvable; the periodic-retry thread handles re-resolution).
+        connection_manager.add_endpoint_request(request.peer_address, request.is_permanent, self.config.net.default_p2p_port()).await;
         Ok(AddPeerResponse {})
     }
 
@@ -1178,6 +1182,32 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
 
         let storage_metrics = req.storage_metrics.then_some(StorageMetrics { storage_size_bytes: 0 });
 
+        // Hostname-origin peer metrics gated on the same `connection_metrics`
+        // request flag as the wRPC borsh / JSON connection counters --
+        // operators asking for connection observability get the hostname
+        // observability with it. The connection-manager snapshot includes
+        // both the resolution counter buckets and the gauge counts.
+        let peer_hostname_metrics = if req.connection_metrics {
+            match self.flow_context.connection_manager() {
+                Some(cm) => {
+                    let snapshot = cm.hostname_metrics_snapshot().await;
+                    Some(PeerHostnameMetrics {
+                        resolutions_total_initial_ok: snapshot.resolutions_total.initial_ok,
+                        resolutions_total_initial_failed: snapshot.resolutions_total.initial_failed,
+                        resolutions_total_dial_failure_ok: snapshot.resolutions_total.dial_failure_ok,
+                        resolutions_total_dial_failure_failed: snapshot.resolutions_total.dial_failure_failed,
+                        resolutions_total_periodic_ok: snapshot.resolutions_total.periodic_ok,
+                        resolutions_total_periodic_failed: snapshot.resolutions_total.periodic_failed,
+                        active: snapshot.active,
+                        resolved_addrs: snapshot.resolved_addrs,
+                    })
+                }
+                None => Some(PeerHostnameMetrics::default()),
+            }
+        } else {
+            None
+        };
+
         let custom_metrics: Option<HashMap<String, CustomMetricValue>> = None;
 
         let server_time = unix_now();
@@ -1189,6 +1219,7 @@ NOTE: This error usually indicates an RPC conversion error between the node and 
             bandwidth_metrics,
             consensus_metrics,
             storage_metrics,
+            peer_hostname_metrics,
             custom_metrics,
         };
 

@@ -874,7 +874,30 @@ message GetMetricsResponseMessage {
   BandwidthMetrics bandwidthMetrics = 13;
   ConsensusMetrics consensusMetrics = 14;
   StorageMetrics storageMetrics = 15;
+  PeerHostnameMetrics peerHostnameMetrics = 16;
   RPCError error = 1000;
+}
+
+// Hostname-origin peer metrics. Counter `peerHostnameResolutionsTotal`
+// is split across the six (status, trigger) buckets named by the
+// connection manager:
+//   status   in {ok, failed}
+//   trigger  in {initial, dial_failure, periodic}
+// `peerHostnameActive` and `peerHostnameResolvedAddrs` are gauges over
+// the live hostname registry (count of distinct hostname entries; sum
+// of distinct resolved socket addresses across all entries).
+//
+// Field numbers leave gaps so future labels (e.g. `cancelled`) can be
+// inserted without renumbering.
+message PeerHostnameMetrics {
+  uint64 peerHostnameResolutionsTotalInitialOk = 1;
+  uint64 peerHostnameResolutionsTotalInitialFailed = 2;
+  uint64 peerHostnameResolutionsTotalDialFailureOk = 3;
+  uint64 peerHostnameResolutionsTotalDialFailureFailed = 4;
+  uint64 peerHostnameResolutionsTotalPeriodicOk = 5;
+  uint64 peerHostnameResolutionsTotalPeriodicFailed = 6;
+  uint64 peerHostnameActive = 11;
+  uint64 peerHostnameResolvedAddrs = 12;
 }
 
 message GetServerInfoRequestMessage {}

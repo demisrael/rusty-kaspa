@@ -14,11 +14,12 @@ use std::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
-    time::{Duration, SystemTime, UNIX_EPOCH},
+    time::Duration,
 };
 
 use async_trait::async_trait;
 use kaspa_utils::networking::{PEER_ENDPOINT_RESOLVE_TIMEOUT, PeerEndpointResolveError};
+use tokio::time::Instant;
 
 /// What triggered a hostname resolution attempt. Captured as a metric label.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -136,7 +137,7 @@ pub struct HostnameMetricsSnapshot {
 /// production code uses [`TokioHostnameResolver`]; unit tests inject a
 /// fake that returns a fixed result table.
 #[async_trait]
-pub trait HostnameResolver: Send + Sync + 'static {
+pub trait HostnameResolver: std::fmt::Debug + Send + Sync + 'static {
     async fn resolve(&self, host: &str, port: u16) -> Result<Vec<SocketAddr>, PeerEndpointResolveError>;
 }
 
@@ -159,25 +160,45 @@ impl HostnameResolver for TokioHostnameResolver {
 }
 
 /// Per-hostname state retained across refresh cycles.
+///
+/// `last_refresh` is a monotonic [`tokio::time::Instant`] so cadence
+/// comparisons are immune to wall-clock jumps (NTP step corrections,
+/// manual clock changes, suspend-resume drift). `None` is the explicit
+/// "refresh ASAP" sentinel set by [`HostnameRegistry::mark_stale`]
+/// after a dial failure or an initial-empty resolve; cadence-elapsed
+/// re-resolution uses `Some(t)`.
 #[derive(Clone, Debug)]
 pub struct HostnameRequest {
     pub host: Arc<str>,
     pub port: u16,
     pub is_permanent: bool,
     pub last_resolved: HashSet<SocketAddr>,
-    pub last_refresh: SystemTime,
+    pub last_refresh: Option<Instant>,
     pub refresh_failures: u32,
 }
 
 impl HostnameRequest {
     fn new(host: Arc<str>, port: u16, is_permanent: bool, initial: HashSet<SocketAddr>) -> Self {
-        Self { host, port, is_permanent, last_resolved: initial, last_refresh: SystemTime::now(), refresh_failures: 0 }
+        Self { host, port, is_permanent, last_resolved: initial, last_refresh: Some(Instant::now()), refresh_failures: 0 }
     }
 }
 
 /// Per-host outcome produced by a parallel resolve phase, consumed by
 /// [`HostnameRegistry::apply_refresh_results`].
 pub type HostnameResolveOutcome = (Arc<str>, Result<Vec<SocketAddr>, PeerEndpointResolveError>);
+
+/// Snapshot tuple returned by [`HostnameRegistry::pending_refreshes`].
+/// Carries the per-entry [`ResolveTrigger`] derived from the eligibility
+/// reason (`Periodic` for cadence-elapsed entries, `DialFailure` for
+/// entries flagged via [`HostnameRegistry::mark_stale`]) so a wakeup
+/// arm that aggregates both never misattributes the metric label.
+#[derive(Clone, Debug)]
+pub struct PendingRefresh {
+    pub host: Arc<str>,
+    pub port: u16,
+    pub prev: HashSet<SocketAddr>,
+    pub trigger: ResolveTrigger,
+}
 
 /// Reconciliation outcome for a single host.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -214,14 +235,14 @@ impl HostnameRegistry {
         key
     }
 
-    /// Force the next periodic-refresh cadence check to treat `host` as
-    /// eligible regardless of when it was last refreshed: sets
-    /// `last_refresh` to [`UNIX_EPOCH`], so the cadence-elapsed predicate
-    /// in [`HostnameRegistry::pending_refreshes`] returns `true` for it
-    /// on the next tick. No-op if `host` is unknown.
+    /// Force the next refresh cadence check to treat `host` as eligible
+    /// regardless of when it was last refreshed: clears `last_refresh`
+    /// to `None`, so [`HostnameRegistry::pending_refreshes`] yields the
+    /// entry on the next tick with [`ResolveTrigger::DialFailure`] as
+    /// its per-entry label. No-op if `host` is unknown.
     pub fn mark_stale(&mut self, host: &str) {
         if let Some(entry) = self.requests.get_mut(host) {
-            entry.last_refresh = UNIX_EPOCH;
+            entry.last_refresh = None;
         }
     }
 
@@ -245,19 +266,39 @@ impl HostnameRegistry {
         self.requests.iter()
     }
 
-    /// Snapshot the hosts whose `last_refresh + cadence` has elapsed
-    /// (i.e. they are eligible to be re-resolved on the next periodic
-    /// tick). Returned out-of-lock so the caller can run DNS lookups
-    /// in parallel without holding the registry mutex across `await`
-    /// points. Entries marked stale via [`mark_stale`] -- whose
-    /// `last_refresh` is [`UNIX_EPOCH`] -- naturally satisfy the
-    /// cadence-elapsed predicate and are always included.
-    pub fn pending_refreshes(&self, cadence: Duration) -> Vec<(Arc<str>, u16, HashSet<SocketAddr>)> {
-        let now = SystemTime::now();
+    /// Snapshot the hosts eligible for re-resolution on the next refresh
+    /// tick, paired with the [`ResolveTrigger`] derived from each entry's
+    /// eligibility reason:
+    ///
+    /// - `last_refresh = None` (set by [`HostnameRegistry::mark_stale`]
+    ///   after a dial failure or initial-empty resolve) -> always
+    ///   eligible, labeled [`ResolveTrigger::DialFailure`].
+    /// - `last_refresh = Some(t)` and `now - t >= cadence` -> eligible,
+    ///   labeled [`ResolveTrigger::Periodic`].
+    /// - `last_refresh = Some(t)` and `now - t < cadence` -> not
+    ///   eligible on this tick.
+    ///
+    /// The per-entry trigger is the fix for `peer_hostname_resolutions_total`
+    /// label misattribution: a wakeup arm that aggregates cadence-elapsed
+    /// entries together with mark-stale entries (which the dial-failure
+    /// channel and the periodic ticker both legitimately do) records each
+    /// entry under its own eligibility reason, not under the wakeup arm's
+    /// trigger.
+    ///
+    /// Returned out-of-lock so the caller can run DNS lookups in parallel
+    /// without holding the registry mutex across `await` points.
+    pub fn pending_refreshes(&self, cadence: Duration) -> Vec<PendingRefresh> {
+        let now = Instant::now();
         self.requests
             .iter()
-            .filter(|(_, req)| now.duration_since(req.last_refresh).map(|elapsed| elapsed >= cadence).unwrap_or(true))
-            .map(|(host, req)| (host.clone(), req.port, req.last_resolved.clone()))
+            .filter_map(|(host, req)| {
+                let trigger = match req.last_refresh {
+                    None => Some(ResolveTrigger::DialFailure),
+                    Some(t) if now.saturating_duration_since(t) >= cadence => Some(ResolveTrigger::Periodic),
+                    Some(_) => None,
+                };
+                trigger.map(|tr| PendingRefresh { host: host.clone(), port: req.port, prev: req.last_resolved.clone(), trigger: tr })
+            })
             .collect()
     }
 
@@ -268,7 +309,7 @@ impl HostnameRegistry {
     /// on `Ok`. Returns one [`HostnameDelta`] per host with non-empty
     /// added/removed sets.
     pub fn apply_refresh_results(&mut self, results: Vec<HostnameResolveOutcome>) -> Vec<HostnameDelta> {
-        let now = SystemTime::now();
+        let now = Instant::now();
         let mut deltas = Vec::with_capacity(results.len());
         for (host, result) in results {
             let prev = match self.requests.get(&host) {
@@ -282,7 +323,7 @@ impl HostnameRegistry {
                     let removed: Vec<SocketAddr> = prev.difference(&new_set).copied().collect();
                     if let Some(entry) = self.requests.get_mut(&host) {
                         entry.last_resolved = new_set;
-                        entry.last_refresh = now;
+                        entry.last_refresh = Some(now);
                         entry.refresh_failures = 0;
                     }
                     if !added.is_empty() || !removed.is_empty() {
@@ -329,7 +370,7 @@ impl HostnameRegistry {
                     let removed: Vec<SocketAddr> = prev.difference(&new_set).copied().collect();
                     if let Some(entry) = self.requests.get_mut(&host) {
                         entry.last_resolved = new_set;
-                        entry.last_refresh = SystemTime::now();
+                        entry.last_refresh = Some(Instant::now());
                         entry.refresh_failures = 0;
                     }
                     if !added.is_empty() || !removed.is_empty() {
@@ -375,6 +416,7 @@ mod tests {
     /// Programmable fake [`HostnameResolver`]. Each entry maps a
     /// `(host, port)` key to either a fixed list of socket addresses or
     /// an error message. `mutate` swaps the response between calls.
+    #[derive(Debug)]
     struct FakeResolver {
         table: Mutex<StdHashMap<String, Result<Vec<SocketAddr>, String>>>,
     }
@@ -524,16 +566,50 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn registry_mark_stale_zeroes_last_refresh() {
+    async fn registry_mark_stale_clears_last_refresh() {
         let mut reg = HostnameRegistry::new();
         reg.upsert("a.example", 16111, true, [sock("10.0.0.1:16111")].into_iter().collect());
         let before = reg.get("a.example").unwrap().last_refresh;
         reg.mark_stale("a.example");
         let after = reg.get("a.example").unwrap().last_refresh;
-        assert!(after < before, "mark_stale must move last_refresh backward");
-        assert_eq!(after, UNIX_EPOCH);
+        assert!(before.is_some(), "fresh upsert must record last_refresh");
+        assert!(after.is_none(), "mark_stale must clear last_refresh to the refresh-ASAP sentinel");
         // Marking an unknown host is a no-op.
         reg.mark_stale("not.in.registry");
+    }
+
+    #[tokio::test]
+    async fn registry_pending_refreshes_labels_per_entry_trigger() {
+        // Cadence-elapsed entries are eligible as Periodic; mark-stale
+        // entries are eligible as DialFailure regardless of cadence.
+        let mut reg = HostnameRegistry::new();
+        reg.upsert("periodic.example", 16111, true, HashSet::new());
+        reg.upsert("stale.example", 16111, true, HashSet::new());
+        reg.mark_stale("stale.example");
+
+        // Force the periodic entry to have an elapsed cadence by clearing
+        // and re-stamping `last_refresh` to a moment far enough in the
+        // past for any plausible `cadence`. We cannot easily backdate
+        // `Instant`, so use `Duration::ZERO` as the cadence -- every
+        // `Some(_)` entry then qualifies as periodic-elapsed.
+        let pending = reg.pending_refreshes(Duration::ZERO);
+        let by_host: StdHashMap<&str, ResolveTrigger> = pending.iter().map(|p| (p.host.as_ref(), p.trigger)).collect();
+        assert_eq!(by_host.get("periodic.example").copied(), Some(ResolveTrigger::Periodic));
+        assert_eq!(by_host.get("stale.example").copied(), Some(ResolveTrigger::DialFailure));
+    }
+
+    #[tokio::test]
+    async fn registry_pending_refreshes_skips_when_cadence_unmet() {
+        // Fresh upsert, large cadence -> nothing eligible (no mark_stale).
+        let mut reg = HostnameRegistry::new();
+        reg.upsert("recent.example", 16111, true, HashSet::new());
+        let pending = reg.pending_refreshes(Duration::from_secs(3600));
+        assert!(pending.is_empty(), "fresh entry must not be eligible until cadence elapses");
+        // Mark stale -> eligible immediately as DialFailure regardless of cadence.
+        reg.mark_stale("recent.example");
+        let pending = reg.pending_refreshes(Duration::from_secs(3600));
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].trigger, ResolveTrigger::DialFailure);
     }
 
     #[tokio::test]

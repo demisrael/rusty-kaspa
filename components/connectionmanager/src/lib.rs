@@ -12,13 +12,9 @@ use itertools::Itertools;
 use kaspa_addressmanager::{AddressManager, NetAddress};
 use kaspa_core::{debug, info, warn};
 use kaspa_p2p_lib::{ConnectionError, Peer, common::ProtocolError};
-use kaspa_utils::{
-    networking::{PeerEndpoint, PeerEndpointResolveError},
-    triggers::SingleTrigger,
-};
+use kaspa_utils::{networking::PeerEndpoint, triggers::SingleTrigger};
 use parking_lot::Mutex as ParkingLotMutex;
 use rand::{seq::SliceRandom, thread_rng};
-use thiserror::Error;
 use tokio::{
     select,
     sync::{
@@ -30,20 +26,12 @@ use tokio::{
 
 pub mod hostname;
 pub use hostname::{
-    HostnameDelta, HostnameMetrics, HostnameMetricsSnapshot, HostnameRegistry, HostnameRequest, HostnameResolver, ResolutionsTotal,
-    ResolveStatus, ResolveTrigger, TokioHostnameResolver,
+    HostnameDelta, HostnameMetrics, HostnameMetricsSnapshot, HostnameRegistry, HostnameRequest, HostnameResolver, PendingRefresh,
+    ResolutionsTotal, ResolveStatus, ResolveTrigger, TokioHostnameResolver,
 };
 
-/// Errors raised by [`ConnectionManager::add_endpoint_request`].
-#[derive(Error, Debug)]
-pub enum AddEndpointError {
-    /// DNS resolution failed for the hostname variant.
-    #[error("hostname resolution failed: {0}")]
-    Resolve(#[from] PeerEndpointResolveError),
-    /// Hostname resolved to zero socket addresses.
-    #[error("hostname `{0}` resolved to zero addresses")]
-    EmptyResult(String),
-}
+#[cfg(feature = "test-utils")]
+pub mod test_support;
 
 pub struct ConnectionManager {
     p2p_adaptor: Arc<kaspa_p2p_lib::Adaptor>,
@@ -178,37 +166,41 @@ impl ConnectionManager {
 
     /// Insert a peer endpoint into the connection-request set. `Address`
     /// variants short-circuit to the existing IP-keyed path. `Hostname`
-    /// variants resolve synchronously (so the caller learns about typos
-    /// immediately), record state in the hostname registry, and seed
+    /// variants register the hostname for periodic re-resolution and seed
     /// `connection_requests` with one entry per resolved socket address.
+    ///
+    /// A hostname that does not currently resolve is **registered anyway**:
+    /// the entry lives in the hostname registry with an empty `last_resolved`
+    /// set, the `initial_failed` metric is bumped, a `warn!` line names
+    /// the host plus the underlying resolver error, and the entry is
+    /// marked stale so the next refresh tick retries immediately rather
+    /// than waiting the full periodic cadence. The unresolvable-host path
+    /// and the unreachable-IP path share the same retry-forever loop.
     ///
     /// Concurrent registrations for the same hostname are de-duplicated
     /// via [`ConnectionManager::pending_registrations`]: the second
-    /// caller short-circuits with `Ok(())` rather than racing the
-    /// first call's resolve+upsert. The DNS lookup runs outside the
+    /// caller short-circuits rather than racing the first call's
+    /// resolve+upsert. The DNS lookup runs outside the
     /// `hostname_state` lock so the registry stays available to
     /// periodic-refresh and metric-snapshot consumers during the
     /// (up to [`PEER_ENDPOINT_RESOLVE_TIMEOUT`]-long) resolve.
-    pub async fn add_endpoint_request(
-        &self,
-        endpoint: PeerEndpoint,
-        is_permanent: bool,
-        default_port: u16,
-    ) -> Result<(), AddEndpointError> {
+    ///
+    /// Source: https://github.com/bitcoin/bitcoin/blob/8f4a3ba8972dae9412ba975a040cea22c227f983/src/net.cpp#L2974
+    /// (`ThreadOpenAddedConnections`).
+    pub async fn add_endpoint_request(&self, endpoint: PeerEndpoint, is_permanent: bool, default_port: u16) {
         match endpoint {
             PeerEndpoint::Address(addr) => {
                 let socket = SocketAddr::from(addr.normalize(default_port));
                 self.add_connection_request(socket, is_permanent).await;
-                Ok(())
             }
             PeerEndpoint::Hostname { host, port } => {
                 let port = port.unwrap_or(default_port);
                 let host_arc: Arc<str> = Arc::from(host.as_str());
 
                 // Dedup pass 1: pending-registrations set. Concurrent
-                // same-host caller gets `Ok(())` and short-circuits.
+                // same-host caller short-circuits rather than racing.
                 if !self.pending_registrations.lock().insert(host_arc.clone()) {
-                    return Ok(());
+                    return;
                 }
                 // RAII cleanup: any return path below clears the
                 // pending entry exactly once, including panics in the
@@ -217,28 +209,41 @@ impl ConnectionManager {
 
                 // Dedup pass 2: registry already has the host.
                 if self.hostname_state.lock().await.contains(&host) {
-                    return Ok(());
+                    return;
                 }
 
                 // Resolve outside any registry-related lock so other
-                // consumers of `hostname_state` are not blocked.
-                let resolved = match self.resolver.resolve(&host, port).await {
-                    Ok(addrs) => {
+                // consumers of `hostname_state` are not blocked. A
+                // failed / empty resolve is tolerated -- the entry is
+                // still registered for periodic retry below.
+                let resolved: Vec<SocketAddr> = match self.resolver.resolve(&host, port).await {
+                    Ok(addrs) if !addrs.is_empty() => {
                         self.hostname_metrics.record(ResolveTrigger::Initial, ResolveStatus::Ok);
                         addrs
                     }
+                    Ok(_) => {
+                        self.hostname_metrics.record(ResolveTrigger::Initial, ResolveStatus::Failed);
+                        warn!("addpeer: resolver returned no addresses for `{host}`; queued for periodic retry");
+                        Vec::new()
+                    }
                     Err(e) => {
                         self.hostname_metrics.record(ResolveTrigger::Initial, ResolveStatus::Failed);
-                        return Err(AddEndpointError::Resolve(e));
+                        // `PeerEndpointResolveError` Display already names the host.
+                        warn!("addpeer: {e}; queued for periodic retry");
+                        Vec::new()
                     }
                 };
-                if resolved.is_empty() {
-                    return Err(AddEndpointError::EmptyResult(host));
-                }
                 let initial: HashSet<SocketAddr> = resolved.iter().copied().collect();
                 let host_arc_inserted = {
                     let mut hostname_state = self.hostname_state.lock().await;
-                    hostname_state.upsert(&host, port, is_permanent, initial)
+                    let key = hostname_state.upsert(&host, port, is_permanent, initial);
+                    if resolved.is_empty() {
+                        // No initial records; mark stale so the next refresh tick
+                        // retries immediately rather than waiting the full cadence.
+                        hostname_state.mark_stale(&host);
+                        return;
+                    }
+                    key
                 };
                 info!("addpeer: resolved {host} -> {resolved:?}");
                 let mut requests = self.connection_requests.lock().await;
@@ -247,7 +252,6 @@ impl ConnectionManager {
                 }
                 drop(requests);
                 let _ = self.force_next_iteration.send(());
-                Ok(())
             }
         }
     }
@@ -276,8 +280,8 @@ impl ConnectionManager {
                     break;
                 }
                 select! {
-                    _ = next_periodic_tick(&mut ticker) => self.clone().refresh_hostnames(ResolveTrigger::Periodic).await,
-                    _ = refresh_rx.recv() => self.clone().refresh_hostnames(ResolveTrigger::DialFailure).await,
+                    _ = next_periodic_tick(&mut ticker) => self.clone().refresh_hostnames().await,
+                    _ = refresh_rx.recv() => self.clone().refresh_hostnames().await,
                     _ = self.shutdown_signal.listener.clone() => break,
                 }
             }
@@ -288,11 +292,16 @@ impl ConnectionManager {
     /// Resolve eligible hostname entries through the configured
     /// resolver and reconcile each delta into `connection_requests`.
     ///
-    /// Eligibility is gated on `last_refresh + cadence <= now` (or
-    /// the entry is marked stale via [`HostnameRegistry::mark_stale`]);
-    /// hosts whose cadence window has not elapsed are skipped on this
-    /// tick, so a dial-failure wakeup re-resolves only the hosts the
-    /// dial loop actually flagged.
+    /// Eligibility is computed per-entry in
+    /// [`HostnameRegistry::pending_refreshes`]: an entry is eligible
+    /// either because its cadence window has elapsed (labeled
+    /// [`ResolveTrigger::Periodic`]) or because the dial loop flagged
+    /// it via [`HostnameRegistry::mark_stale`] (labeled
+    /// [`ResolveTrigger::DialFailure`]). The wakeup arm (periodic
+    /// ticker vs `force_hostname_refresh` channel) does not determine
+    /// the metric label -- the per-entry trigger does -- so a
+    /// dial-failure wakeup that happens to coincide with cadence-elapsed
+    /// entries records each entry under its own eligibility reason.
     ///
     /// DNS lookups run outside the `hostname_state` lock and in
     /// parallel via `join_all`, so a slow resolver does not block
@@ -300,9 +309,10 @@ impl ConnectionManager {
     /// `host_for_socket`, metric snapshots). Per-result metric
     /// recording runs after the resolves complete and before the
     /// re-acquisition of the registry lock.
-    pub async fn refresh_hostnames(self: Arc<Self>, trigger: ResolveTrigger) {
+    pub async fn refresh_hostnames(self: Arc<Self>) {
         // Phase 1: snapshot eligible hosts under lock; lock is dropped
-        // before any DNS work begins.
+        // before any DNS work begins. Each snapshot carries the
+        // per-entry trigger derived from the eligibility reason.
         let snapshots = {
             let state = self.hostname_state.lock().await;
             state.pending_refreshes(self.hostname_refresh_interval)
@@ -311,24 +321,28 @@ impl ConnectionManager {
             return;
         }
         // Phase 2: resolve concurrently outside the registry lock.
-        let resolves = snapshots.into_iter().map(|(host, port, _prev)| {
+        let resolves = snapshots.into_iter().map(|pending| {
             let resolver = self.resolver.clone();
             async move {
-                let result = resolver.resolve(&host, port).await;
-                (host, result)
+                let result = resolver.resolve(&pending.host, pending.port).await;
+                (pending.host, pending.trigger, result)
             }
         });
-        let results = join_all(resolves).await;
-        // Phase 3a: record per-result metrics outside the registry lock.
-        for (_, result) in &results {
+        let triggered_results = join_all(resolves).await;
+        // Phase 3a: record per-entry metrics outside the registry lock,
+        // labeled by the entry's own eligibility trigger.
+        for (_, trigger, result) in &triggered_results {
             let status = if result.is_ok() { ResolveStatus::Ok } else { ResolveStatus::Failed };
-            self.hostname_metrics.record(trigger, status);
+            self.hostname_metrics.record(*trigger, status);
         }
         // Phase 3b: re-acquire lock, apply results, capture permanence
-        // for delta reconciliation in one pass.
+        // for delta reconciliation in one pass. The trigger is dropped
+        // here -- registry reconciliation is trigger-agnostic.
+        let outcomes: Vec<hostname::HostnameResolveOutcome> =
+            triggered_results.into_iter().map(|(host, _trigger, result)| (host, result)).collect();
         let (deltas, permanence) = {
             let mut state = self.hostname_state.lock().await;
-            let deltas = state.apply_refresh_results(results);
+            let deltas = state.apply_refresh_results(outcomes);
             let permanence: HashMap<Arc<str>, bool> = state.iter().map(|(host, req)| (host.clone(), req.is_permanent)).collect();
             (deltas, permanence)
         };

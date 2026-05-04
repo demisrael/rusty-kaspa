@@ -494,6 +494,10 @@ impl TryFrom<GetMetricsResponse> for MetricsData {
             bandwidth_metrics,
             process_metrics,
             storage_metrics,
+            // The hostname-origin block is rendered via `kaspa-cli getmetrics`
+            // directly off the wire response; no integration with the
+            // historical `MetricsData` projection is required here.
+            peer_hostname_metrics: _,
             custom_metrics: _,
         } = response; //rpc.get_metrics(true, true, true, true, true, false).await?;
 

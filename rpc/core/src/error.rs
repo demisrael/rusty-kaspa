@@ -149,9 +149,6 @@ pub enum RpcError {
 
     #[error(transparent)]
     CompressedParentsError(#[from] CompressedParentsError),
-
-    #[error("Failed to resolve peer host `{host}`: {reason}")]
-    PeerHostResolutionFailed { host: String, reason: String },
 }
 
 impl From<String> for RpcError {

@@ -1205,6 +1205,21 @@ mod mockery {
 
     test!(GetMetricsRequest);
 
+    impl Mock for PeerHostnameMetrics {
+        fn mock() -> Self {
+            PeerHostnameMetrics {
+                resolutions_total_initial_ok: mock(),
+                resolutions_total_initial_failed: mock(),
+                resolutions_total_dial_failure_ok: mock(),
+                resolutions_total_dial_failure_failed: mock(),
+                resolutions_total_periodic_ok: mock(),
+                resolutions_total_periodic_failed: mock(),
+                active: mock(),
+                resolved_addrs: mock(),
+            }
+        }
+    }
+
     impl Mock for GetMetricsResponse {
         fn mock() -> Self {
             GetMetricsResponse {
@@ -1214,6 +1229,7 @@ mod mockery {
                 bandwidth_metrics: mock(),
                 consensus_metrics: mock(),
                 storage_metrics: mock(),
+                peer_hostname_metrics: mock(),
                 custom_metrics: None,
             }
         }
