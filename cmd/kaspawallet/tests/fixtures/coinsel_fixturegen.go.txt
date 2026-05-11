@@ -1,0 +1,191 @@
+// Source-of-truth Go program that produces the cross-binary parity
+// fixture for the Rust port of `libkaspawallet.CreateUnsignedTransaction`
+// (the unsigned-PST builder fed by the Path-A coin-selection layer).
+//
+// Run from inside the kaspad clone:
+//
+//   mkdir -p cmd/_kas994_coinsel_fixturegen
+//   cp <this-file> cmd/_kas994_coinsel_fixturegen/main.go
+//   /home/dima/sdk/go1.23.4/bin/go run ./cmd/_kas994_coinsel_fixturegen
+//
+// The program emits a single JSON object on stdout describing the
+// inputs and the resulting `serialization.SerializePartiallySignedTransaction`
+// hex bytes. The JSON is committed verbatim under
+// `cmd/kaspawallet/tests/fixtures/coinsel_create_unsigned.json`. The Rust
+// integration test `cmd/kaspawallet/tests/coinsel_parity.rs` loads the
+// JSON, replays the same logical inputs through the Rust port's
+// `crate::transaction::create_unsigned_transaction`, serializes the
+// result, and asserts byte equality.
+//
+// Reference: kaspad@4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2
+//   `cmd/kaspawallet/libkaspawallet/transaction.go::CreateUnsignedTransaction`
+//   `cmd/kaspawallet/libkaspawallet/serialization/serialization.go::SerializePartiallySignedTransaction`
+
+package main
+
+import (
+	"encoding/hex"
+	"encoding/json"
+	"fmt"
+	"os"
+
+	"github.com/kaspanet/kaspad/cmd/kaspawallet/libkaspawallet"
+	"github.com/kaspanet/kaspad/cmd/kaspawallet/libkaspawallet/serialization"
+	"github.com/kaspanet/kaspad/domain/consensus/model/externalapi"
+	"github.com/kaspanet/kaspad/domain/consensus/utils/utxo"
+	"github.com/kaspanet/kaspad/util"
+)
+
+// Cosigner-level testnet xpub reused from the existing
+// `cmd/kaspawallet/tests/fixtures/legacy_go_v1_singlekey.json` so the
+// fixture's xpub is consistent across the crate's test suites.
+const cosignerXpub = "ktub249YJayoDJS3tDjTW8NG3iAwufiDQ13uEptr8Wz2LgnzdVFLUQiRqFRPyq1xndcJMXFbYx268MSxHwukrnD52gWeshgeYseLmTBcUNHR1Xb"
+
+// Per-input relative derivation path, matching the Go daemon's
+// single-signer `m/<keyChain>/<index>` shape that
+// daemon/server/address.go:116 emits.
+const relativeDerivationPath = "m/0/0"
+
+const ecdsaPubKeyLen = 33
+
+type utxoFixture struct {
+	TransactionID       string `json:"transaction_id"`
+	Index               uint32 `json:"index"`
+	Amount              uint64 `json:"amount"`
+	ScriptPublicKeyVer  uint32 `json:"script_public_key_version"`
+	ScriptPublicKeyHex  string `json:"script_public_key_hex"`
+	BlockDaaScore       uint64 `json:"block_daa_score"`
+	IsCoinbase          bool   `json:"is_coinbase"`
+	DerivationPath      string `json:"derivation_path"`
+}
+
+type paymentFixture struct {
+	AddressString string `json:"address"`
+	Amount        uint64 `json:"amount"`
+}
+
+type fixture struct {
+	ExtendedPublicKeys []string         `json:"extended_public_keys"`
+	MinimumSignatures  uint32           `json:"minimum_signatures"`
+	AddressPrefix      string           `json:"address_prefix"`
+	SelectedUTXOs      []utxoFixture    `json:"selected_utxos"`
+	Payments           []paymentFixture `json:"payments"`
+	ExpectedPSTHex     string           `json:"expected_pst_hex"`
+}
+
+func main() {
+	prefix := util.Bech32PrefixKaspaTest
+
+	// Recipient and change addresses are 33-byte all-zero ECDSA
+	// public keys -- same shape the Go daemon's `estimateFee` uses
+	// for its worst-case mock outputs (see
+	// create_unsigned_transaction.go:264-268). Deterministic; needs
+	// no external state.
+	zeroPubKey := make([]byte, ecdsaPubKeyLen)
+	recipient, err := util.NewAddressPublicKeyECDSA(zeroPubKey, prefix)
+	if err != nil {
+		fail("recipient address", err)
+	}
+	change, err := util.NewAddressPublicKeyECDSA(append([]byte{0x01}, make([]byte, ecdsaPubKeyLen-1)...), prefix)
+	if err != nil {
+		fail("change address", err)
+	}
+
+	// Three synthetic UTXOs with deterministic outpoints (prev hash
+	// filled with the index byte). Sorted descending by amount as
+	// the daemon's `s.utxosSortedByAmount` would deliver them.
+	utxos := []*libkaspawallet.UTXO{
+		mkUtxo(1, 100_000_000_000),
+		mkUtxo(2, 50_000_000_000),
+		mkUtxo(3, 10_000_000_000),
+	}
+
+	// Two payments: recipient + change. Numbers chosen so the sum
+	// is well below the total UTXO value (no insufficient-funds
+	// branch); the Rust side replays the same arithmetic.
+	payments := []*libkaspawallet.Payment{
+		{Address: recipient, Amount: 75_000_000_000},
+		{Address: change, Amount: 60_000_000_000},
+	}
+
+	pst, err := libkaspawallet.CreateUnsignedTransaction(
+		[]string{cosignerXpub},
+		1,
+		payments,
+		utxos,
+	)
+	if err != nil {
+		fail("CreateUnsignedTransaction", err)
+	}
+
+	pstBytes, err := serialization.SerializePartiallySignedTransaction(pst)
+	if err != nil {
+		fail("SerializePartiallySignedTransaction", err)
+	}
+
+	out := fixture{
+		ExtendedPublicKeys: []string{cosignerXpub},
+		MinimumSignatures:  1,
+		AddressPrefix:      prefix.String(),
+		SelectedUTXOs:      make([]utxoFixture, len(utxos)),
+		Payments: []paymentFixture{
+			{AddressString: recipient.EncodeAddress(), Amount: payments[0].Amount},
+			{AddressString: change.EncodeAddress(), Amount: payments[1].Amount},
+		},
+		ExpectedPSTHex: hex.EncodeToString(pstBytes),
+	}
+
+	for i, u := range utxos {
+		out.SelectedUTXOs[i] = utxoFixture{
+			TransactionID:      hex.EncodeToString(u.Outpoint.TransactionID.ByteSlice()),
+			Index:              u.Outpoint.Index,
+			Amount:             u.UTXOEntry.Amount(),
+			ScriptPublicKeyVer: uint32(u.UTXOEntry.ScriptPublicKey().Version),
+			ScriptPublicKeyHex: hex.EncodeToString(u.UTXOEntry.ScriptPublicKey().Script),
+			BlockDaaScore:      u.UTXOEntry.BlockDAAScore(),
+			IsCoinbase:         u.UTXOEntry.IsCoinbase(),
+			DerivationPath:     u.DerivationPath,
+		}
+	}
+
+	enc := json.NewEncoder(os.Stdout)
+	enc.SetIndent("", "  ")
+	if err := enc.Encode(&out); err != nil {
+		fail("encode JSON", err)
+	}
+}
+
+func mkUtxo(idx byte, amount uint64) *libkaspawallet.UTXO {
+	var prevHash [externalapi.DomainHashSize]byte
+	for i := range prevHash {
+		prevHash[i] = idx
+	}
+	prevID := externalapi.NewDomainTransactionIDFromByteArray(&prevHash)
+
+	// 35-byte P2PK-shape script_public_key: OP_DATA_32 + 32-byte
+	// payload + OP_CHECKSIG. The payload is the index byte
+	// repeated so each UTXO's spk is distinct.
+	script := make([]byte, 35)
+	script[0] = 0x20
+	for i := 1; i < 33; i++ {
+		script[i] = idx
+	}
+	script[33] = 0xac
+
+	return &libkaspawallet.UTXO{
+		Outpoint: &externalapi.DomainOutpoint{
+			TransactionID: *prevID,
+			Index:         uint32(idx),
+		},
+		UTXOEntry: utxo.NewUTXOEntry(amount, &externalapi.ScriptPublicKey{
+			Script:  script,
+			Version: 0,
+		}, false, 0),
+		DerivationPath: relativeDerivationPath,
+	}
+}
+
+func fail(stage string, err error) {
+	fmt.Fprintf(os.Stderr, "%s: %v\n", stage, err)
+	os.Exit(1)
+}
