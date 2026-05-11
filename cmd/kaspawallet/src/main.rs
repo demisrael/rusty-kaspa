@@ -1,4 +1,4 @@
-//! Binary entry point. The 13-subcommand surface is wired via
+//! Binary entry point. The 17-subcommand surface is wired via
 //! `clap`; subcommands route to the in-crate `dispatch` module
 //! (offline subcommands compose the library directly; daemon-client
 //! subcommands dial the running daemon via the in-crate
@@ -41,6 +41,10 @@ fn main() -> ExitCode {
         Subcommand::ShowAddresses(args) => dispatch::run_show_addresses(args, &cli.network),
         Subcommand::NewAddress(args) => dispatch::run_new_address(args, &cli.network),
         Subcommand::Sweep(args) => dispatch::run_sweep(args, &cli.network),
+        Subcommand::BroadcastReplacement(args) => dispatch::run_broadcast_replacement(args, &cli.network),
+        Subcommand::BumpFee(args) => dispatch::run_bump_fee(args, &cli.network),
+        Subcommand::BumpFeeUnsigned(args) => dispatch::run_bump_fee_unsigned(args, &cli.network),
+        Subcommand::GetDaemonVersion(args) => dispatch::run_get_daemon_version(args),
     }
 }
 

@@ -348,3 +348,69 @@ fn cross_wallet_multisig_3of5_both_directions() {
     // diff rules as the 2-of-3 case.
     unreachable!("scaffold");
 }
+
+// --------------------------------------------------------------
+// RBF / version subcommands. Mirrors the parity-harness scaffolds
+// above; each new subcommand needs a live daemon (and for
+// `bump-fee` / `broadcast-replacement` a pending mempool tx on
+// tn-10) so the active assertion is deferred to the Validator's
+// tn-10 closure pass.
+// --------------------------------------------------------------
+
+#[test]
+#[ignore = "needs two daemons against one kaspad with a pre-signed replacement tx; un-ignore for the Validator's tn-10 closure run"]
+fn broadcast_replacement_byte_identity() {
+    // Mirrors the `broadcast` parity row: byte-identical
+    // tx-ID-list output. Daemon submits via kaspad's
+    // `submit_transaction_replacement` RPC; the Go and Rust
+    // binaries should produce the same stdout framing on the same
+    // pre-signed replacement hex.
+    unreachable!("scaffold");
+}
+
+#[test]
+#[ignore = "needs two daemons against one kaspad with a funded wallet + pending mempool tx; un-ignore for the Validator's tn-10 closure run"]
+fn bump_fee_byte_identity() {
+    // The `bump-fee` flow constructs a higher-fee replacement
+    // server-side, signs it client-side, and broadcasts via
+    // BroadcastReplacement. tx-ID framing should match Go's
+    // output byte-for-byte on the same tn-10 mempool entry.
+    unreachable!("scaffold");
+}
+
+#[test]
+#[ignore = "needs two daemons against one kaspad with a pending mempool tx; un-ignore for tn-10 closure run (Path-A coin-selected hex cmp)"]
+fn bump_fee_unsigned_byte_identity() {
+    // The `bump-fee-unsigned` flow returns the daemon's unsigned
+    // replacement PSTX hex. Under Path-A coin selection the
+    // emitted PSTX bytes should be identical between Go and
+    // Rust.
+    unreachable!("scaffold");
+}
+
+#[test]
+#[ignore = "sec.3.5.1 cross-binary interop MUST: Go-emitted `bump-fee-unsigned` PSKT signs cleanly under Rust `sign` and vice-versa; needs paired fixtures or two live daemons. Un-ignore for tn-10 closure run."]
+fn bump_fee_unsigned_pskt_cross_binary_interop_both_directions() {
+    // Cross-binary interop AC: Rust loads a Go-emitted
+    // `bump-fee-unsigned` PSKT and signs it without error; Go
+    // loads a Rust-emitted PSKT and signs it without error.
+    unreachable!("scaffold");
+}
+
+#[test]
+fn get_daemon_version_help_framing_parity() {
+    // The `get-daemon-version` subcommand has no client-side
+    // observable surface without a running daemon. The help-text
+    // framing (subcommand name + `--daemonaddress` flag presence)
+    // is the closest deterministic parity probe available
+    // offline.
+    let Some((go, rust)) = resolve_binaries("get_daemon_version_help_framing_parity") else {
+        return;
+    };
+    let go_help = run_capture(&go, &["get-daemon-version", "--help"]);
+    let rust_help = run_capture(&rust, &["get-daemon-version", "--help"]);
+    let go_text = String::from_utf8_lossy(&go_help);
+    let rust_text = String::from_utf8_lossy(&rust_help);
+    assert!(go_text.contains("daemonaddress"), "Go help-text must mention --daemonaddress: {go_text}");
+    assert!(rust_text.contains("daemonaddress"), "Rust help-text must mention --daemonaddress: {rust_text}");
+}

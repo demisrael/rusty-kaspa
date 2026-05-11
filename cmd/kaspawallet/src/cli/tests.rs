@@ -8,11 +8,11 @@ use clap::CommandFactory;
 use super::args::Cli;
 use super::wallet_backend::WalletBackend;
 
-/// The 13 subcommands in scope per the task's Scope block plus
-/// the 2026-05-11 lead addendum. Four Go subcommands
-/// (`broadcast-replacement`, `get-daemon-version`, `bump-fee`,
-/// `bump-fee-unsigned`) are deferred to a sibling cycle and MUST
-/// NOT appear in this list.
+/// The full 17-subcommand surface mirroring the Go reference's
+/// `parseCommandLine`. The four RBF-and-version subcommands
+/// (`broadcast-replacement`, `bump-fee`, `bump-fee-unsigned`,
+/// `get-daemon-version`) close the Phase-1 parity gap from the
+/// initial 13-subcommand subset.
 const EXPECTED_SUBCOMMANDS: &[&str] = &[
     "create",
     "dump-unencrypted-data",
@@ -27,6 +27,10 @@ const EXPECTED_SUBCOMMANDS: &[&str] = &[
     "new-address",
     "version",
     "sweep",
+    "broadcast-replacement",
+    "bump-fee",
+    "bump-fee-unsigned",
+    "get-daemon-version",
 ];
 
 #[test]
@@ -36,14 +40,14 @@ fn test_subcommand_registry_matches_go_set() {
     got.sort();
     let mut want: Vec<String> = EXPECTED_SUBCOMMANDS.iter().map(|s| (*s).to_string()).collect();
     want.sort();
-    assert_eq!(got, want, "registered subcommands deviate from the Go reference's Phase-1 subset");
+    assert_eq!(got, want, "registered subcommands deviate from the Go reference");
 }
 
 #[test]
-fn test_subcommand_count_is_thirteen() {
+fn test_subcommand_count_is_seventeen() {
     let cmd = Cli::command();
     let count = cmd.get_subcommands().count();
-    assert_eq!(count, 13, "Phase-1 subset is exactly 13 subcommands");
+    assert_eq!(count, 17, "full Phase-1 surface is exactly 17 subcommands");
 }
 
 #[test]
@@ -114,7 +118,19 @@ fn test_start_daemon_listen_default_is_loopback() {
 fn test_wallet_backend_flag_appears_only_on_keyfile_subcommands() {
     let cmd = Cli::command();
     let with_backend = ["create", "dump-unencrypted-data", "start-daemon", "sign", "parse", "sweep"];
-    let without_backend = ["balance", "send", "create-unsigned-transaction", "broadcast", "show-addresses", "new-address", "version"];
+    let without_backend = [
+        "balance",
+        "send",
+        "create-unsigned-transaction",
+        "broadcast",
+        "show-addresses",
+        "new-address",
+        "version",
+        "broadcast-replacement",
+        "bump-fee",
+        "bump-fee-unsigned",
+        "get-daemon-version",
+    ];
 
     for name in &with_backend {
         let sub = cmd.find_subcommand(name).expect("subcommand registered");
@@ -198,5 +214,55 @@ fn test_subcommand_parsing_smoke() {
         assert_eq!(args.wallet_backend, WalletBackend::Ledger);
     } else {
         panic!("expected Create subcommand");
+    }
+}
+
+#[test]
+fn test_rbf_subcommands_parse_with_expected_flags() {
+    use clap::Parser;
+
+    let cli = Cli::try_parse_from([
+        "kaspawallet",
+        "bump-fee",
+        "--txid",
+        "deadbeef",
+        "--password",
+        "pw",
+        "--max-fee-rate",
+        "12.5",
+        "--show-serialized",
+    ])
+    .expect("bump-fee parses");
+    if let super::Subcommand::BumpFee(args) = cli.command {
+        assert_eq!(args.txid.as_deref(), Some("deadbeef"));
+        assert_eq!(args.password.as_deref(), Some("pw"));
+        assert_eq!(args.max_fee_rate, Some(12.5));
+        assert!(args.show_serialized);
+    } else {
+        panic!("expected BumpFee subcommand");
+    }
+
+    let cli = Cli::try_parse_from(["kaspawallet", "bump-fee-unsigned", "--txid", "feedface", "--fee-rate", "3.0"])
+        .expect("bump-fee-unsigned parses");
+    if let super::Subcommand::BumpFeeUnsigned(args) = cli.command {
+        assert_eq!(args.txid.as_deref(), Some("feedface"));
+        assert_eq!(args.fee_rate, Some(3.0));
+    } else {
+        panic!("expected BumpFeeUnsigned subcommand");
+    }
+
+    let cli =
+        Cli::try_parse_from(["kaspawallet", "broadcast-replacement", "--transaction", "00ff"]).expect("broadcast-replacement parses");
+    if let super::Subcommand::BroadcastReplacement(args) = cli.command {
+        assert_eq!(args.transaction.as_deref(), Some("00ff"));
+    } else {
+        panic!("expected BroadcastReplacement subcommand");
+    }
+
+    let cli = Cli::try_parse_from(["kaspawallet", "get-daemon-version"]).expect("get-daemon-version parses with defaults");
+    if let super::Subcommand::GetDaemonVersion(args) = cli.command {
+        assert_eq!(args.daemon_address, super::args::DEFAULT_LISTEN);
+    } else {
+        panic!("expected GetDaemonVersion subcommand");
     }
 }

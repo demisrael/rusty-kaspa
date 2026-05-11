@@ -31,13 +31,13 @@ use tonic::Request;
 use zeroize::Zeroizing;
 
 use crate::cli::{
-    BalanceArgs, BroadcastArgs, CreateArgs, CreateUnsignedTransactionArgs, DumpUnencryptedDataArgs, NetworkFlags, NewAddressArgs,
-    SendArgs, ShowAddressesArgs, SignArgs, SweepArgs, WalletBackend,
+    BalanceArgs, BroadcastArgs, BumpFeeArgs, BumpFeeUnsignedArgs, CreateArgs, CreateUnsignedTransactionArgs, DumpUnencryptedDataArgs,
+    GetDaemonVersionArgs, NetworkFlags, NewAddressArgs, SendArgs, ShowAddressesArgs, SignArgs, SweepArgs, WalletBackend,
 };
 use crate::daemon::DaemonClient;
 use crate::daemon::pb::{
-    BroadcastRequest, CreateUnsignedTransactionsRequest, FeePolicy, GetBalanceRequest, GetExternalSpendableUtxOsRequest,
-    NewAddressRequest, ShowAddressesRequest, fee_policy,
+    BroadcastRequest, BumpFeeRequest, CreateUnsignedTransactionsRequest, FeePolicy, GetBalanceRequest,
+    GetExternalSpendableUtxOsRequest, NewAddressRequest, ShowAddressesRequest, fee_policy,
 };
 use crate::keyfile::{self, KeysFile, LATEST_VERSION};
 use crate::keysource::{default_keys_file, require_existing_keyfile};
@@ -322,6 +322,187 @@ pub fn run_broadcast(args: BroadcastArgs, top: &NetworkFlags) -> ExitCode {
             println!("\t{txid}");
         }
         ExitCode::SUCCESS
+    })
+}
+
+pub fn run_broadcast_replacement(args: BroadcastArgs, top: &NetworkFlags) -> ExitCode {
+    let _network = merge_network(top, &args.network);
+    let tx_hex = match resolve_transaction_hex(args.transaction.as_deref(), args.transaction_file.as_deref(), "broadcast-replacement")
+    {
+        Ok(s) => s,
+        Err(e) => return e,
+    };
+    let transactions = match decode_transactions_from_hex(&tx_hex) {
+        Ok(t) => t,
+        Err(e) => return fail(format!("'broadcast-replacement': invalid hex: {e}")),
+    };
+    let runtime = match build_runtime() {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    runtime.block_on(async move {
+        let mut client = match dial_daemon(&args.daemon_address).await {
+            Ok(c) => c,
+            Err(e) => return fail(format!("dial daemon '{}': {e}", args.daemon_address)),
+        };
+        let resp =
+            match client.inner_mut().broadcast_replacement(with_timeout(BroadcastRequest { is_domain: false, transactions })).await {
+                Ok(r) => r.into_inner(),
+                Err(s) => return fail(format!("BroadcastReplacement failed: {s}")),
+            };
+        println!("Transactions were sent successfully");
+        println!("Transaction ID(s): ");
+        for txid in &resp.tx_i_ds {
+            println!("\t{txid}");
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+pub fn run_bump_fee(args: BumpFeeArgs, top: &NetworkFlags) -> ExitCode {
+    let network = merge_network(top, &args.network);
+    let password = match require_password(&args.password, "bump-fee") {
+        Ok(p) => p,
+        Err(e) => return e,
+    };
+    let (kf, _path) = match read_keyfile(&network, args.keys_file.as_deref()) {
+        Ok(v) => v,
+        Err(e) => return e,
+    };
+    if kf.extended_public_keys.len() > kf.encrypted_mnemonics.len() {
+        return fail("cannot use 'bump-fee' command for multisig wallet without all of the keys");
+    }
+    let policy = fee_policy_from_args(args.fee_rate, args.max_fee_rate, args.max_fee);
+
+    let runtime = match build_runtime() {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    runtime.block_on(async move {
+        let mut client = match dial_daemon(&args.daemon_address).await {
+            Ok(c) => c,
+            Err(e) => return fail(format!("dial daemon '{}': {e}", args.daemon_address)),
+        };
+        // Mirror Go: the BumpFee request omits the password. The
+        // daemon returns unsigned replacement transactions; signing
+        // happens client-side and broadcast uses the replacement
+        // RPC.
+        let req = BumpFeeRequest {
+            password: String::new(),
+            from: args.from_address.clone(),
+            use_existing_change_address: args.use_existing_change_address,
+            fee_policy: policy,
+            tx_id: args.txid.clone().unwrap_or_default(),
+        };
+        let unsigned = match client.inner_mut().bump_fee(with_timeout(req)).await {
+            Ok(r) => r.into_inner().transactions,
+            Err(s) => return fail(format!("BumpFee failed: {s}")),
+        };
+        let mnemonics = match keyfile::decrypt_mnemonics(&kf, password.as_bytes()) {
+            Ok(m) => m,
+            Err(e) => return fail(format!("keyfile decryption failed: {e}")),
+        };
+        let mut signed: Vec<Vec<u8>> = Vec::with_capacity(unsigned.len());
+        for bytes in &unsigned {
+            let mut pst = match serialization::deserialize_partially_signed_transaction(bytes) {
+                Ok(p) => p,
+                Err(e) => return fail(format!("PSTX deserialization failed: {e}")),
+            };
+            for mnemonic in mnemonics.iter() {
+                let res = if kf.ecdsa {
+                    sign_pst_ecdsa_with_mnemonic(&mut pst, mnemonic, "")
+                } else {
+                    sign_pst_schnorr_with_mnemonic(&mut pst, mnemonic, "")
+                };
+                if let Err(e) = res {
+                    return fail(format!("sign failed: {e}"));
+                }
+            }
+            let out = match serialization::serialize_partially_signed_transaction(&pst) {
+                Ok(b) => b,
+                Err(e) => return fail(format!("PSTX serialization failed: {e}")),
+            };
+            signed.push(out);
+        }
+
+        println!("Broadcasting {} transaction(s)", signed.len());
+        let chunk_size = 100;
+        let total = signed.len();
+        let mut sent = 0usize;
+        for chunk in signed.chunks(chunk_size) {
+            let resp = match client
+                .inner_mut()
+                .broadcast_replacement(with_timeout(BroadcastRequest { is_domain: false, transactions: chunk.to_vec() }))
+                .await
+            {
+                Ok(r) => r.into_inner(),
+                Err(s) => return fail(format!("BroadcastReplacement failed: {s}")),
+            };
+            sent += chunk.len();
+            let pct = 100.0 * sent as f64 / total as f64;
+            println!("Broadcasted {} transaction(s) (broadcasted {pct:.2}% of the transactions so far)", chunk.len());
+            println!("Broadcasted Transaction ID(s): ");
+            for txid in &resp.tx_i_ds {
+                println!("\t{txid}");
+            }
+        }
+        if args.show_serialized {
+            println!("Serialized Transaction(s) (can be parsed via the `parse` command or resent via `broadcast`): ");
+            for tx in &signed {
+                println!("\t{}\n", hex::encode(tx));
+            }
+        }
+        ExitCode::SUCCESS
+    })
+}
+
+pub fn run_bump_fee_unsigned(args: BumpFeeUnsignedArgs, top: &NetworkFlags) -> ExitCode {
+    let _network = merge_network(top, &args.network);
+    let policy = fee_policy_from_args(args.fee_rate, args.max_fee_rate, args.max_fee);
+
+    let runtime = match build_runtime() {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    runtime.block_on(async move {
+        let mut client = match dial_daemon(&args.daemon_address).await {
+            Ok(c) => c,
+            Err(e) => return fail(format!("dial daemon '{}': {e}", args.daemon_address)),
+        };
+        let req = BumpFeeRequest {
+            password: String::new(),
+            from: args.from_address.clone(),
+            use_existing_change_address: args.use_existing_change_address,
+            fee_policy: policy,
+            tx_id: args.txid.clone().unwrap_or_default(),
+        };
+        let resp = match client.inner_mut().bump_fee(with_timeout(req)).await {
+            Ok(r) => r.into_inner(),
+            Err(s) => return fail(format!("BumpFee failed: {s}")),
+        };
+        eprintln!("Created unsigned transaction");
+        println!("{}", encode_transactions_to_hex(&resp.transactions));
+        ExitCode::SUCCESS
+    })
+}
+
+pub fn run_get_daemon_version(args: GetDaemonVersionArgs) -> ExitCode {
+    let runtime = match build_runtime() {
+        Ok(r) => r,
+        Err(e) => return e,
+    };
+    runtime.block_on(async move {
+        let mut client = match dial_daemon(&args.daemon_address).await {
+            Ok(c) => c,
+            Err(e) => return fail(format!("dial daemon '{}': {e}", args.daemon_address)),
+        };
+        match client.get_version().await {
+            Ok(v) => {
+                println!("{v}");
+                ExitCode::SUCCESS
+            }
+            Err(s) => fail(format!("GetVersion failed: {s}")),
+        }
     })
 }
 

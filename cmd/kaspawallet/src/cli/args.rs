@@ -78,6 +78,20 @@ pub enum Subcommand {
     /// Sweep all funds controlled by the supplied private key
     /// into the running daemon's wallet.
     Sweep(SweepArgs),
+    /// Broadcast a signed replacement transaction (RBF) over the
+    /// running daemon. Same flags as `broadcast`; the daemon
+    /// forwards via `kaspad`'s replacement-aware submit RPC.
+    BroadcastReplacement(BroadcastArgs),
+    /// Bump the fee of a pending mempool transaction. Constructs
+    /// a higher-fee replacement, signs it locally with the
+    /// keyfile, and broadcasts via the daemon.
+    BumpFee(BumpFeeArgs),
+    /// Bump the fee of a pending mempool transaction without
+    /// signing. Emits the unsigned replacement transaction(s) as
+    /// hex for offline signing.
+    BumpFeeUnsigned(BumpFeeUnsignedArgs),
+    /// Print the running daemon's reported version string.
+    GetDaemonVersion(GetDaemonVersionArgs),
 }
 
 /// `create` subcommand. Mirrors `createConfig` in Go.
@@ -389,4 +403,88 @@ pub struct SweepArgs {
 
     #[command(flatten)]
     pub network: NetworkFlags,
+}
+
+/// `bump-fee` subcommand. Mirrors `bumpFeeConfig`. Local-signing
+/// flow: the daemon returns unsigned replacement transactions and
+/// the CLI signs them client-side, then broadcasts.
+#[derive(clap::Args, Debug)]
+pub struct BumpFeeArgs {
+    /// Transaction ID of the pending mempool entry to replace.
+    #[arg(long = "txid", short = 'i', value_name = "TXID")]
+    pub txid: Option<String>,
+
+    #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
+    pub keys_file: Option<String>,
+
+    #[arg(long, short = 'p', value_name = "PASSWORD")]
+    pub password: Option<String>,
+
+    #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
+    pub daemon_address: String,
+
+    /// Restrict input selection to these source addresses. Repeat
+    /// to accept several.
+    #[arg(long = "from-address", short = 'a', value_name = "KASPA_ADDRESS")]
+    pub from_address: Vec<String>,
+
+    #[arg(long = "use-existing-change-address", short = 'u')]
+    pub use_existing_change_address: bool,
+
+    #[arg(long = "max-fee-rate", short = 'm', value_name = "SOMPI_PER_GRAM")]
+    pub max_fee_rate: Option<f64>,
+
+    #[arg(long = "fee-rate", short = 'r', value_name = "SOMPI_PER_GRAM")]
+    pub fee_rate: Option<f64>,
+
+    #[arg(long = "max-fee", short = 'x', value_name = "SOMPI")]
+    pub max_fee: Option<u64>,
+
+    /// Show hex-encoded signed replacement transactions after
+    /// broadcast.
+    #[arg(long = "show-serialized", short = 's')]
+    pub show_serialized: bool,
+
+    #[command(flatten)]
+    pub network: NetworkFlags,
+}
+
+/// `bump-fee-unsigned` subcommand. Mirrors `bumpFeeUnsignedConfig`.
+/// Returns the daemon's unsigned replacement transaction(s) as
+/// hex; no keyfile is read.
+#[derive(clap::Args, Debug)]
+pub struct BumpFeeUnsignedArgs {
+    /// Transaction ID of the pending mempool entry to replace.
+    #[arg(long = "txid", short = 'i', value_name = "TXID")]
+    pub txid: Option<String>,
+
+    #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
+    pub daemon_address: String,
+
+    #[arg(long = "from-address", short = 'a', value_name = "KASPA_ADDRESS")]
+    pub from_address: Vec<String>,
+
+    #[arg(long = "use-existing-change-address", short = 'u')]
+    pub use_existing_change_address: bool,
+
+    #[arg(long = "max-fee-rate", short = 'm', value_name = "SOMPI_PER_GRAM")]
+    pub max_fee_rate: Option<f64>,
+
+    #[arg(long = "fee-rate", short = 'r', value_name = "SOMPI_PER_GRAM")]
+    pub fee_rate: Option<f64>,
+
+    #[arg(long = "max-fee", short = 'x', value_name = "SOMPI")]
+    pub max_fee: Option<u64>,
+
+    #[command(flatten)]
+    pub network: NetworkFlags,
+}
+
+/// `get-daemon-version` subcommand. Mirrors
+/// `getDaemonVersionConfig`. Only `--daemonaddress`; no network
+/// flags (the daemon's reported version is network-agnostic).
+#[derive(clap::Args, Debug)]
+pub struct GetDaemonVersionArgs {
+    #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
+    pub daemon_address: String,
 }
