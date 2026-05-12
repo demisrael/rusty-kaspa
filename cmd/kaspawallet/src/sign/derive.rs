@@ -1,20 +1,21 @@
-//! Cosigner-prefix-then-relative-path BIP-32 derivation helper shared
-//! by the Schnorr and ECDSA single-cosigner sign modules.
+//! Cosigner-prefix-then-relative-path BIP-32 derivation helper
+//! shared by the Schnorr and ECDSA single-cosigner sign modules.
 //!
-//! Mirrors Go libkaspawallet.sign() at
-//! https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/sign.go#L46
-//! (`defaultPath(isMultisig)` -> `extendedKeyFromMnemonicAndPath` ->
-//! `extendedKey.DeriveFromPath(partiallySignedInput.DerivationPath)` ->
-//! `derivedKey.Public()` -> `pair.ExtendedPublicKey ==
-//! derivedPublicKey.String()`).
+//! Reference: [BIP-32](https://github.com/bitcoin/bips/blob/master/bip-0032.mediawiki).
 //!
-//! The stored `PubKeySignaturePair.ExtendedPublicKey` is the
-//! LEAF-level xpub; the stored `PartiallySignedInput.DerivationPath`
-//! is RELATIVE to the cosigner prefix
-//! (`m/<purpose>'/<COIN_TYPE>'/0'`). See
-//! https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/transaction.go#L102
-//! (`emptyPubKeySignaturePairs[i].ExtendedPublicKey = derivedKey.String()`
-//! where `derivedKey` is the cosigner-xpub-derived leaf).
+//! The derivation chain is:
+//!
+//! 1. Walk the master xpriv to `m/<purpose>'/<COIN_TYPE>'/0'`.
+//! 2. Extend by the per-input `DerivationPath` from the PST.
+//! 3. Extract the public half and match against the
+//!    `PubKeySignaturePair.ExtendedPublicKey`.
+//!
+//! Two layout invariants the rest of the wallet depends on:
+//!
+//! - `PubKeySignaturePair.ExtendedPublicKey` stores the LEAF-level
+//!   xpub.
+//! - `PartiallySignedInput.DerivationPath` is RELATIVE to the
+//!   cosigner prefix `m/<purpose>'/<COIN_TYPE>'/0'`.
 
 use std::str::FromStr;
 
@@ -23,39 +24,33 @@ use kaspa_bip32::{DerivationPath, ExtendedPrivateKey, ExtendedPublicKey, Prefix,
 use super::error::SignError;
 use crate::serialization::wire;
 
-/// BIP-43 purpose component for single-signer wallets. Source:
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/bip39.go#L20
-/// (`SingleSignerPurpose = 44`).
+/// BIP-43 purpose component for single-signer wallets.
 const SINGLE_SIGNER_PURPOSE: u32 = 44;
 
-/// BIP-43-style purpose component for multisig wallets. Source:
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/bip39.go#L22
-/// (`MultiSigPurpose = 45`).
+/// BIP-43-style purpose component for multisig wallets.
 const MULTISIG_PURPOSE: u32 = 45;
 
-/// Kaspa SLIP-0044 coin-type component. Source:
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/bip39.go#L26
-/// (`CoinType = 111111`).
+/// Kaspa SLIP-0044 coin-type component.
 const COIN_TYPE: u32 = 111111;
 
 /// Length of the textual version prefix in a serialized extended
 /// public key (`kpub`, `ktub`, etc.).
 const XPUB_PREFIX_LEN: usize = 4;
 
-/// Derive the leaf signing key for a partially-signed input and locate
-/// the matching `PubKeySignaturePair`. Mirrors Go's chain:
+/// Derive the leaf signing key for a partially-signed input and
+/// locate the matching `PubKeySignaturePair`. The chain runs:
 ///
-/// 1. Walk the master xpriv to `m/<purpose>'/<COIN_TYPE>'/0'`, where
-///    `purpose` is 44 for single-signer (one pair) or 45 for multisig
-///    (more than one pair).
+/// 1. Walk the master xpriv to `m/<purpose>'/<COIN_TYPE>'/0'`,
+///    where `purpose` is 44 for single-signer (one pair) or 45
+///    for multisig (more than one pair).
 /// 2. Walk the resulting cosigner xpriv via the input's relative
 ///    derivation path (e.g. `m/0/0`) to the leaf xpriv.
 /// 3. Match the leaf xpub's serialized form against every stored
 ///    pair's `extended_pub_key`, reusing each pair's own textual
 ///    prefix to drive the version bytes (so a `ktub`-stored pair
 ///    compares with a `ktub`-encoded leaf, a `kpub` pair with a
-///    `kpub`-encoded leaf, etc. -- the Go binary's network selection
-///    flows through the user-supplied cosigner xpub).
+///    `kpub`-encoded leaf, etc. -- network selection flows through
+///    the user-supplied cosigner xpub).
 pub(super) fn derive_leaf_and_match_pair(
     master: &ExtendedPrivateKey<SecretKey>,
     psi: &wire::PartiallySignedInput,

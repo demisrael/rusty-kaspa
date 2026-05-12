@@ -1,8 +1,7 @@
 //! Exclusive keyfile lock. Acquires `<keysfile>.lock` via the
-//! cross-platform [`fd_lock`] crate for the daemon's lifetime;
-//! mirrors Go's `keys.File.TryLock` semantics in
-//! `cmd/kaspawallet/keys/keys.go`. On POSIX the underlying primitive
-//! is `flock(2)`; on Windows it is `LockFileEx`.
+//! cross-platform [`fd_lock`] crate for the daemon's lifetime.
+//! On POSIX the underlying primitive is `flock(2)`; on Windows
+//! it is `LockFileEx`.
 
 use std::ffi::OsString;
 use std::fs::{File, OpenOptions};

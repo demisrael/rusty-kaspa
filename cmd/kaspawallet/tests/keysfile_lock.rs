@@ -1,7 +1,6 @@
 //! Integration test for the exclusive keyfile lock the daemon
 //! acquires in `start_daemon`. Two acquisitions against the same
-//! keyfile path must fail the second one, mirroring Go
-//! `keys.File.TryLock` semantics.
+//! keyfile path must fail the second one.
 //!
 //! This integration test exists alongside the in-crate unit tests
 //! in `daemon::keysfile_lock::tests` so the public guarantee

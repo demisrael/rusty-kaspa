@@ -1,20 +1,19 @@
-//! Standalone-CLI subcommand dispatchers. Each `run_<name>` function
-//! is invoked by `main.rs` after `clap` has resolved the per-
-//! subcommand argument struct; the function performs the same flow
-//! the Go `cmd/kaspawallet/<name>.go` counterpart performs.
+//! Standalone-CLI subcommand dispatchers. Each `run_<name>`
+//! function is invoked by `main.rs` after `clap` has resolved the
+//! per-subcommand argument struct.
 //!
-//! Offline subcommands (`sign`, `dump-unencrypted-data`, `create`,
-//! `sweep` partial) read or write the keyfile directly. Daemon-
-//! client subcommands (`balance`, `send`, `create-unsigned-
-//! transaction`, `broadcast`, `show-addresses`, `new-address`) dial
-//! a running daemon at `--daemonaddress` via the in-crate
+//! Offline subcommands (`sign`, `dump-unencrypted-data`,
+//! `create`, `sweep` partial) read or write the keyfile directly.
+//! Daemon-client subcommands (`balance`, `send`,
+//! `create-unsigned-transaction`, `broadcast`, `show-addresses`,
+//! `new-address`) dial a running daemon at `--daemonaddress` via
+//! the in-crate
 //! [`DaemonClient`](crate::daemon::DaemonClient) wrapper.
 //!
-//! Password handling: the Go binary prompts via terminal when
-//! `--password` is empty; the Phase 1 Rust port requires the flag
-//! to be supplied non-interactively. Interactive `rpassword`-style
+//! Password handling: subcommands require `--password` to be
+//! supplied non-interactively; interactive `rpassword`-style
 //! prompts are a deliberate follow-on. Scripted / piped operator
-//! flows (the common automation case) work today.
+//! flows work today.
 
 use std::fs;
 use std::io::{self, Write};
@@ -45,29 +44,22 @@ use crate::serialization;
 use crate::sign::{is_pst_fully_signed, sign_pst_ecdsa_with_mnemonic, sign_pst_schnorr_with_mnemonic};
 use crate::transactions_hex::{decode_transactions_from_hex, encode_transactions_to_hex};
 
-/// Default per-RPC wait timeout. Matches Go
-/// `cmd/kaspawallet/daemon_client.go::daemonTimeout = 2 *
-/// time.Minute`.
+/// Default per-RPC wait timeout for daemon client calls.
 const DAEMON_TIMEOUT: Duration = Duration::from_secs(120);
 
-/// Sompi-per-kaspa multiplier mirroring Go
-/// `domain/consensus/utils/constants.SompiPerKaspa = 100_000_000`.
+/// Sompi-per-kaspa multiplier.
 const SOMPI_PER_KASPA: u64 = 100_000_000;
 
-/// Per-input fee for sweep transactions. Matches Go
-/// `cmd/kaspawallet/sweep.go::feePerInput = 10000`.
+/// Per-input fee for sweep transactions.
 const SWEEP_FEE_PER_INPUT: u64 = 10_000;
 
-/// BIP-43 purpose component for single-signer wallets. Source:
-/// `cmd/kaspawallet/libkaspawallet/bip39.go::SingleSignerPurpose = 44`.
+/// BIP-43 purpose component for single-signer wallets.
 const SINGLE_SIGNER_PURPOSE: u32 = 44;
 
-/// BIP-43-style purpose component for multisig wallets. Source:
-/// `cmd/kaspawallet/libkaspawallet/bip39.go::MultiSigPurpose = 45`.
+/// BIP-43-style purpose component for multisig wallets.
 const MULTISIG_PURPOSE: u32 = 45;
 
-/// Kaspa SLIP-0044 coin type. Source:
-/// `cmd/kaspawallet/libkaspawallet/bip39.go::CoinType = 111111`.
+/// Kaspa SLIP-0044 coin type.
 const COIN_TYPE: u32 = 111111;
 
 // ---- shared helpers -------------------------------------------------
@@ -123,9 +115,9 @@ fn read_keyfile(network: &NetworkFlags, keys_override: Option<&str>) -> Result<(
 }
 
 fn parse_kas_to_sompi(amount: &str) -> Result<u64, String> {
-    // Mirror Go `utils.KasToSompi`: validate `^([1-9]\d{0,11}|0)(\.\d{0,8})?$`,
-    // then scale to sompi. Implemented locally to avoid pulling regex
-    // for a single shape.
+    // Validate against `^([1-9]\d{0,11}|0)(\.\d{0,8})?$` and
+    // scale to sompi. Implemented locally to avoid pulling in
+    // the `regex` crate for a single pattern.
     if amount.is_empty() {
         return Err("invalid amount: empty".to_owned());
     }
@@ -151,8 +143,8 @@ fn parse_kas_to_sompi(amount: &str) -> Result<u64, String> {
     padded.parse::<u64>().map_err(|e| format!("invalid amount '{amount}': {e}"))
 }
 
-/// Mirrors Go `utils.FormatKas` (8 decimal places, fixed 19-char
-/// width, space-padded for zero amounts).
+/// Format an amount in sompi as 8-decimal KAS, fixed 19-char
+/// width, space-padded for zero amounts.
 fn format_kas(amount_sompi: u64) -> String {
     if amount_sompi == 0 {
         return "                   ".to_owned();
@@ -182,9 +174,9 @@ fn with_timeout<T>(req: T) -> Request<T> {
 }
 
 fn xpub_prefix(network: &NetworkFlags) -> Bip32Prefix {
-    // Go uses `kpub`/`ktub` per network at the keyfile-write boundary
-    // (see `cmd/kaspawallet/libkaspawallet/bip39.go`'s extended-key
-    // version selection).
+    // Keyfile-format pins extended-pubkey version bytes per
+    // network: `kpub` for mainnet, `ktub` for every test
+    // network.
     match network_type(network) {
         NetworkType::Mainnet => Bip32Prefix::KPUB,
         NetworkType::Testnet | NetworkType::Simnet | NetworkType::Devnet => Bip32Prefix::KTUB,
@@ -383,8 +375,8 @@ pub fn run_bump_fee(args: BumpFeeArgs, top: &NetworkFlags) -> ExitCode {
             Ok(c) => c,
             Err(e) => return fail(format!("dial daemon '{}': {e}", args.daemon_address)),
         };
-        // Mirror Go: the BumpFee request omits the password. The
-        // daemon returns unsigned replacement transactions; signing
+        // The BumpFee request omits the password: the daemon
+        // returns unsigned replacement transactions; signing
         // happens client-side and broadcast uses the replacement
         // RPC.
         let req = BumpFeeRequest {
@@ -625,7 +617,6 @@ pub fn run_send(args: SendArgs, top: &NetworkFlags) -> ExitCode {
         }
 
         println!("Broadcasting {} transaction(s)", signed.len());
-        // Reset timeout for broadcast (matches Go's separate context).
         let chunk_size = 100;
         let total = signed.len();
         let mut sent = 0usize;
@@ -646,9 +637,6 @@ pub fn run_send(args: SendArgs, top: &NetworkFlags) -> ExitCode {
                 println!("\t{txid}");
             }
         }
-        // `--show-serialized` (Go names it differently in client vs
-        // daemon; matches the `verbose` field on the Go config struct
-        // for the `send` subcommand).
         if args.show_serialized {
             println!("Serialized Transaction(s) (can be parsed via the `parse` command or resent via `broadcast`): ");
             for tx in &signed {
@@ -771,12 +759,12 @@ pub fn run_create(args: CreateArgs, top: &NetworkFlags) -> ExitCode {
     }
     if args.import {
         return fail(
-            "'create --import' (interactive mnemonic import) is a Phase-2 enhancement of the Rust port; use --keys-file with a pre-existing Go-format keyfile in the interim",
+            "'create --import' (interactive mnemonic import) is a Phase-2 enhancement; use --keys-file with a pre-existing keyfile in the interim",
         );
     }
     if args.num_public_keys > args.num_private_keys {
         return fail(
-            "'create' with cosigner xpub stdin prompts (--num-public-keys > --num-private-keys) is a Phase-2 enhancement of the Rust port; multisig wallet creation requires interactive stdin",
+            "'create' with cosigner xpub stdin prompts (--num-public-keys > --num-private-keys) is a Phase-2 enhancement; multisig wallet creation requires interactive stdin",
         );
     }
     if args.num_private_keys != args.num_public_keys {
@@ -884,15 +872,14 @@ pub fn run_sweep(args: SweepArgs, top: &NetworkFlags) -> ExitCode {
     // address, signing the inputs with the supplied private key,
     // and broadcasting them. The daemon-side
     // `GetExternalSpendableUTXOs` + `NewAddress` + `Broadcast`
-    // primitives are wired (B4-tx-composition / B4-tx-mechanical);
-    // the sweep transaction builder (consensus-tx construction
-    // from raw private-key inputs, distinct from the
-    // libkaspawallet PSTX flow used by `sign`) is a Phase-2
+    // primitives are wired; the sweep transaction builder
+    // (consensus-tx construction from raw private-key inputs,
+    // distinct from the PSTX flow used by `sign`) is a Phase-2
     // surface the standalone CLI does not yet compose. The
     // operator-visible diagnostic surfaces the daemon-known UTXO
     // count and the resolved sweep-source address so a manual
-    // sweep can be constructed and broadcast via the daemon-client
-    // surface in the interim.
+    // sweep can be constructed and broadcast via the
+    // daemon-client surface in the interim.
 
     let runtime = match build_runtime() {
         Ok(r) => r,

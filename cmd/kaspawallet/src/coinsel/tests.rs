@@ -1,10 +1,11 @@
 //! Unit tests for the coin-selection algorithm core.
 //!
-//! These are pure-Rust tests against synthetic UTXO sets that pin
-//! the deterministic ordering rule, the two break conditions, the
-//! KIP-9 dust-margin policy, and the insufficient-funds error path.
-//! Cross-binary byte-identity against Go-emitted PSTs is exercised
-//! by the dedicated integration test under `tests/coinsel_parity.rs`.
+//! These are pure-Rust tests against synthetic UTXO sets that
+//! pin the deterministic ordering rule, the two break conditions,
+//! the KIP-9 dust-margin policy, and the insufficient-funds
+//! error path. Cross-implementation byte-identity is exercised
+//! by the dedicated integration test under
+//! `tests/coinsel_parity.rs`.
 
 use super::*;
 use crate::transaction::{Utxo, outpoint};
@@ -50,8 +51,8 @@ fn mk_utxo(idx: u32, amount: u64, derivation_path: &str) -> Utxo {
 }
 
 /// Build a sorted-by-amount-descending slice of the supplied
-/// amounts. Mirrors the daemon's `sort.Slice(utxos, ... > ...)`
-/// invocation in `daemon/server/sync.go:279`.
+/// amounts (matches the input ordering the daemon's UTXO sync
+/// loop produces).
 fn sorted_desc(amounts: &[u64]) -> Vec<Utxo> {
     let mut utxos: Vec<Utxo> = amounts.iter().enumerate().map(|(i, &a)| mk_utxo(i as u32 + 1, a, "m/0/0")).collect();
     utxos.sort_by(|a, b| b.utxo_entry.amount.cmp(&a.utxo_entry.amount));
@@ -61,7 +62,7 @@ fn sorted_desc(amounts: &[u64]) -> Vec<Utxo> {
 #[test]
 fn test_select_utxos_single_input_exact_spend() {
     // Exact match path: total_value == total_spend after one
-    // iteration -> immediate break under Go's first break case.
+    // iteration -> immediate break under the first break case.
     // We cannot pre-compute the fee without running the mass calc,
     // so we set `spend_amount` so that even with the largest
     // possible fee the single largest UTXO covers it. Asserts:
@@ -72,8 +73,9 @@ fn test_select_utxos_single_input_exact_spend() {
     let sel = select_utxos(&cfg, &params, &utxos, &[], 500_000_000, false, 1.0, 100_000_000).expect("select");
     assert_eq!(sel.selected.len(), 1, "single sufficient UTXO -> single-input selection");
     assert!(sel.change_sompi > 0, "change must be present (total_value > spend + fee)");
-    // One-input-with-change disallowed by Go break case 2 (need
-    // selected.len() > 1 for change-with-dust-margin); but the
+    // One-input-with-change disallowed by break case 2 (which
+    // requires selected.len() > 1 for change-with-dust-margin);
+    // the
     // first-loop iteration's break check fires only when
     // total_value == total_spend OR (>=spend+min_change AND
     // len>1). With len==1 and total>spend+min_change, neither
@@ -89,8 +91,9 @@ fn test_select_utxos_two_inputs_meets_dust_margin() {
     // total >= spend + fee + MIN_CHANGE_TARGET.
     let cfg = cfg();
     let params = params();
-    // Two UTXOs of 5 KAS each (sorted desc -> equal amounts; tied
-    // ordering is preserved by Go's stable sort.Slice).
+    // Two UTXOs of 5 KAS each (sorted desc -> equal amounts;
+    // tied ordering is preserved deterministically by the
+    // selector).
     let utxos = sorted_desc(&[2_500_000_000, 2_500_000_000]); // 25 KAS + 25 KAS
     // Spend 10 KAS, leave plenty for fee + change:
     let sel = select_utxos(&cfg, &params, &utxos, &[], 1_000_000_000, false, 1.0, 100_000_000).expect("select");
@@ -100,14 +103,14 @@ fn test_select_utxos_two_inputs_meets_dust_margin() {
 
 #[test]
 fn test_select_utxos_largest_first_ordering() {
-    // Mirror the daemon's sorted-by-amount-desc input ordering and
-    // assert the selected slice carries the largest UTXOs first.
+    // Sorted-by-amount-desc input; assert the selected slice
+    // carries the largest UTXOs first.
     let cfg = cfg();
     let params = params();
     let utxos = sorted_desc(&[100_000_000_000, 50_000_000_000, 10_000_000_000, 1_000_000_000]); // 1000 / 500 / 100 / 10 KAS
-    // 12 KAS spend forces the loop to take the largest UTXO first
-    // and then a second one to clear the KIP-9 dust margin (Go
-    // break case 2 requires `selected.len() > 1`).
+    // 12 KAS spend forces the loop to take the largest UTXO
+    // first and then a second one to clear the KIP-9 dust
+    // margin (break case 2 requires `selected.len() > 1`).
     let sel = select_utxos(&cfg, &params, &utxos, &[], 1_200_000_000, false, 1.0, 100_000_000).expect("select");
     assert!(!sel.selected.is_empty());
     // Iteration order is the input slice order, so the first
@@ -163,8 +166,8 @@ fn test_select_utxos_send_all_consumes_every_utxo() {
 
 #[test]
 fn test_select_utxos_insufficient_funds() {
-    // Total UTXO value cannot cover spend + fee -> Go's
-    // errors.Errorf("Insufficient funds for send...").
+    // Total UTXO value cannot cover spend + fee ->
+    // `CoinSelectError::InsufficientFunds`.
     let cfg = cfg();
     let params = params();
     let utxos = sorted_desc(&[100_000_000]); // 1 KAS available
@@ -174,10 +177,10 @@ fn test_select_utxos_insufficient_funds() {
 
 #[test]
 fn test_select_utxos_empty_inputs_with_zero_amount_succeeds() {
-    // Edge case: no UTXOs, spend 0, is_send_all false. Go's
-    // selectUTXOs returns ([], 0, 0, nil) here because total_value
-    // == total_spend == 0 and the InsufficientFunds branch isn't
-    // entered. Mirrors the boundary behaviour.
+    // Edge case: no UTXOs, spend 0, is_send_all false. The
+    // selector returns an empty selection here because
+    // total_value == total_spend == 0 and the InsufficientFunds
+    // branch is not entered.
     let cfg = cfg();
     let params = params();
     let sel = select_utxos(&cfg, &params, &[], &[], 0, false, 1.0, 100_000_000).expect("select empty");
@@ -189,8 +192,7 @@ fn test_select_utxos_empty_inputs_with_zero_amount_succeeds() {
 #[test]
 fn test_select_utxos_change_sompi_is_value_minus_spend_minus_fee() {
     // Pin the change arithmetic. Two big UTXOs, modest spend.
-    // change = total_value - spend_amount - fee (the daemon's
-    // accounting rule on lines 250-260).
+    // change = total_value - spend_amount - fee.
     let cfg = cfg();
     let params = params();
     let utxos = sorted_desc(&[5_000_000_000, 5_000_000_000]); // 50 + 50 KAS
@@ -229,9 +231,9 @@ fn test_estimate_fee_clamps_to_max_fee() {
 
 #[test]
 fn test_estimate_fee_per_input_returns_positive_input_mass_times_fee_rate() {
-    // The Go reference's `estimateFeePerInput` always returns a
-    // positive value: a single-input mock tx must compute-mass
-    // higher than a zero-input mock tx, so `input_mass > 0` and
+    // `estimate_fee_per_input` always returns a positive value:
+    // a single-input mock tx must compute-mass higher than a
+    // zero-input mock tx, so `input_mass > 0` and
     // `input_mass * fee_rate > 0`.
     let cfg = cfg();
     let params = params();
@@ -296,9 +298,9 @@ mod split_tests {
 
     #[test]
     fn test_maximum_standard_transaction_mass_constant_matches_protocol() {
-        // Pin the constant against the protocol value Go uses
-        // (`mempool.MaximumStandardTransactionMass = 100_000`).
-        // If kaspad ever bumps this, the matching ports across the
+        // Pin the constant against the protocol value
+        // (`MaximumStandardTransactionMass = 100_000`). If
+        // kaspad ever bumps this, the matching ports across the
         // workspace must update together.
         assert_eq!(MAXIMUM_STANDARD_TRANSACTION_MASS, 100_000);
     }

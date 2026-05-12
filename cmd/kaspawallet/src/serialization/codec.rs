@@ -1,6 +1,5 @@
-//! Encode / decode entry points. Mirrors the Go reference's
-//! `Serialize*` and `Deserialize*` helpers in
-//! `serialization.go`.
+//! Encode / decode entry points for the PST and unsigned-tx
+//! wire formats.
 
 use prost::Message;
 
@@ -8,29 +7,27 @@ use super::error::SerializationError;
 use super::wire;
 
 /// Encode a `PartiallySignedTransaction` to its protobuf wire
-/// form. Equivalent to Go `SerializePartiallySignedTransaction`.
+/// form.
 pub fn serialize_partially_signed_transaction(pst: &wire::PartiallySignedTransaction) -> Result<Vec<u8>, SerializationError> {
     Ok(pst.encode_to_vec())
 }
 
 /// Decode a protobuf-encoded `PartiallySignedTransaction`.
-/// Equivalent to Go `DeserializePartiallySignedTransaction`.
 pub fn deserialize_partially_signed_transaction(bytes: &[u8]) -> Result<wire::PartiallySignedTransaction, SerializationError> {
     Ok(wire::PartiallySignedTransaction::decode(bytes)?)
 }
 
 /// Encode a `TransactionMessage` (the unsigned-transaction wire
-/// shape used by the daemon's `Broadcast` RPC and the legacy
-/// `kaspawallet broadcast --transaction <hex>` interop). Mirrors
-/// Go `SerializeDomainTransaction`.
+/// shape used by the daemon's `Broadcast` RPC and the
+/// `kaspawallet broadcast --transaction <hex>` interop path).
 pub fn serialize_domain_transaction(tx: &wire::TransactionMessage) -> Result<Vec<u8>, SerializationError> {
     Ok(tx.encode_to_vec())
 }
 
-/// Decode a protobuf-encoded `TransactionMessage`. Mirrors Go
-/// `DeserializeDomainTransaction`. The Go reference performs an
-/// additional `Version <= MaxUint16` check; the wire `version`
-/// field is `uint32`, so that runtime check is preserved here.
+/// Decode a protobuf-encoded `TransactionMessage`. Performs an
+/// additional `version <= u16::MAX` check on top of the prost
+/// decode -- the wire `version` field is encoded as `uint32` but
+/// the consensus layer treats it as `uint16`.
 pub fn deserialize_domain_transaction(bytes: &[u8]) -> Result<wire::TransactionMessage, SerializationError> {
     let tx = wire::TransactionMessage::decode(bytes)?;
     if tx.version > u32::from(u16::MAX) {

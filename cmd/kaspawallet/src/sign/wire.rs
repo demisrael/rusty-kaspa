@@ -30,11 +30,10 @@ const SUBNETWORK_ID_LEN: usize = 20;
 /// Length of a kaspa transaction-id field.
 const TRANSACTION_ID_LEN: usize = 32;
 
-/// Convert a proto-wire `TransactionMessage` into the consensus-core
-/// `Transaction` type that the sighash routines accept. Visible to
-/// the crate's `parse` module too, which uses the consensus tx ID
-/// to mirror the Go reference's `consensushashing.TransactionID`
-/// rendering on parse output.
+/// Convert a proto-wire `TransactionMessage` into the
+/// consensus-core `Transaction` type that the sighash routines
+/// accept. Visible to the crate's `parse` module too, which uses
+/// the consensus tx ID for parse output rendering.
 pub(crate) fn wire_to_consensus_tx(tx_msg: &wire::TransactionMessage) -> Result<Transaction, SignError> {
     let version: u16 = u16::try_from(tx_msg.version)
         .map_err(|_| SignError::Invalid { field: "tx.version", reason: format!("version {} exceeds u16::MAX", tx_msg.version) })?;
@@ -83,14 +82,10 @@ fn wire_script_to_consensus(spk: &wire::ScriptPublicKey) -> Result<ScriptPublicK
 }
 
 /// Sync every `tx.inputs[i].sig_op_count` to the matching PSI's
-/// `pub_key_signature_pairs.len()`. Mirrors Go
-/// `cmd/kaspawallet/libkaspawallet/sign.go:60`:
-/// `partiallySignedTransaction.Tx.Inputs[i].SigOpCount =
-/// byte(len(partiallySignedInput.PubKeySignaturePairs))`. Both
-/// signing flows call this BEFORE sighash so the digest signed
-/// matches the consensus-tx form `extract_transaction` later
-/// produces (which sets `sig_op_count` from the same source per
-/// `super::combine`).
+/// `pub_key_signature_pairs.len()`. Both signing flows call this
+/// BEFORE sighash so the digest signed matches the consensus-tx
+/// form `extract_transaction` later produces (which sets
+/// `sig_op_count` from the same source per `super::combine`).
 pub(crate) fn apply_sig_op_count_from_psi(pst: &mut wire::PartiallySignedTransaction) -> Result<(), SignError> {
     let tx = pst.tx.as_mut().ok_or(SignError::Missing("PartiallySignedTransaction.tx"))?;
     if tx.inputs.len() != pst.partially_signed_inputs.len() {

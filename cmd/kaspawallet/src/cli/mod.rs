@@ -1,9 +1,6 @@
-//! Command-line surface for the grandpa wallet binary. The
-//! 17-subcommand registry mirrors the Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/config.go`
-//! (`config.go` `parseCommandLine`). Long names, short flags,
-//! defaults, and `required` dispositions are copied from the Go
-//! `go-flags` struct tags.
+//! Command-line surface for the wallet binary: a 17-subcommand
+//! registry with long names, short flags, defaults, and
+//! `required` dispositions exposed via `clap`'s derive surface.
 
 mod args;
 mod network;

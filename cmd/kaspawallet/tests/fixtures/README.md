@@ -22,12 +22,11 @@ under a chosen `numThreads`. See
 ## Cross-wallet serialization fixture
 
 `go_emitted_pst.hex` is a hex-encoded
-`PartiallySignedTransaction` produced by the Go reference's
-`libkaspawallet/serialization.SerializePartiallySignedTransaction`
-on a deterministic synthetic input (single input, two outputs,
-one cosigner xpub, no signatures attached). The fixture is the
-ground truth for the cross-wallet wire-format AC (lead direction
-2026-05-11, steer addendum 1778485777798-0).
+`PartiallySignedTransaction` produced by the reference Go
+implementation's wire-serializer on a deterministic synthetic
+input (single input, two outputs, one cosigner xpub, no
+signatures attached). The fixture is the ground truth for the
+cross-wallet wire-format AC.
 
 `fixturegen.go.txt` is the Go helper that produced the fixture.
 Reproduce with:

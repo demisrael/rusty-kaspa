@@ -1,23 +1,19 @@
-//! Domain types for the legacy Go keyfile format.
+//! Domain types for the on-disk keyfile format.
 
 use serde::{Deserialize, Serialize};
 
-/// Most up-to-date keyfile format version, mirroring the Go
-/// `LastVersion` constant at
-/// `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/keys/keys.go#L29`.
+/// Format-version tag emitted in new keyfiles. Existing field
+/// keyfiles carry this value; reading older formats is handled by
+/// the v0 decoder in `decrypt.rs`.
 pub const LATEST_VERSION: u32 = 1;
 
-/// Default `numThreads` for v1 keyfiles (matches Go
-/// `defaultNumThreads` at
-/// `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/keys/keys.go#L319`).
+/// Default `numThreads` value emitted in v1 keyfiles.
 pub(crate) const DEFAULT_NUM_THREADS: u8 = 8;
 
-/// Argon2id memory cost in KiB (64 MiB), matching the Go
-/// `argon2.IDKey(password, salt, 1, 64*1024, threads, 32)` call at
-/// `keys.go` `getAEAD`.
+/// Argon2id memory cost in KiB (64 MiB).
 pub(crate) const ARGON2_MEMORY_KIB: u32 = 64 * 1024;
 
-/// Argon2id time cost, matching the Go `t = 1` parameter.
+/// Argon2id time cost.
 pub(crate) const ARGON2_TIME_COST: u32 = 1;
 
 /// Argon2id output length in bytes (XChaCha20-Poly1305 key size).
@@ -40,15 +36,14 @@ pub struct EncryptedMnemonic {
     pub salt: Vec<u8>,
 }
 
-/// Decoded keyfile. Field names mirror the Go `File` struct in
-/// `keys.go`.
+/// Decoded keyfile content.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct KeysFile {
     pub version: u32,
     /// `numThreads` is interpreted for v0 (brute-forced) and
-    /// constant for v1. For v1 keyfiles the Go reference still
-    /// emits this field (default 8); we preserve whatever JSON
-    /// supplied so round-trip is exact.
+    /// constant for v1. v1 keyfiles still emit this field
+    /// (default 8); whatever value the JSON carried is preserved
+    /// so the round-trip is exact.
     pub num_threads: u8,
     pub encrypted_mnemonics: Vec<EncryptedMnemonic>,
     pub extended_public_keys: Vec<String>,
@@ -59,9 +54,8 @@ pub struct KeysFile {
     pub ecdsa: bool,
 }
 
-/// Wire-format mirror of the Go `keysFileJSON` struct with
-/// hex-encoded byte fields and `omitempty` semantics on
-/// `numThreads`.
+/// On-disk JSON shape: hex-encoded byte fields and `omitempty`
+/// semantics on `numThreads`.
 #[derive(Debug, Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 pub(crate) struct KeysFileJson {

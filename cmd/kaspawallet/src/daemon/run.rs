@@ -18,7 +18,7 @@
 //!
 //! The TCP listener is configured via `tonic::transport::Server`'s
 //! `serve_with_incoming_shutdown` path. The graceful-stop window
-//! mirrors the Go daemon's `stopTimeout = 2 * time.Second`.
+//! is 2 seconds.
 
 use std::net::SocketAddr;
 use std::path::PathBuf;
@@ -42,12 +42,9 @@ use super::sync::SyncLoop;
 use crate::keyfile;
 
 /// Maximum send-message size used by the daemon gRPC server.
-/// Matches Go `MaxDaemonSendMsgSize = 100_000_000` at
-/// `cmd/kaspawallet/daemon/server/server.go@6c1f821f`.
 pub const MAX_DAEMON_SEND_MSG_SIZE: usize = 100_000_000;
 
-/// Graceful-shutdown timeout. Matches Go `stopTimeout = 2 *
-/// time.Second` at `cmd/kaspawallet/daemon/server/server.go@6c1f821f`.
+/// Graceful-shutdown timeout.
 pub const GRACEFUL_STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Caller-supplied shutdown signal. Used by integration tests to
@@ -94,12 +91,11 @@ impl Default for ShutdownTrigger {
 }
 
 /// Options that the CLI's `start-daemon` subcommand passes into
-/// the daemon runtime. Mirrors the subset of Go `startDaemonConfig`
-/// fields the daemon constructor consumes at startup time.
+/// the daemon runtime.
 #[derive(Debug, Clone)]
 pub struct ServeOptions {
     /// `host:port` style listener address (`localhost:8082` by
-    /// default, per the F3 ruling).
+    /// default).
     pub listen: String,
     /// Resolved on-disk path to the keyfile. The CLI resolves this
     /// via the keysource default-path resolver before constructing
@@ -123,9 +119,8 @@ pub async fn start_daemon(opts: ServeOptions) -> Result<(), DaemonError> {
     // Acquire the exclusive keyfile lock BEFORE binding the
     // listener or reading the keyfile: two daemons against the
     // same keyfile would race the JSON file on `save_to_path`
-    // otherwise. Mirrors Go `keys.File.TryLock` at
-    // `cmd/kaspawallet/keys/keys.go`; the guard releases the OS
-    // lock on drop at function exit.
+    // otherwise. The guard releases the OS lock on drop at
+    // function exit.
     let _keysfile_guard = keysfile_lock::acquire(&opts.keysfile_path)?;
     let listener = bind_listener(&opts.listen).await?;
     let keyfile = keyfile::read_from_path(&opts.keysfile_path)?;
@@ -177,13 +172,12 @@ pub async fn serve_with_listener(listener: TcpListener, svc: KaspawalletdSvc, tr
 
 async fn bind_listener(listen: &str) -> Result<TcpListener, DaemonError> {
     // `parse::<SocketAddr>` rejects `localhost` (it expects a
-    // numeric host); the daemon's actual `tcp.Listen` behavior in
-    // Go uses `net.Listen` which resolves DNS, so the Rust port
-    // matches by delegating to `tokio::net::TcpListener::bind`
-    // when the operator-supplied string is non-numeric. We try a
-    // SocketAddr parse first because it produces a clearer error
-    // message for malformed numeric addresses (helpful in tests),
-    // and fall through to the DNS-resolving bind on parse failure.
+    // numeric host). Delegate to `tokio::net::TcpListener::bind`
+    // when the operator-supplied string is non-numeric (it will
+    // resolve DNS). Try a SocketAddr parse first because it
+    // produces a clearer error message for malformed numeric
+    // addresses (helpful in tests), and fall through to the
+    // DNS-resolving bind on parse failure.
     let bound = match listen.parse::<SocketAddr>() {
         Ok(addr) => TcpListener::bind(addr).await,
         Err(_) => TcpListener::bind(listen).await,
@@ -207,11 +201,10 @@ async fn serve_inner(
 }
 
 async fn combined_shutdown(notify: Arc<Notify>) {
-    // SIGINT / SIGTERM (cross-platform via tokio::signal::ctrl_c)
-    // OR an in-process `Shutdown` RPC -- whichever fires first
-    // ends the daemon. The Go reference waits on
-    // `interrupt | shutdown` channels; the Rust port mirrors with
-    // a `tokio::select!`.
+    // SIGINT / SIGTERM (cross-platform via
+    // `tokio::signal::ctrl_c`) OR an in-process `Shutdown` RPC --
+    // whichever fires first ends the daemon. Composed via a
+    // `tokio::select!`.
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {},
         _ = notify.notified() => {},
@@ -219,9 +212,9 @@ async fn combined_shutdown(notify: Arc<Notify>) {
 }
 
 /// `kaspa_grpc_client::GrpcClient::connect` requires a `grpc://`
-/// URL. The CLI's `--rpcserver` flag accepts both forms (`host:port`
-/// and `grpc://host:port`) for Go compatibility -- the Go binary
-/// accepts a bare authority and applies the protocol implicitly.
+/// URL. The CLI's `--rpcserver` flag accepts both `host:port`
+/// and `grpc://host:port`; bare-authority input is normalised by
+/// prepending the `grpc://` scheme.
 fn ensure_grpc_scheme(addr: &str) -> String {
     if addr.starts_with("grpc://") { addr.to_owned() } else { format!("grpc://{addr}") }
 }

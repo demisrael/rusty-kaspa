@@ -1,9 +1,8 @@
-//! Argon2id + XChaCha20-Poly1305 mnemonic encryption, mirroring Go
-//! `cmd/kaspawallet/keys/keys.go::encryptMnemonic`. Used by the
+//! Argon2id + XChaCha20-Poly1305 mnemonic encryption. Used by the
 //! standalone `create` subcommand to produce v1-format encrypted
-//! mnemonic records. Parameters match v1 keyfiles exactly so a
-//! Rust-emitted keyfile decrypts under the Go binary using the same
-//! passphrase.
+//! mnemonic records. Parameters are pinned to the v1 keyfile
+//! format so a Rust-emitted keyfile decrypts cleanly under any
+//! v1-aware reader using the same passphrase.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::rand_core::RngCore;
@@ -14,15 +13,14 @@ use zeroize::Zeroizing;
 use super::error::KeyfileError;
 use super::types::{ARGON2_MEMORY_KIB, ARGON2_OUTPUT_LEN, ARGON2_TIME_COST, DEFAULT_NUM_THREADS, EncryptedMnemonic};
 
-/// Argon2 salt size used by the Go reference for v1 keyfiles.
-/// Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/keys/create.go#L86
-/// (`generateSalt` -- `salt := make([]byte, 16)`).
+/// Argon2 salt size used by the v1 keyfile format.
 pub(crate) const ARGON2_SALT_LEN: usize = 16;
 
-/// Encrypt one mnemonic plaintext under `password` using Go-v1
-/// parameters (Argon2id m=64 MiB, t=1, threads=8; XChaCha20-Poly1305
-/// AEAD; per-record 16-byte salt and 24-byte nonce). The returned
-/// record's `cipher` field is `nonce || ciphertext_with_tag`.
+/// Encrypt one mnemonic plaintext under `password` using the v1
+/// keyfile parameters (Argon2id m=64 MiB, t=1, threads=8;
+/// XChaCha20-Poly1305 AEAD; per-record 16-byte salt and 24-byte
+/// nonce). The returned record's `cipher` field is
+/// `nonce || ciphertext_with_tag`.
 pub fn encrypt_mnemonic(mnemonic: &str, password: &[u8]) -> Result<EncryptedMnemonic, KeyfileError> {
     let mut salt = vec![0u8; ARGON2_SALT_LEN];
     let mut rng = OsRng;

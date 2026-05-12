@@ -1,10 +1,9 @@
-//! Network-flag group. Mirrors the Go reference's
-//! `config.NetworkFlags` (`--testnet`, `--simnet`, `--devnet`,
-//! `--override-dag-params-file`) at the per-subcommand level; the
-//! Go binary embeds this group on every subcommand and merges with
-//! any top-level value via `combineNetworkFlags`. Clap models the
-//! group as a flattened struct with a mutually-exclusive arg group
-//! covering the three boolean flags.
+//! Network-flag group exposed on every subcommand: `--testnet`,
+//! `--simnet`, `--devnet`, `--override-dag-params-file`. The group
+//! is embedded on every subcommand and merged with the top-level
+//! value via [`NetworkFlags::combine`]. Clap models the group as a
+//! flattened struct with a mutually-exclusive arg group covering
+//! the three boolean flags.
 
 use clap::Args;
 
@@ -36,8 +35,7 @@ pub struct NetworkFlags {
 
 impl NetworkFlags {
     /// Combine `self` with `other`, treating any truthy boolean on
-    /// either side as truthy on the result. Mirrors the Go
-    /// `combineNetworkFlags` function.
+    /// either side as truthy on the result.
     pub fn combine(&mut self, other: &NetworkFlags) {
         self.testnet = self.testnet || other.testnet;
         self.simnet = self.simnet || other.simnet;
@@ -48,7 +46,7 @@ impl NetworkFlags {
     }
 
     /// Canonical kaspa address prefix used to encode addresses on
-    /// the selected network. Mirrors Go's `dagconfig.Params.Prefix`.
+    /// the selected network.
     pub fn address_prefix(&self) -> kaspa_addresses::Prefix {
         if self.simnet {
             kaspa_addresses::Prefix::Simnet
@@ -61,21 +59,15 @@ impl NetworkFlags {
         }
     }
 
-    /// Canonical kaspa network-name string matching Go's
-    /// `dagconfig.Params.Name` field. Used by the keyfile
-    /// default-path resolver to mirror Go's
-    /// `defaultKeysFile(netParams) =
-    /// filepath.Join(defaultAppDir, netParams.Name, "keys.json")`.
-    /// Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/domain/dagconfig/params.go#L212
-    /// (`MainnetParams.Name = "kaspa-mainnet"`); analogous lines for
-    /// testnet-10 (`"kaspa-testnet-10"`), simnet (`"kaspa-simnet"`),
-    /// devnet (`"kaspa-devnet"`).
+    /// Canonical kaspa network-name string. Used by the keyfile
+    /// default-path resolver to compose
+    /// `<app-dir>/<network-name>/keys.json`. The mainnet name is
+    /// `kaspa-mainnet`; the testnet-10 name is `kaspa-testnet-10`;
+    /// simnet and devnet follow the same `kaspa-<network>` pattern.
     pub fn network_name(&self) -> &'static str {
         // Mutually-exclusive `clap` group means at most one of
         // simnet / devnet / testnet is set; mainnet is the default
-        // when none is set. Phase 1 testnet target is testnet-10
-        // (per task file's `KASPA_TN10_ENDPOINT` default), matching
-        // Go `dagconfig.TestnetParams.Name`.
+        // when none is set. The testnet target is testnet-10.
         if self.simnet {
             "kaspa-simnet"
         } else if self.devnet {

@@ -1,24 +1,19 @@
-//! Verbatim Path-A port of the Go daemon's mass-bound transaction
-//! splitter and the recursive merge-transaction chain.
+//! Mass-bound transaction splitter and recursive merge-transaction
+//! chain.
 //!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/split_transaction.go
+//! When an unsigned transaction's compute-mass exceeds the
+//! `MaximumStandardTransactionMass` mempool ceiling (100 000
+//! grams), the splitter divides the inputs into N batches, each
+//! with its own change output paying back to the wallet, and emits
+//! a separate merge transaction that consumes the splits' outputs
+//! to pay the original recipient. The algorithm's wire-byte output
+//! is exercised against reference fixtures by
+//! `tests/coinsel_parity.rs`.
 //!
-//! When an unsigned transaction's compute-mass exceeds the kaspad
-//! mempool's `MaximumStandardTransactionMass` ceiling (100 000
-//! grams), the Go daemon splits the inputs into N batches, each
-//! with its own change output paying back to the wallet, and then
-//! emits a separate merge transaction that consumes the splits'
-//! outputs to pay the original recipient. This module preserves
-//! that algorithm line-for-line so the daemon's
-//! `CreateUnsignedTransactions` RPC return path emits byte-identical
-//! `[][]byte` slices versus the Go binary on the same input set.
-//!
-//! Daemon-state dependencies (`s.utxosSortedByAmount` for
-//! `more_utxos_for_merge_transaction`) are caller-owned; the
-//! caller passes the post-filter sorted UTXO pool (minus
-//! anything already consumed by the original transaction's
-//! coin-selection step) as `spare_utxos`. The B4 daemon will
-//! own the filter step; this module owns the algorithm.
+//! Daemon-state dependencies are caller-owned: the caller passes
+//! the post-filter sorted UTXO pool (minus anything already
+//! consumed by the original transaction's coin-selection step) as
+//! `spare_utxos`.
 
 use kaspa_addresses::Address;
 use kaspa_consensus_core::config::params::Params;
@@ -31,43 +26,33 @@ use crate::serialization::{serialize_partially_signed_transaction, wire};
 use crate::transaction::{Payment, Utxo, create_unsigned_transaction, outpoint};
 
 /// Maximum compute-mass a standard transaction may carry on the
-/// kaspa mempool's `check_transaction_standard` path. Mirrors Go's
-/// `mempool.MaximumStandardTransactionMass = 100_000`
-/// (`domain/miningmanager/mempool/check_transaction_standard.go:41`)
-/// and rusty-kaspa's `wallet/core/src/tx/mass.rs:24`. Pinned here
-/// so the splitter does not depend on either crate just to read
+/// kaspa mempool's `check_transaction_standard` path. Pinned here
+/// so the splitter does not pull in a heavier crate just to read
 /// one protocol constant.
 pub const MAXIMUM_STANDARD_TRANSACTION_MASS: u64 = 100_000;
 
-/// Minimum fee rate (sompi per gram) the Go reference accepts on
-/// any tx the wallet daemon emits. Mirrors Go's
-/// `minFeeRate = 1.0` at
-/// `cmd/kaspawallet/daemon/server/create_unsigned_transaction.go:26`.
+/// Minimum fee rate (sompi per gram) accepted on any tx the wallet
+/// daemon emits.
 const MIN_FEE_RATE: f64 = 1.0;
 
-/// The DAA-score the Go reference uses for synthetic UTXOs the
-/// merge-transaction step builds from each split-transaction's
-/// first output. Mirrors `constants.UnacceptedDAAScore`
-/// (`domain/consensus/utils/constants/constants.go`); the value is
-/// not load-bearing for byte-identity (the synthetic UTXO never
-/// hits the wire), but the port preserves it so the synthetic
-/// shape matches Go's stored shape on the daemon side.
+/// DAA-score placeholder for synthetic UTXOs the merge-transaction
+/// step builds from each split-transaction's first output. The
+/// synthetic UTXO never hits the wire, but the placeholder is the
+/// sentinel value the consensus layer reserves for unaccepted
+/// outpoints.
 const UNACCEPTED_DAA_SCORE: u64 = u64::MAX;
 
-/// Verbatim port of Go's `maybeAutoCompoundTransaction`
-/// (`split_transaction.go:24-39`). Returns the serialized
+/// Run the mass-bound auto-compound step. Returns the serialized
 /// `PartiallySignedTransaction` bytes for each split + merge
-/// transaction the splitter emitted, in the same order Go does.
+/// transaction the splitter emits, in order.
 ///
 /// `transaction` is the original unsigned PST returned by the
 /// coin-selection layer. `to_address` / `change_address` /
 /// `change_derivation_path` describe the merge transaction's
-/// destination + change-back rules (the daemon's
-/// `walletAddressPath(changeWalletAddress)` lookup is replaced
-/// with a caller-supplied string so this module stays daemon-state
-/// free). `spare_utxos` is the post-filter sorted-desc UTXO pool
-/// minus anything already consumed by `transaction`; the
-/// merge-transaction's `more_utxos_for_merge_transaction` step
+/// destination + change-back rules (the caller supplies the
+/// derivation-path string so this module stays daemon-state free).
+/// `spare_utxos` is the post-filter sorted-desc UTXO pool minus
+/// anything already consumed by `transaction`; the merge step
 /// scans it when the splits do not produce enough value to cover
 /// the original recipient amount.
 pub fn maybe_auto_compound_transaction(
@@ -104,11 +89,9 @@ pub fn maybe_auto_compound_transaction(
     Ok(bytes_out)
 }
 
-/// Verbatim port of Go's `maybeSplitAndMergeTransaction`
-/// (`split_transaction.go:143-196`). Recursive: when the splitter
-/// produces N > 1 splits, the merge transaction is itself fed
-/// back into this function so a still-too-big merge is split
-/// further. The Go reference's comment notes recursion depth is
+/// Recursive splitter: when the splitter produces N > 1 splits,
+/// the merge transaction is itself fed back into this function so
+/// a still-too-big merge is split further. Recursion depth is
 /// 2-3 in the rarest cases.
 pub fn maybe_split_and_merge_transaction(
     cfg: &WalletConfig,
@@ -153,7 +136,6 @@ pub fn maybe_split_and_merge_transaction(
             max_fee,
             spare_utxos,
         )?;
-        // Mirror Go's recursion (split_transaction.go:187-191).
         let split_merge = maybe_split_and_merge_transaction(
             cfg,
             params,
@@ -171,10 +153,10 @@ pub fn maybe_split_and_merge_transaction(
     Ok(splits)
 }
 
-/// Verbatim port of Go's `transactionFeeRate`
-/// (`split_transaction.go:108-128`). Returns `(total_in - total_out)
-/// / compute_mass`. Errors when the transaction underpays its
-/// outputs (`InsufficientFunds`-style mismatch).
+/// Compute the transaction's fee rate as
+/// `(total_in - total_out) / compute_mass`. Errors when the
+/// transaction underpays its outputs (`InsufficientFunds`-style
+/// mismatch).
 fn transaction_fee_rate(params: &Params, ps_tx: &wire::PartiallySignedTransaction, ecdsa: bool) -> Result<f64, CoinSelectError> {
     let total_outs: u64 = ps_tx.tx.as_ref().map(|tx| tx.outputs.iter().map(|o| o.value).sum()).unwrap_or(0);
     let total_ins: u64 = ps_tx.partially_signed_inputs.iter().filter_map(|psi| psi.prev_output.as_ref().map(|po| po.value)).sum();
@@ -185,19 +167,16 @@ fn transaction_fee_rate(params: &Params, ps_tx: &wire::PartiallySignedTransactio
     let fee = total_ins - total_outs;
     let mass = estimate_compute_mass_after_signatures(ps_tx, params, ecdsa)?;
     if mass == 0 {
-        // Mirror Go's div-by-zero behaviour: the function does not
-        // guard, but compute_mass is positive for any non-empty tx
-        // so the branch is defensive only.
+        // compute_mass is positive for any non-empty tx; this
+        // branch is defensive only.
         return Ok(0.0);
     }
     Ok(fee as f64 / mass as f64)
 }
 
-/// Verbatim port of Go's `checkTransactionFeeRate`
-/// (`split_transaction.go:130-141`). Gates the fee_rate against
-/// the `MIN_FEE_RATE` floor; raises a typed error so the caller
-/// can surface the `max_fee` parameter that produced the
-/// below-floor rate.
+/// Gate the transaction's fee_rate against the `MIN_FEE_RATE`
+/// floor; raise a typed error so the caller can surface the
+/// `max_fee` parameter that produced the below-floor rate.
 fn check_transaction_fee_rate(
     params: &Params,
     ps_tx: &wire::PartiallySignedTransaction,
@@ -208,13 +187,11 @@ fn check_transaction_fee_rate(
     if fee_rate < MIN_FEE_RATE {
         return Err(CoinSelectError::FeeRateTooLow { requested: fee_rate, minimum: MIN_FEE_RATE });
     }
-    let _ = max_fee; // mirror Go's signature; max_fee is informational here
+    let _ = max_fee; // informational on this branch; consumed by callers
     Ok(())
 }
 
-/// Verbatim port of Go's `splitAndInputPerSplitCounts`
-/// (`split_transaction.go:198-235`). Returns
-/// `(split_count, inputs_per_split_count)` for the
+/// Compute `(split_count, inputs_per_split_count)` for the
 /// mass-bound batching.
 fn split_and_input_per_split_counts(
     cfg: &WalletConfig,
@@ -225,8 +202,8 @@ fn split_and_input_per_split_counts(
     fee_rate: f64,
     max_fee: u64,
 ) -> Result<(usize, usize), CoinSelectError> {
-    // Step 1 (Go lines 202-208): clone tx with no inputs, calc its
-    // mass, derive `mass_of_all_inputs = transaction_mass -
+    // Step 1: clone the tx with no inputs, calculate its mass,
+    // and derive `mass_of_all_inputs = transaction_mass -
     // mass_without_inputs`.
     let tx_msg =
         transaction.tx.as_ref().ok_or(CoinSelectError::Transaction(crate::transaction::TransactionError::InvalidAddress {
@@ -239,15 +216,14 @@ fn split_and_input_per_split_counts(
     let mass_without_inputs = estimate_compute_mass_after_signatures(&tx_without_inputs, params, cfg.ecdsa)?;
     let mass_of_all_inputs = transaction_mass.saturating_sub(mass_without_inputs);
 
-    // Step 2 (Go lines 211-216): mass per input. Round up if
-    // `mass_of_all_inputs % input_count > 0`.
+    // Step 2: mass per input, round up.
     let input_count = tx_msg.inputs.len();
     if input_count == 0 {
-        // Defensive: a zero-input tx cannot be split; return (1, 0)
-        // so the outer loop emits a single split (which equals the
-        // input tx) and exits. Go's reference assumes this branch
-        // is unreachable from `maybeSplitAndMergeTransaction`'s
-        // mass-gate; we preserve the assumption.
+        // Defensive: a zero-input tx cannot be split; return
+        // (1, 0) so the outer loop emits a single split (equal to
+        // the input tx) and exits. Unreachable from
+        // `maybe_split_and_merge_transaction`'s mass-gate; this
+        // branch preserves the invariant.
         return Ok((1, 0));
     }
     let mut mass_per_input = mass_of_all_inputs / input_count as u64;
@@ -256,23 +232,21 @@ fn split_and_input_per_split_counts(
     }
     if mass_per_input == 0 {
         // Defensive: zero per-input mass would divide-by-zero
-        // below. Go's reference does not guard but the path
-        // requires a non-zero mass to make progress.
+        // below.
         mass_per_input = 1;
     }
 
-    // Step 3 (Go lines 219-226): create a dummy split with 0
-    // inputs to measure the per-split overhead.
+    // Step 3: create a dummy split with 0 inputs to measure the
+    // per-split overhead.
     let split_without_inputs = create_split_transaction(cfg, params, transaction, change_address, 0, 0, fee_rate, max_fee)?;
     let mass_for_everything_except_inputs_in_split =
         crate::mass::estimate_compute_mass_after_signatures(&split_without_inputs, params, cfg.ecdsa)?;
     let mass_for_inputs_in_split = MAXIMUM_STANDARD_TRANSACTION_MASS.saturating_sub(mass_for_everything_except_inputs_in_split);
 
-    // Step 4 (Go lines 228-232): inputs per split + split count.
+    // Step 4: inputs per split + split count.
     let inputs_per_split_count = (mass_for_inputs_in_split / mass_per_input) as usize;
     if inputs_per_split_count == 0 {
-        // Defensive guard; mirror Go's lack of a check by returning
-        // an error if the policy cannot fit even one input per split.
+        // Defensive guard: cannot fit even one input per split.
         return Err(CoinSelectError::Transaction(crate::transaction::TransactionError::InvalidAddress {
             reason: "per-input mass exceeds maximum standard transaction mass; cannot split".to_string(),
         }));
@@ -285,11 +259,9 @@ fn split_and_input_per_split_counts(
     Ok((split_count, inputs_per_split_count))
 }
 
-/// Verbatim port of Go's `createSplitTransaction`
-/// (`split_transaction.go:237-270`). Builds a single-output
-/// (change-back) PST consuming a contiguous slice of the original
-/// transaction's `partially_signed_inputs` from `start_index`
-/// through `end_index` (exclusive).
+/// Build a single-output (change-back) PST consuming a contiguous
+/// slice of the original transaction's `partially_signed_inputs`
+/// from `start_index` through `end_index` (exclusive).
 fn create_split_transaction(
     cfg: &WalletConfig,
     params: &Params,
@@ -349,11 +321,10 @@ fn create_split_transaction(
     Ok(create_unsigned_transaction(&cfg.extended_public_keys, cfg.minimum_signatures, &[payment], &selected_utxos)?)
 }
 
-/// Verbatim port of Go's `mergeTransaction`
-/// (`split_transaction.go:41-106`). Builds the outer merge
-/// transaction whose inputs are the split transactions' first
-/// outputs and whose payee is the original recipient.
-#[allow(clippy::too_many_arguments)] // mirror Go's parameter set; collapsing into a struct hurts call-site clarity
+/// Build the outer merge transaction whose inputs are the split
+/// transactions' first outputs and whose payee is the original
+/// recipient.
+#[allow(clippy::too_many_arguments)] // collapsing into a struct hurts call-site clarity
 fn merge_transaction(
     cfg: &WalletConfig,
     params: &Params,
@@ -371,7 +342,8 @@ fn merge_transaction(
     ))?;
     let num_outputs = original_tx.outputs.len();
     if num_outputs == 0 || num_outputs > 2 {
-        // Mirror Go's sanity check (lines 51-58).
+        // Sanity check: a wallet transaction has at most a
+        // recipient output plus an optional change output.
         return Err(CoinSelectError::Transaction(crate::transaction::TransactionError::InvalidAddress {
             reason: format!("original transaction has {num_outputs} outputs, while 1 or 2 are expected"),
         }));
@@ -417,8 +389,7 @@ fn merge_transaction(
         total_value += output.value;
     }
 
-    // Mirror Go's "estimate fee, then if total < sent, find more"
-    // chain (lines 75-91).
+    // Estimate fee, then if total < sent, find more spare UTXOs.
     let fee = estimate_fee(cfg, params, &utxos, fee_rate, max_fee, sent_value)?;
     total_value = total_value.saturating_sub(fee);
 
@@ -437,14 +408,12 @@ fn merge_transaction(
     Ok(create_unsigned_transaction(&cfg.extended_public_keys, cfg.minimum_signatures, &payments, &utxos)?)
 }
 
-/// Verbatim port of Go's `moreUTXOsForMergeTransaction`
-/// (`split_transaction.go:320-358`). Iterates `spare_utxos` (the
-/// daemon's filtered, sorted-desc UTXO pool) and accumulates
-/// additional UTXOs until `total_value_added >= required_amount`.
-/// Skips outpoints already in `already_selected_utxos`, mirroring
-/// Go's `alreadySelectedUTXOsMap` dedup. Each UTXO contributes
-/// `amount - fee_per_input` toward the running total (Go's
-/// over-estimate that accounts for the extra signature mass).
+/// Iterate `spare_utxos` (the daemon's filtered, sorted-desc UTXO
+/// pool) and accumulate additional UTXOs until
+/// `total_value_added >= required_amount`. Skips outpoints already
+/// in `already_selected_utxos`. Each UTXO contributes
+/// `amount - fee_per_input` toward the running total, accounting
+/// for the extra signature mass.
 fn more_utxos_for_merge_transaction(
     cfg: &WalletConfig,
     params: &Params,
@@ -480,19 +449,17 @@ fn more_utxos_for_merge_transaction(
     Ok((additional, total_value_added))
 }
 
-/// Compute the kaspa transaction id for a split's `tx` field, the
-/// way Go's `consensushashing.TransactionID(splitTransaction.Tx)`
-/// does at `split_transaction.go:65-68`. Lifts the wire PST into
-/// the consensus-core `Transaction` type and asks the consensus
-/// hashing surface for the canonical id.
+/// Compute the kaspa transaction id for a split's `tx` field by
+/// lifting the wire PST into the consensus-core `Transaction`
+/// type and asking the consensus hashing surface for the
+/// canonical id.
 fn split_consensus_tx_id(pst: &wire::PartiallySignedTransaction) -> Result<[u8; 32], CoinSelectError> {
     let tx_msg = pst.tx.as_ref().ok_or(CoinSelectError::Transaction(crate::transaction::TransactionError::InvalidAddress {
         reason: "pst.tx missing".to_string(),
     }))?;
-    // `Transaction::new` already calls `finalize()`, which populates
-    // the cached `TransactionId` via the consensus-core canonical
-    // hashing surface (`hashing::tx::id` -- the same path Go's
-    // `consensushashing.TransactionID` runs).
+    // `Transaction::new` already calls `finalize()`, which
+    // populates the cached `TransactionId` via the consensus-core
+    // canonical hashing surface (`hashing::tx::id`).
     let consensus_tx = wire_to_consensus_tx_local(tx_msg)?;
     Ok(consensus_tx.id().as_bytes())
 }

@@ -1,23 +1,19 @@
-//! Estimate post-signing mass of an unsigned `PartiallySignedTransaction`.
+//! Estimate post-signing mass of an unsigned
+//! `PartiallySignedTransaction`.
 //!
-//! Mirrors the Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/daemon/server/split_transaction.go`
-//! (`createTransactionWithJunkFieldsForMassCalculation` +
-//! `EstimateMassAfterSignatures`). The Go path fills each
-//! `PubKeySignaturePair.Signature` with a junk byte vector of the
-//! same length the eventual real signature will occupy, sets the
-//! input's `SigOpCount = len(PubKeySignaturePairs)`, packs the
-//! resulting bytes into a signature script, then asks the consensus
-//! mass calculator for the **overall** mass
-//! (`max(compute_mass, storage_mass)`). The number is what `parse`
-//! reports as "Mass: N grams" and what `send` uses to decide the
-//! fee-rate.
+//! Each `PubKeySignaturePair.Signature` is padded with a junk byte
+//! vector of the same length the eventual real signature will
+//! occupy; the input's `SigOpCount` is set to the cosigner count;
+//! the resulting bytes are packed into a signature script; the
+//! transaction is then handed to the consensus mass calculator for
+//! the **overall** mass (`max(compute_mass, storage_mass)`). That
+//! number is what `parse` reports as "Mass: N grams" and what
+//! `send` uses to decide the fee-rate.
 //!
-//! Reuse-existing-crates discipline: this module is integration
-//! glue between `crate::sign::wire` (which lifts the proto-wire
-//! PST into consensus-core types) and
-//! `kaspa_consensus_core::mass::MassCalculator`. No mass formula is
-//! re-implemented here -- the consensus crate already owns it.
+//! This module is integration glue between `crate::sign::wire`
+//! (which lifts the proto-wire PST into consensus-core types) and
+//! `kaspa_consensus_core::mass::MassCalculator`; no mass formula
+//! is re-implemented here.
 
 use kaspa_consensus_core::config::params::Params;
 use kaspa_consensus_core::mass::MassCalculator;
@@ -32,16 +28,12 @@ use crate::sign::wire::build_utxo_entries;
 /// and kaspa's compact ECDSA wire form. The on-chain signature
 /// script also carries a 1-byte sigHashType appendage, so the
 /// total payload pushed for one signature is `SIGNATURE_LEN + 1`
-/// bytes (mirrors the Go reference's
-/// `secp256k1.SerializedSchnorrSignatureSize` /
-/// `SerializedECDSASignatureSize`, both 64).
+/// bytes.
 pub const SIGNATURE_LEN: usize = 64;
 
-/// Estimate the overall mass of the transaction the input PST will
-/// produce once every cosigner up to `minimum_signatures` has
-/// contributed a signature.
-///
-/// The Go reference's behavior, mirrored line-for-line:
+/// Estimate the overall mass of the transaction the input PST
+/// will produce once every cosigner up to `minimum_signatures`
+/// has contributed a signature. The estimator runs:
 ///
 /// 1. Clone the PST.
 /// 2. For each input, walk its `PubKeySignaturePairs`. For the
@@ -67,51 +59,45 @@ pub fn estimate_mass_after_signatures(pst: &wire::PartiallySignedTransaction, pa
 
 /// Compute-only mass variant of [`estimate_mass_after_signatures`].
 ///
-/// Mirrors Go's `estimateComputeMassAfterSignatures` at
-/// `cmd/kaspawallet/daemon/server/split_transaction.go:302-309`. The
-/// batch-splitter chain (`splitAndInputPerSplitCounts`,
-/// `estimateFeePerInput`) needs the compute-mass component without
-/// the storage-mass adjustment so it can derive `mass_per_input`
-/// without a divide-by-zero risk on degenerate (zero-storage-mass)
-/// shapes. The Go reference's comment on the call site is explicit:
-/// "Here we use compute mass to avoid dividing by zero."
+/// The batch-splitter chain (`split_and_input_per_split_counts`,
+/// `estimate_fee_per_input`) needs the compute-mass component
+/// without the storage-mass adjustment so it can derive
+/// `mass_per_input` without a divide-by-zero risk on degenerate
+/// (zero-storage-mass) shapes.
 pub fn estimate_compute_mass_after_signatures(
     pst: &wire::PartiallySignedTransaction,
     params: &Params,
     ecdsa: bool,
 ) -> Result<u64, SignError> {
-    // Compute mass only: do NOT call `calc_contextual_masses`. The
-    // contextual storage-mass calculator divides by `ins_plurality`
-    // (sum of input pluralities) and panics with divide-by-zero on
-    // zero-input mock transactions -- exactly the shape Go's
-    // `estimateFeePerInput` uses for its baseline calc. Mirroring
-    // Go's behaviour here means staying out of the storage-mass
-    // path entirely.
+    // Compute mass only: do NOT call `calc_contextual_masses`.
+    // The contextual storage-mass calculator divides by
+    // `ins_plurality` (sum of input pluralities) and panics with
+    // divide-by-zero on zero-input mock transactions -- the very
+    // shape the per-input baseline calc uses.
     let (consensus_tx, _entries) = junk_filled_consensus_tx(pst, ecdsa)?;
     let mc = MassCalculator::new_with_consensus_params(params);
     let nc = mc.calc_non_contextual_masses(&consensus_tx);
     Ok(nc.compute_mass)
 }
 
-/// Internal helper extracted from [`estimate_mass_after_signatures`]
-/// so the compute-only variant can share the junk-fill + lift step
-/// without duplicating it.
+/// Internal helper extracted from
+/// [`estimate_mass_after_signatures`] so the compute-only variant
+/// can share the junk-fill + lift step without duplicating it.
 ///
-/// Mirrors Go `createTransactionWithJunkFieldsForMassCalculation` at
-/// https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/daemon/server/split_transaction.go#L280
-/// EXACTLY: clone the PST, fill the first `minimum_signatures` pairs
-/// per input with a placeholder signature blob of `SIGNATURE_LEN + 1`
-/// bytes (the +1 for the sigHashType byte), then route the junk PST
-/// through `extract_transaction` so the resulting consensus tx
-/// carries the same sigscript shape (push opcodes + redeem-script
-/// push for multisig) the post-real-signing tx will have. Counting
-/// bytes against a hand-built `sig_script = vec![0u8; SIGNATURE_LEN +
-/// 1]` underestimates the mass by 1 byte per signature (the
-/// `OP_DATA_65` push opcode) and -- for multisig -- by the entire
-/// redeem-script push (which `ScriptBuilder.AddData(redeem_script)`
-/// adds via `OP_PUSHDATA1` + 1-byte length + the redeem-script
-/// bytes). The under-count became operationally fatal on fee-tight
-/// outputs (2-sompi shortfall on tn-10).
+/// Clones the PST, fills the first `minimum_signatures` pairs per
+/// input with a placeholder signature blob of `SIGNATURE_LEN + 1`
+/// bytes (the +1 for the sigHashType byte), and routes the junk
+/// PST through `extract_transaction` so the resulting consensus
+/// tx carries the same sigscript shape (push opcodes + redeem-
+/// script push for multisig) the post-real-signing tx will have.
+/// Counting bytes against a hand-built
+/// `sig_script = vec![0u8; SIGNATURE_LEN + 1]` underestimates the
+/// mass by 1 byte per signature (the `OP_DATA_65` push opcode)
+/// and -- for multisig -- by the entire redeem-script push (which
+/// `ScriptBuilder::add_data(redeem_script)` adds via
+/// `OP_PUSHDATA1` + 1-byte length + the redeem-script bytes). The
+/// under-count was operationally fatal on fee-tight outputs
+/// (2-sompi shortfall on tn-10).
 fn junk_filled_consensus_tx(
     pst: &wire::PartiallySignedTransaction,
     ecdsa: bool,
@@ -119,12 +105,12 @@ fn junk_filled_consensus_tx(
     let entries = build_utxo_entries(pst)?;
     let mut junk = pst.clone();
 
-    // Set `Tx.Inputs[i].SigOpCount = len(PubKeySignaturePairs)` to
-    // match Go (`split_transaction.go::createTransactionWithJunkFieldsForMassCalculation:296`).
+    // Set `Tx.Inputs[i].SigOpCount = len(PubKeySignaturePairs)`.
     // The matching pre-sighash sync in the sign module
-    // (`apply_sig_op_count_from_psi`) covers the real-signing path;
-    // this junk-fill duplicates it because the PST passed here is
-    // typically unsigned (just emerged from `create_unsigned_transaction`).
+    // (`apply_sig_op_count_from_psi`) covers the real-signing
+    // path; this junk-fill duplicates it because the PST passed
+    // here is typically unsigned (just emerged from
+    // `create_unsigned_transaction`).
     let tx = junk.tx.as_mut().ok_or(SignError::Missing("PartiallySignedTransaction.tx"))?;
     if tx.inputs.len() != junk.partially_signed_inputs.len() {
         return Err(SignError::Invalid {
@@ -145,9 +131,8 @@ fn junk_filled_consensus_tx(
     }
 
     // Fill the first `minimum_signatures` pairs with junk
-    // `SIGNATURE_LEN + 1`-byte blobs. The remaining pairs stay empty
-    // -- matching Go's `if uint32(j) >= minimumSignatures { break }`
-    // bound at `split_transaction.go:291`.
+    // `SIGNATURE_LEN + 1`-byte blobs. The remaining pairs stay
+    // empty.
     let junk_sig: Vec<u8> = vec![0u8; SIGNATURE_LEN + 1];
     for psi in junk.partially_signed_inputs.iter_mut() {
         let min_sigs = psi.minimum_signatures as usize;

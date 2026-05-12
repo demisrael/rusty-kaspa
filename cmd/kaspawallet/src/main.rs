@@ -1,11 +1,11 @@
 //! Binary entry point. The 17-subcommand surface is wired via
 //! `clap`; subcommands route to the in-crate `dispatch` module
-//! (offline subcommands compose the library directly; daemon-client
-//! subcommands dial the running daemon via the in-crate
-//! `DaemonClient`). `parse` reads transaction hex offline and emits
-//! the Go-equivalent transcript via the library's parse module;
-//! `start-daemon` boots the gRPC daemon surface via the library's
-//! daemon module.
+//! (offline subcommands compose the library directly; daemon-
+//! client subcommands dial the running daemon via the in-crate
+//! `DaemonClient`). `parse` reads transaction hex offline and
+//! emits the transcript via the library's parse module;
+//! `start-daemon` boots the gRPC daemon surface via the
+//! library's daemon module.
 
 use std::io::{self, Write};
 use std::path::Path;
@@ -91,18 +91,15 @@ fn run_parse(args: ParseArgs, top_level_network: &kaspawallet::cli::NetworkFlags
         eprintln!("wallet backend '{}' is not available in this build", args.wallet_backend.as_kebab());
         return ExitCode::from(2);
     }
-    // Merge top-level + per-subcommand network flags (Go's
-    // `combineNetworkFlags` semantics).
+    // Merge top-level + per-subcommand network flags.
     let mut merged = top_level_network.clone();
     merged.combine(&args.network);
 
     // Resolve the keyfile path: operator-supplied `--keys-file`
-    // override if present, otherwise the Go-conformant
-    // platform-aware default
-    // (`AppDir/<network>/keys.json`). The keyfile is ALWAYS read,
-    // mirroring Go's `keys.ReadKeysFile(netParams, path)` chain
-    // (`cmd/kaspawallet/keys/keys.go:28-34`). Failure at the
-    // resolved path exits 1 with a structured error.
+    // override if present, otherwise the platform-aware default
+    // (`<app-dir>/<network>/keys.json`). The keyfile is ALWAYS
+    // read; failure at the resolved path exits 1 with a
+    // structured error.
     let override_path = args.keys_file.as_deref().map(Path::new);
     let keysfile_path = match require_existing_keyfile(override_path, merged.network_name()) {
         Ok(p) => p,

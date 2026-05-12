@@ -1,18 +1,12 @@
-//! Subcommand-registry and flag-parity tests. Cross-checked
-//! against the Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/config.go`
-//! `parseCommandLine`'s subcommand list and per-`Conf` flag tags.
+//! Subcommand-registry and flag-parity tests.
 
 use clap::CommandFactory;
 
 use super::args::Cli;
 use super::wallet_backend::WalletBackend;
 
-/// The full 17-subcommand surface mirroring the Go reference's
-/// `parseCommandLine`. The four RBF-and-version subcommands
-/// (`broadcast-replacement`, `bump-fee`, `bump-fee-unsigned`,
-/// `get-daemon-version`) close the Phase-1 parity gap from the
-/// initial 13-subcommand subset.
+/// The full 17-subcommand surface registered on the binary's
+/// `clap` `Command`.
 const EXPECTED_SUBCOMMANDS: &[&str] = &[
     "create",
     "dump-unencrypted-data",
@@ -40,14 +34,14 @@ fn test_subcommand_registry_matches_go_set() {
     got.sort();
     let mut want: Vec<String> = EXPECTED_SUBCOMMANDS.iter().map(|s| (*s).to_string()).collect();
     want.sort();
-    assert_eq!(got, want, "registered subcommands deviate from the Go reference");
+    assert_eq!(got, want, "registered subcommands deviate from the expected surface");
 }
 
 #[test]
 fn test_subcommand_count_is_seventeen() {
     let cmd = Cli::command();
     let count = cmd.get_subcommands().count();
-    assert_eq!(count, 17, "full Phase-1 surface is exactly 17 subcommands");
+    assert_eq!(count, 17, "wallet binary exposes exactly 17 subcommands");
 }
 
 #[test]
@@ -81,7 +75,7 @@ fn test_send_required_to_address() {
     let cmd = Cli::command();
     let sub = cmd.find_subcommand("send").expect("send subcommand registered");
     let to_address = sub.get_arguments().find(|a| a.get_long() == Some("to-address")).expect("send has --to-address");
-    assert!(to_address.is_required_set(), "send --to-address must be required per Go reference");
+    assert!(to_address.is_required_set(), "send --to-address must be required");
 }
 
 #[test]
@@ -100,7 +94,7 @@ fn test_balance_daemon_address_default_is_loopback() {
     let defaults: Vec<&clap::builder::OsStr> = arg.get_default_values().iter().collect();
     let default_os: &std::ffi::OsStr = defaults.first().expect("default present").as_ref();
     let default_str = default_os.to_str().unwrap_or("");
-    assert_eq!(default_str, "localhost:8082", "F3 ruling: daemon address default must be loopback-only");
+    assert_eq!(default_str, "localhost:8082", "daemon address default must be loopback-only");
 }
 
 #[test]
@@ -111,7 +105,7 @@ fn test_start_daemon_listen_default_is_loopback() {
     let defaults: Vec<&clap::builder::OsStr> = arg.get_default_values().iter().collect();
     let default_os: &std::ffi::OsStr = defaults.first().expect("default present").as_ref();
     let default_str = default_os.to_str().unwrap_or("");
-    assert_eq!(default_str, "localhost:8082", "F3 ruling: --listen default must be localhost:8082");
+    assert_eq!(default_str, "localhost:8082", "--listen default must be localhost:8082");
 }
 
 #[test]
@@ -152,7 +146,7 @@ fn test_wallet_backend_default_is_go() {
     let defaults: Vec<&clap::builder::OsStr> = arg.get_default_values().iter().collect();
     let default_os_str: &std::ffi::OsStr = defaults.first().expect("default present").as_ref();
     let default_str = default_os_str.to_str().unwrap_or("");
-    assert_eq!(default_str, "go", "default backend must be go (lead direction 2026-05-11)");
+    assert_eq!(default_str, "go", "default backend must be go");
 }
 
 #[test]

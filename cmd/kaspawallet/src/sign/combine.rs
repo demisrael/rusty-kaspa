@@ -1,11 +1,7 @@
 //! Multisig partial-signature combination + final-signature-script
-//! assembly. Mirrors the Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/libkaspawallet/transaction.go#L188`
-//! (`ExtractTransactionDeserialized`,
-//! `partiallySignedInputMultisigRedeemScript`,
-//! `multiSigRedeemScript`).
+//! assembly.
 //!
-//! Phase 1 contract:
+//! Module contract:
 //!
 //! - Consumes a fully-signed (or junk-filled, for mass estimation)
 //!   `PartiallySignedTransaction` -- every input's
@@ -13,25 +9,23 @@
 //!   `Signature` byte blobs.
 //! - Produces a consensus-core `Transaction` whose
 //!   `inputs[i].signature_script` is the on-chain-broadcastable
-//!   sigscript, built the same way the Go reference's
-//!   `txscript.NewScriptBuilder()...Script()` chain builds it.
+//!   sigscript.
 //! - For single-cosigner inputs the sigscript is one PUSHDATA of
 //!   the signature blob; for multisig inputs the sigscript is N
 //!   PUSHDATA signatures followed by one PUSHDATA of the redeem
 //!   script.
 //!
-//! Reuse-existing-crates discipline observed end-to-end:
+//! Building blocks reused from the workspace:
 //!
 //! - `kaspa_bip32::ExtendedPublicKey` for deserializing each
 //!   `pair.extended_pub_key` and extracting its serialized public
 //!   key.
 //! - `kaspa_txscript::script_builder::ScriptBuilder` for every
-//!   PUSHDATA wrapping (so length prefixes match Go's
-//!   `txscript.NewScriptBuilder().AddData(...)` byte-for-byte).
+//!   PUSHDATA wrapping (so length prefixes follow the consensus
+//!   script-builder semantics byte-for-byte).
 //! - `kaspa_txscript::standard::multisig::{multisig_redeem_script,
 //!   multisig_redeem_script_ecdsa}` for the redeem-script
-//!   construction (the same primitive `kaspa-txscript`'s own
-//!   multisig tests consume).
+//!   construction.
 
 use kaspa_bip32::ExtendedPublicKey;
 use kaspa_consensus_core::tx::{Transaction, TransactionInput};
@@ -49,14 +43,13 @@ const SCHNORR_PUBKEY_LEN: usize = 32;
 const ECDSA_PUBKEY_LEN: usize = 33;
 
 /// Assemble the on-chain `Transaction` from a fully-collected (or
-/// junk-filled) PST. Mirrors the Go
-/// `ExtractTransactionDeserialized(pst, ecdsa)` end-to-end.
+/// junk-filled) PST.
 ///
 /// `ecdsa` controls the redeem-script's opcode + pubkey form for
-/// multisig inputs (`OpCheckMultiSig` + 32-byte Schnorr pubkeys vs
-/// `OpCheckMultiSigECDSA` + 33-byte compressed pubkeys). For
-/// single-cosigner inputs the flag is unused (the sigscript is one
-/// PUSHDATA of the signature only).
+/// multisig inputs (`OpCheckMultiSig` + 32-byte Schnorr pubkeys
+/// vs `OpCheckMultiSigECDSA` + 33-byte compressed pubkeys). For
+/// single-cosigner inputs the flag is unused (the sigscript is
+/// one PUSHDATA of the signature only).
 pub fn extract_transaction(pst: &wire::PartiallySignedTransaction, ecdsa: bool) -> Result<Transaction, SignError> {
     let tx_msg = pst.tx.as_ref().ok_or(SignError::Missing("PartiallySignedTransaction.tx"))?;
     let mut consensus_tx = wire_to_consensus_tx(tx_msg)?;
@@ -121,11 +114,10 @@ fn build_multisig_signature_script(psi: &wire::PartiallySignedInput, ecdsa: bool
     Ok(builder.drain())
 }
 
-/// Build the redeem script bound to a multisig input's pair set.
-/// Mirrors Go `partiallySignedInputMultisigRedeemScript`:
-/// extracts each pair's `extended_pub_key`, deserializes it, takes
+/// Build the redeem script bound to a multisig input's pair set:
+/// extract each pair's `extended_pub_key`, deserialize it, take
 /// its serialized public key (32-byte x-only for Schnorr, 33-byte
-/// compressed for ECDSA), and builds the M-of-N redeem script via
+/// compressed for ECDSA), and build the M-of-N redeem script via
 /// `kaspa_txscript::standard::multisig::multisig_redeem_script*`.
 fn redeem_script_for_input(psi: &wire::PartiallySignedInput, ecdsa: bool) -> Result<Vec<u8>, SignError> {
     let required = psi.minimum_signatures as usize;

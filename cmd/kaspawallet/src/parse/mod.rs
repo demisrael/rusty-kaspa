@@ -1,28 +1,20 @@
 //! `parse` subcommand body. Decodes one or more hex-encoded
-//! `PartiallySignedTransaction` messages and emits a human-readable
-//! transcript whose surface mirrors the Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/e6e7f6743501f55b0b57fd879a8d58ebb390182e/cmd/kaspawallet/parse.go`.
+//! `PartiallySignedTransaction` messages and emits a human-
+//! readable transcript.
 //!
-//! The Go binary's parse output is plain text emitted via
-//! `fmt.Printf` (NOT JSON). The Rust port mirrors that shape
-//! byte-for-byte where physically possible so the Validator's
-//! `cmp`-against-Go parity test in spec section 6.10.2 succeeds without
-//! normalization.
+//! Output is plain text (not JSON). The transcript shape is the
+//! contract exercised by the parity tests in `tests/parity.rs`.
 //!
-//! The Go binary's hex format supports MULTIPLE
-//! `PartiallySignedTransaction` payloads concatenated with a `_`
-//! separator (see `server.DecodeTransactionsFromHex` in
-//! `cmd/kaspawallet/daemon/server/transactions_hex_encoding.go`).
-//! This module accepts the same multi-transaction form.
+//! The hex format supports MULTIPLE `PartiallySignedTransaction`
+//! payloads concatenated with a `_` separator; this module
+//! accepts the same multi-transaction form.
 //!
 //! Mass + fee-rate output: when the caller supplies a
-//! `KeysFile`, the parse transcript trails with the Go reference's
-//! "Mass: N grams" and "Fee rate: X Sompi/Gram" lines computed via
-//! `crate::mass::estimate_mass_after_signatures`. When no keyfile
-//! is supplied (which the spec section 3.0.7 documents as optional in
-//! Phase 1, pending the architect's reconciliation against the Go
-//! reference's required-keysfile behavior), those two lines are
-//! omitted; everything before them mirrors Go byte-for-byte.
+//! `KeysFile`, the transcript trails with "Mass: N grams" and
+//! "Fee rate: X Sompi/Gram" lines computed via
+//! `crate::mass::estimate_mass_after_signatures`. When no
+//! keyfile is supplied, those two lines are omitted; everything
+//! before them is identical.
 
 mod error;
 
@@ -45,18 +37,15 @@ use crate::sign::wire::wire_to_consensus_tx;
 
 pub use error::ParseError;
 
-/// Separator the Go reference uses to concatenate multiple
-/// hex-encoded transactions in one input string. See
-/// `cmd/kaspawallet/daemon/server/transactions_hex_encoding.go`
-/// (`hexTransactionsSeparator`).
+/// Separator used to concatenate multiple hex-encoded
+/// transactions in one input string.
 const HEX_TRANSACTIONS_SEPARATOR: char = '_';
 
 /// Sources of the transaction hex. Exactly one MUST be `Some`;
-/// passing both or neither yields a `ParseError`. When `keysfile`
-/// is `Some`, the trailing Go-equivalent "Mass: ... grams" and
+/// passing both or neither yields a `ParseError`. When
+/// `keysfile` is `Some`, the trailing "Mass: ... grams" and
 /// "Fee rate: ... Sompi/Gram" lines are emitted; otherwise both
-/// trailing lines are omitted (the rest of the transcript still
-/// mirrors Go).
+/// trailing lines are omitted.
 #[derive(Debug)]
 pub struct ParseInput<'a> {
     pub transaction: Option<&'a str>,
@@ -67,8 +56,7 @@ pub struct ParseInput<'a> {
 }
 
 /// Resolve the active address prefix from the parsed
-/// `NetworkFlags`. Mirrors the Go reference's
-/// `NetParams().Prefix` selection. The clap arg-group makes
+/// `NetworkFlags`. The clap arg-group makes
 /// `testnet`/`simnet`/`devnet` mutually exclusive; mainnet (no
 /// flag) is the default.
 pub fn resolve_prefix(network: &NetworkFlags) -> Prefix {

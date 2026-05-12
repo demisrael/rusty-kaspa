@@ -1,4 +1,4 @@
-//! JSON encode / decode for the legacy Go keyfile format.
+//! JSON encode / decode for the keyfile format.
 
 use std::fs::{File, OpenOptions};
 use std::io::{BufReader, Read, Write};
@@ -7,18 +7,16 @@ use std::path::Path;
 use super::error::KeyfileError;
 use super::types::{EncryptedMnemonic, EncryptedMnemonicJson, KeysFile, KeysFileJson};
 
-/// Read a keyfile from a filesystem path. Mirrors the Go
-/// `ReadKeysFile` strict-decode semantics: unknown JSON fields are
-/// rejected (Go uses `decoder.DisallowUnknownFields`).
+/// Read a keyfile from a filesystem path. Strict decode --
+/// unknown JSON fields are rejected.
 pub fn read_from_path(path: impl AsRef<Path>) -> Result<KeysFile, KeyfileError> {
     let file = File::open(path)?;
     let reader = BufReader::new(file);
     read_from_reader(reader)
 }
 
-/// Read a keyfile from any reader. The Go reference uses
-/// `json.NewDecoder(file).DisallowUnknownFields()`; we use
-/// `serde(deny_unknown_fields)` for equivalent strictness.
+/// Read a keyfile from any reader. Uses
+/// `serde(deny_unknown_fields)` for strict decode.
 pub fn read_from_reader(reader: impl Read) -> Result<KeysFile, KeyfileError> {
     let raw: KeysFileJson = serde_json::from_reader(reader)?;
     from_json(raw)
@@ -46,14 +44,14 @@ fn decode_encrypted_mnemonic(j: EncryptedMnemonicJson) -> Result<EncryptedMnemon
     Ok(EncryptedMnemonic { cipher, salt })
 }
 
-/// Atomically persist a `KeysFile` to the supplied path. Mirrors
-/// Go `keys.File.Save` semantics: serialize the JSON envelope,
-/// write to a sibling `<path>.tmp`, fsync, then rename onto the
-/// target. The rename is the atomic step; on POSIX `rename(2)`
-/// replaces the destination atomically, and on Windows
-/// `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING` provides the
-/// same guarantee. Used by the daemon's mutating handlers
-/// (NewAddress, change-address bump in CreateUnsignedTransactions).
+/// Atomically persist a `KeysFile` to the supplied path:
+/// serialize the JSON envelope, write to a sibling
+/// `<path>.tmp`, fsync, then rename onto the target. The rename
+/// is the atomic step; on POSIX `rename(2)` replaces the
+/// destination atomically, and on Windows `MoveFileExW` with
+/// `MOVEFILE_REPLACE_EXISTING` provides the same guarantee. Used
+/// by the daemon's mutating handlers (NewAddress,
+/// change-address bump in CreateUnsignedTransactions).
 pub fn save_to_path(keysfile: &KeysFile, path: impl AsRef<Path>) -> Result<(), KeyfileError> {
     let path = path.as_ref();
     let parent = path.parent().unwrap_or_else(|| Path::new("."));

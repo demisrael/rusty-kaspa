@@ -1,9 +1,6 @@
-//! Argon2id + XChaCha20-Poly1305 mnemonic decryption, mirroring the
-//! Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/keys/keys.go#L378`
-//! (`getAEAD` and `decryptMnemonic`). v0 keyfiles brute-force the
-//! parallelism parameter; v1 keyfiles use a fixed
-//! `DEFAULT_NUM_THREADS`.
+//! Argon2id + XChaCha20-Poly1305 mnemonic decryption. v0
+//! keyfiles brute-force the Argon2id parallelism parameter; v1
+//! keyfiles use a fixed `DEFAULT_NUM_THREADS`.
 
 use argon2::{Algorithm, Argon2, Params, Version};
 use chacha20poly1305::aead::Aead;
@@ -22,12 +19,11 @@ use super::types::{
 /// drop, so callers do not need to add their own zeroize wrapper at
 /// the boundary.
 ///
-/// Mirrors Go `File.DecryptMnemonics`: a single thread-count
-/// resolution applies to every mnemonic in the file (one
-/// brute-force pass on v0 against the first mnemonic, then reused).
-/// The on-disk keyfile is **not** mutated in this Rust path; the Go
-/// reference writes the resolved value back to disk on v0, which is
-/// deliberately omitted here so fixture-driven tests remain
+/// A single thread-count resolution applies to every mnemonic in
+/// the file (one brute-force pass on v0 against the first
+/// mnemonic, then reused). The on-disk keyfile is **not** mutated
+/// here -- writing the resolved value back to disk on v0 is
+/// deliberately omitted so fixture-driven tests remain
 /// idempotent.
 pub fn decrypt_mnemonics(keyfile: &KeysFile, password: &[u8]) -> Result<Zeroizing<Vec<String>>, KeyfileError> {
     if keyfile.encrypted_mnemonics.is_empty() {
@@ -68,9 +64,9 @@ fn derive_key(password: &[u8], salt: &[u8], threads: u8) -> Result<Zeroizing<[u8
 
 /// Resolve the Argon2id parallelism parameter. v1 keyfiles use a
 /// fixed constant; v0 keyfiles brute-force against the first
-/// mnemonic (the Go reference's `detectNumThreads`). The
-/// brute-force exits on the first guess that produces a successful
-/// AEAD open and propagates any non-MAC error verbatim.
+/// mnemonic. The brute-force exits on the first guess that
+/// produces a successful AEAD open and propagates any non-MAC
+/// error verbatim.
 fn resolve_num_threads(keyfile: &KeysFile, password: &[u8]) -> Result<u8, KeyfileError> {
     if keyfile.version != 0 {
         return Ok(DEFAULT_NUM_THREADS);

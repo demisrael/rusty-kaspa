@@ -26,9 +26,8 @@ pub enum KeySourceError {
     Invalid { field: &'static str, reason: String },
     #[error("redeem-script construction failed: {0}")]
     RedeemScript(String),
-    /// Mirrors Go's `os.Open`-on-default-keys-file error path
-    /// when neither `--keys-file` nor the platform-aware default
-    /// path resolves to an existing file.
+    /// Neither `--keys-file` nor the platform-aware default
+    /// path resolves to an existing keyfile on disk.
     #[error("keyfile not found at default path '{default}' or any operator-supplied override")]
     DefaultPathMissing { default: String },
     /// The platform-aware default-path resolver could not

@@ -1,42 +1,33 @@
-//! Validation parity harness (Go vs Rust kaspawallet) -- offline
-//! subset.
+//! Cross-implementation parity harness -- offline subset.
 //!
-//! Mirrors the spec's sec.6.10 harness contract. The full per-subcommand
-//! matrix the Validator runs spans both an offline (no-kaspad) subset
-//! and an online (tn-10 / simnet) subset that requires running daemons
-//! and a live kaspad. This file lands the offline subset Implementor
-//! can ship + verify in CI; the online subset is scaffolded as
-//! `#[ignore]`-gated tests so the same module hosts the eventual full
-//! matrix without a second cross-cutting reorganization.
+//! The full per-subcommand parity matrix the Validator runs spans
+//! both an offline (no-kaspad) subset and an online
+//! (tn-10 / simnet) subset that requires running daemons and a
+//! live kaspad. This file lands the offline subset that ships in
+//! CI; the online subset is scaffolded as `#[ignore]`-gated tests
+//! so the same module hosts the eventual full matrix without a
+//! second cross-cutting reorganization.
 //!
-//! Subcommands actually exercisable in standalone-binary mode today
-//! (per `cmd/kaspawallet/src/main.rs` -- the offline subset that the
-//! binary's own `main` dispatches without daemon/coin-sel/sign
-//! plumbing):
+//! Subcommands exercisable in standalone-binary mode today:
 //!
-//! - `version` -- both binaries print a one-line version banner; we
-//!   normalize the version literal per sec.6.10.2 and compare framing.
-//! - `parse` -- both binaries decode a Go-emitted unsigned PSTX hex
-//!   plus a fixture keyfile and emit a plaintext transcript; spec
-//!   says byte-identity holds (raw `cmp`).
+//! - `version` -- both binaries print a one-line version banner;
+//!   the version literal is normalised and the framing compared.
+//! - `parse` -- both binaries decode a reference unsigned PSTX
+//!   hex plus a fixture keyfile and emit a plaintext transcript;
+//!   byte-identity holds (raw `cmp`).
 //!
-//! Subcommands that need the daemon-client wiring (or sign-flow) the
-//! standalone CLI does not yet wire (`balance`, `show-addresses`,
-//! `new-address`, `send`, `create-unsigned-transaction`, `broadcast`,
-//! `sign`, `dump-unencrypted-data`, `sweep`, `start-daemon`'s gRPC
-//! liveness probe, `create`) are scaffolded below as `#[ignore]`-gated
-//! tests. Each carries the spec's normalization rule and the diff
-//! invocation; the ignore lifts when the corresponding standalone
-//! invocation is wired (sibling task or B7 tn-10).
+//! Subcommands that need the daemon-client wiring (or sign-flow)
+//! the standalone CLI does not yet wire are scaffolded below as
+//! `#[ignore]`-gated tests. Each carries the normalization rule
+//! and the diff invocation; the ignore lifts when the
+//! corresponding standalone invocation is wired (sibling task or
+//! tn-10 closure run).
 //!
-//! Skip semantics: when the Go binary is missing AND the default path
-//! (`/home/dima/work/kaspa/kaspad/bin/kaspawallet`) does not resolve
-//! to an executable file, EVERY parity test prints a one-line warning
-//! and exits 0. This is "skip-with-warning" per sec.6.10.1; the Validator
-//! treats a no-Go-binary closure as a HIGH-severity FINDING under
-//! Mission sec.S4 (the AC explicitly demands Go-vs-Rust evidence on
-//! tn-10), but the Implementor's harness is not the place to enforce
-//! that policy -- the closure-report attestation is.
+//! Skip semantics: when the reference Go binary is missing AND
+//! the default path
+//! (`/home/dima/work/kaspa/kaspad/bin/kaspawallet`) does not
+//! resolve to an executable file, every parity test prints a
+//! one-line warning and exits 0.
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -47,8 +38,8 @@ use std::process::Command;
 /// fresh checkout can run the parity tests without env-var setup.
 const DEFAULT_GO_BIN: &str = "/home/dima/work/kaspa/kaspad/bin/kaspawallet";
 
-/// Environment variable the Validator (or developer) sets to point
-/// the harness at a non-default Go binary build. Mirrors sec.6.10.1.
+/// Environment variable the Validator (or developer) sets to
+/// point the harness at a non-default reference-binary build.
 const ENV_GO_BIN: &str = "KASPAWALLET_GO_BIN";
 
 /// Environment variable the Validator (or developer) sets to point
@@ -161,10 +152,10 @@ fn resolve_binaries(test_name: &str) -> Option<(PathBuf, PathBuf)> {
 }
 
 /// Capture stdout + stderr from a binary invocation as a single
-/// byte stream. Mirrors the Go reference's `2>&1` semantics so
-/// the parity diff covers both streams. Panics on process-spawn
-/// failure (the test should fail loudly when the binary path
-/// resolved but cannot be exec'd).
+/// byte stream (the equivalent of `2>&1`) so the parity diff
+/// covers both streams. Panics on process-spawn failure (the
+/// test should fail loudly when the binary path resolved but
+/// cannot be exec'd).
 fn run_capture(bin: &Path, args: &[&str]) -> Vec<u8> {
     let output = Command::new(bin).args(args).output().expect("process spawn");
     let mut combined = output.stdout;
@@ -350,21 +341,20 @@ fn cross_wallet_multisig_3of5_both_directions() {
 }
 
 // --------------------------------------------------------------
-// RBF / version subcommands. Mirrors the parity-harness scaffolds
-// above; each new subcommand needs a live daemon (and for
-// `bump-fee` / `broadcast-replacement` a pending mempool tx on
-// tn-10) so the active assertion is deferred to the Validator's
-// tn-10 closure pass.
+// RBF / version subcommands. Each new subcommand needs a live
+// daemon (and for `bump-fee` / `broadcast-replacement` a pending
+// mempool tx on tn-10), so the active assertion is deferred to
+// the Validator's tn-10 closure pass.
 // --------------------------------------------------------------
 
 #[test]
 #[ignore = "needs two daemons against one kaspad with a pre-signed replacement tx; un-ignore for the Validator's tn-10 closure run"]
 fn broadcast_replacement_byte_identity() {
-    // Mirrors the `broadcast` parity row: byte-identical
-    // tx-ID-list output. Daemon submits via kaspad's
-    // `submit_transaction_replacement` RPC; the Go and Rust
-    // binaries should produce the same stdout framing on the same
-    // pre-signed replacement hex.
+    // Same shape as the `broadcast` parity row: byte-identical
+    // tx-ID-list output. The daemon submits via kaspad's
+    // `submit_transaction_replacement` RPC; both binaries
+    // produce the same stdout framing on the same pre-signed
+    // replacement hex.
     unreachable!("scaffold");
 }
 

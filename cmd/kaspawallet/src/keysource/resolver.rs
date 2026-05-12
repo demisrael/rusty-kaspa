@@ -1,6 +1,6 @@
 //! Wallet-backend resolver. Reads the `--wallet-backend` flag
 //! value and constructs the matching `KeySource` implementation.
-//! Only `WalletBackend::Go` resolves successfully in this build;
+//! Only the keyfile-backed variant resolves successfully in this build;
 //! the reserved values return a structured error with the
 //! operator-facing wording mandated by the task spec.
 
@@ -13,9 +13,8 @@ use super::error::ResolveError;
 use super::legacy_go::LegacyGoKeyfile;
 use super::traits::KeySource;
 
-/// Two key chains in a BIP-32 wallet. Mirrors the Go reference's
-/// `ExternalKeychain = 0` / `InternalKeychain = 1` constants
-/// (`libkaspawallet/keychains.go`).
+/// Two key chains in a BIP-32 wallet. The wire-encoded constants
+/// are `External = 0` and `Internal = 1`.
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub enum KeyChain {
     /// Receiving addresses.
@@ -35,9 +34,9 @@ impl KeyChain {
 
 /// Resolve a backend selection to a concrete `KeySource`
 /// implementation. The keyfile + password tuple is consumed only
-/// when the resolved backend reads on-disk keyfiles (Go in this
-/// build). Hardware-wallet backends (when they land) would accept
-/// a different opener tuple; the resolver's surface will grow at
+/// when the resolved backend reads on-disk keyfiles.
+/// Hardware-wallet backends (when they land) would accept a
+/// different opener tuple; the resolver's surface will grow at
 /// that point.
 pub fn resolve_backend(
     backend: WalletBackend,

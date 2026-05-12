@@ -1,28 +1,19 @@
 //! Daemon state: address-set, UTXO snapshot, mempool-excluded
-//! UTXOs, used-outpoint expiry tracking, sync progress markers.
-//! Mirrors Go `cmd/kaspawallet/daemon/server/server.go@6c1f821f`'s
-//! `server` struct minus the kaspad RPC clients (held separately
-//! by the sync loop and the transaction-broadcast handlers).
+//! UTXOs, used-outpoint expiry tracking, and sync progress
+//! markers.
 //!
-//! The state is held behind an asynchronous `tokio::sync::Mutex`.
-//! The Go reference uses a `sync.RWMutex` and acquires it inside
-//! synchronous handlers; the async-Rust equivalent matches the
-//! lock semantics but yields the executor while contended.
+//! State is held behind an asynchronous `tokio::sync::Mutex`; the
+//! lock semantics are read-mostly with occasional mutating
+//! handlers (`new_address`, `create_unsigned_transactions`,
+//! `send`, `bump_fee`).
 //!
-//! Address derivation is performed by a Go-conformant helper
-//! (`address_for_wallet_path`) that respects the cosigner-prefix
-//! the Go `walletAddressPath` produces for multisig:
+//! Address derivation uses cosigner-prefixed paths:
 //!
 //! - single-cosigner: `m/<keychain>/<index>` -- 2 levels off the
 //!   keyfile-stored cosigner xpub.
 //! - multi-cosigner: `m/<cosigner_index>/<keychain>/<index>` -- 3
 //!   levels off each cosigner xpub, combined into an M-of-N
 //!   redeem script whose blake2b-256 hash is the P2SH payload.
-//!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/address.go#L116
-//! (`walletAddressPath`) and
-//! https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/keypair.go#L79
-//! (`libkaspawallet.Address`).
 
 use std::collections::HashMap;
 use std::str::FromStr;
@@ -44,23 +35,17 @@ use crate::keysource::KeySourceError;
 /// Matches `kaspa_txscript::pay_to_script_hash_script`.
 const SCRIPT_HASH_LEN: usize = 32;
 
-/// Time window after which a previously-attempted-spend outpoint is
-/// considered safe to reuse. Matches Go
-/// `cmd/kaspawallet/daemon/server/sync.go@6c1f821f::usedOutpointHasExpired`
-/// (`time.Minute`).
+/// Time window after which a previously-attempted-spend outpoint
+/// is considered safe to reuse.
 pub const USED_OUTPOINT_EXPIRY: Duration = Duration::from_secs(60);
 
-/// Coinbase maturity window measured in DAA score units. Mirrors
-/// Go's post-Crescendo `coinbaseMaturity = 1000` baked into the
-/// daemon at
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/server.go#L100
-/// (the Go reference comment notes the value differs from the
-/// pre-Crescendo go-kaspad default).
+/// Coinbase maturity window measured in DAA score units
+/// (post-Crescendo).
 pub const COINBASE_MATURITY: u64 = 1000;
 
 /// Logical key chain a derived address belongs to. The values
-/// mirror Go `libkaspawallet.ExternalKeychain = 0` and
-/// `InternalKeychain = 1`.
+/// (External=0, Internal=1) are the keyfile-format child-number
+/// indices.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum KeyChain {
     External = 0,
@@ -68,16 +53,14 @@ pub enum KeyChain {
 }
 
 impl KeyChain {
-    /// Hardened-derivation child number for this chain. Both
-    /// chains are non-hardened in the Go reference.
+    /// Non-hardened child number for this chain.
     pub fn index(self) -> u32 {
         self as u32
     }
 }
 
 /// Wallet-internal address identity: which cosigner stream, which
-/// chain, and which leaf index. Mirrors Go
-/// `cmd/kaspawallet/daemon/server/common.go::walletAddress`.
+/// chain, and which leaf index.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub struct WalletAddress {
     pub cosigner_index: u32,
@@ -85,14 +68,12 @@ pub struct WalletAddress {
     pub index: u32,
 }
 
-/// Map of address-string -> wallet-address identity. Mirrors Go
-/// `walletAddressSet`. The keys are the Go-compatible
-/// `kaspa:...` / `kaspatest:...` strings the kaspad RPC API
+/// Map of address-string -> wallet-address identity. The keys are
+/// the `kaspa:...` / `kaspatest:...` strings the kaspad RPC API
 /// consumes.
 pub type WalletAddressSet = HashMap<String, WalletAddress>;
 
-/// In-daemon view of a single UTXO. Mirrors Go
-/// `cmd/kaspawallet/daemon/server/common.go::walletUTXO`.
+/// In-daemon view of a single UTXO.
 #[derive(Debug, Clone)]
 pub struct WalletUtxo {
     pub outpoint: TransactionOutpoint,
@@ -104,11 +85,10 @@ pub struct WalletUtxo {
     pub address_string: String,
 }
 
-/// Sync state of the wallet daemon. The Go reference computes
-/// `isSynced()` as
-/// `s.nextSyncStartIndex > s.maxUsedIndex() && s.firstSyncDone.Load()`
-/// at
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/sync.go#L330.
+/// Sync state of the wallet daemon. `is_synced()` returns true
+/// once the first sync pass has completed AND the next scan
+/// boundary has overtaken the highest derivation index already
+/// observed in the keyfile.
 #[derive(Debug, Clone, Copy)]
 pub struct SyncProgress {
     pub first_sync_done: bool,
@@ -118,7 +98,7 @@ pub struct SyncProgress {
 }
 
 impl SyncProgress {
-    /// Daemon-side `isSynced` predicate mirroring Go.
+    /// Daemon-side synced predicate.
     pub fn is_synced(&self) -> bool {
         self.first_sync_done && self.next_sync_start_index > self.max_used_index()
     }
@@ -129,9 +109,7 @@ impl SyncProgress {
     }
 
     /// Human-facing summary the daemon emits when an RPC handler
-    /// is invoked before `is_synced()` is true. Mirrors Go
-    /// `formatSyncStateReport` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/sync.go#L334.
+    /// is invoked before `is_synced()` is true.
     pub fn format_state_report(&self) -> String {
         let max_used = self.max_used_index().max(self.next_sync_start_index);
         if self.next_sync_start_index < self.max_used_index() {
@@ -150,16 +128,15 @@ impl SyncProgress {
 pub struct DaemonState {
     pub keyfile: KeysFile,
     pub address_prefix: AddressPrefix,
-    /// Sorted xpubs (lexicographic on the textual form). Mirrors
-    /// Go's `sortPublicKeys` step that runs once at keyfile load.
+    /// Sorted xpubs (lexicographic on the textual form), built
+    /// once at keyfile load.
     pub extended_public_keys_sorted: Vec<String>,
     pub address_set: WalletAddressSet,
-    /// UTXOs sorted by amount descending; matches Go
-    /// `s.utxosSortedByAmount`.
+    /// UTXOs sorted by amount descending.
     pub utxos_sorted_by_amount: Vec<WalletUtxo>,
     /// Outpoints excluded because the mempool reports them as
-    /// being spent by a transaction sent from this wallet. Mirrors
-    /// Go `s.mempoolExcludedUTXOs` keyed by `DomainOutpoint`.
+    /// being spent by a transaction sent from this wallet. Keyed
+    /// by outpoint.
     pub mempool_excluded_utxos: HashMap<TransactionOutpoint, WalletUtxo>,
     /// Outpoints this daemon recently selected for a spending
     /// transaction. Each entry expires after `USED_OUTPOINT_EXPIRY`
@@ -205,7 +182,7 @@ impl DaemonState {
         self.extended_public_keys_sorted.len() as u32
     }
 
-    /// Whether this is a multisig keyfile (Go: `isMultisig`).
+    /// Whether this is a multisig keyfile.
     pub fn is_multisig(&self) -> bool {
         self.extended_public_keys_sorted.len() > 1
     }
@@ -226,8 +203,7 @@ impl DaemonState {
 
     /// Derive the textual address for the supplied wallet-address
     /// identity directly (no string allocation for callers that
-    /// already need a typed `Address`). Same Go reference as
-    /// [`Self::wallet_address_string`].
+    /// already need a typed `Address`).
     pub fn wallet_address(&self, wallet_addr: WalletAddress) -> Result<Address, KeySourceError> {
         address_for_wallet_path(
             &self.extended_public_keys_sorted,
@@ -238,11 +214,10 @@ impl DaemonState {
         )
     }
 
-    /// BIP-32 derivation path string for a wallet-address identity.
-    /// Mirrors Go `walletAddressPath` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/address.go#L116
-    /// -- single-cosigner keyfiles produce `m/<keychain>/<index>`,
-    /// multi-cosigner keyfiles produce `m/<cosigner>/<keychain>/<index>`.
+    /// BIP-32 derivation path string for a wallet-address identity:
+    /// single-cosigner keyfiles produce `m/<keychain>/<index>`,
+    /// multi-cosigner keyfiles produce
+    /// `m/<cosigner>/<keychain>/<index>`.
     pub fn wallet_address_path(&self, wallet_addr: WalletAddress) -> String {
         if self.is_multisig() {
             format!("m/{}/{}/{}", wallet_addr.cosigner_index, wallet_addr.key_chain.index(), wallet_addr.index)
@@ -251,11 +226,9 @@ impl DaemonState {
         }
     }
 
-    /// Spendability predicate. Mirrors Go `isUTXOSpendable` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/balance.go#L70
-    /// -- non-coinbase UTXOs are always spendable; coinbase UTXOs
-    /// must satisfy `block_daa_score + COINBASE_MATURITY <
-    /// virtual_daa_score`.
+    /// Spendability predicate. Non-coinbase UTXOs are always
+    /// spendable; coinbase UTXOs must satisfy
+    /// `block_daa_score + COINBASE_MATURITY < virtual_daa_score`.
     pub fn is_utxo_spendable(&self, utxo: &WalletUtxo, virtual_daa_score: u64) -> bool {
         if !utxo.utxo_entry.is_coinbase {
             return true;
@@ -264,11 +237,9 @@ impl DaemonState {
     }
 
     /// Consensus parameters for the daemon's active network. Used
-    /// by the coin-selection / mass-estimation paths the
-    /// transaction-construction handlers feed. Mirrors Go's
-    /// `s.params` lookup -- the wallet daemon only ever reads
-    /// mass coefficients and KIP-9 constants from this value, so a
-    /// `&'static Params` reference is sufficient.
+    /// by the coin-selection / mass-estimation paths; the daemon
+    /// only reads mass coefficients and KIP-9 constants from this
+    /// value, so a `&'static Params` reference is sufficient.
     pub fn params(&self) -> &'static Params {
         match self.address_prefix {
             AddressPrefix::Mainnet => &MAINNET_PARAMS,
@@ -290,14 +261,13 @@ pub fn shared(state: DaemonState) -> SharedState {
     Arc::new(Mutex::new(state))
 }
 
-/// Go-conformant address derivation for a single wallet-address
-/// identity. Single-cosigner keyfiles produce a P2PK (Schnorr or
-/// ECDSA per the keyfile's `ecdsa` flag); multi-cosigner keyfiles
-/// produce a P2SH whose payload is the blake2b-256 hash of an
-/// M-of-N redeem script.
+/// Address derivation for a single wallet-address identity.
+/// Single-cosigner keyfiles produce a P2PK (Schnorr or ECDSA per
+/// the keyfile's `ecdsa` flag); multi-cosigner keyfiles produce a
+/// P2SH whose payload is the blake2b-256 hash of an M-of-N redeem
+/// script.
 ///
-/// The path semantics match Go `walletAddressPath` ->
-/// `libkaspawallet.Address`:
+/// Path semantics:
 ///
 /// - single-cosigner: derive the lone xpub at `<key_chain>/<index>`.
 /// - multi-cosigner: derive EACH sorted cosigner xpub at

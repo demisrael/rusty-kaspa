@@ -132,11 +132,11 @@ async fn view_rpcs_return_failed_precondition_without_state() {
 
 #[tokio::test]
 async fn composition_tx_rpcs_return_failed_precondition_when_unsynced() {
-    // The composition trio now lands here: CreateUnsignedTransactions,
+    // The composition trio lands here: CreateUnsignedTransactions,
     // Send, BumpFee all gate on `state_or_unsynced()`. When the
     // daemon is not yet synced, every one of them returns
-    // `Code::FailedPrecondition` with the Go-style "wallet daemon
-    // is not synced yet" message.
+    // `Code::FailedPrecondition` with the "wallet daemon is not
+    // synced yet" message.
     let (svc, _shutdown) = make_service_unsynced();
 
     let status = svc.create_unsigned_transactions(Request::new(CreateUnsignedTransactionsRequest::default())).await.unwrap_err();
@@ -177,7 +177,7 @@ fn service_constructor_records_version_string() {
 }
 
 #[test]
-fn sync_progress_is_synced_predicate_matches_go() {
+fn sync_progress_is_synced_predicate() {
     let mut progress = super::state::SyncProgress {
         first_sync_done: false,
         next_sync_start_index: 5,
@@ -227,12 +227,11 @@ async fn show_addresses_returns_external_addresses_at_last_used_indices() {
 async fn get_balance_aggregates_per_address_available_and_pending() {
     // Available = matured (non-coinbase OR coinbase past
     // COINBASE_MATURITY); Pending = immature coinbase.
-    // Mempool-excluded UTXOs do NOT show up in balance, matching Go
-    // `cmd/kaspawallet/daemon/server/balance.go::GetBalance`
-    // (Go's `utxosSortedByAmount` already excludes mempool-spent
-    // outpoints; the Rust port's `mempool_excluded_utxos` map is a
-    // separate workspace for the daemon's own bookkeeping, NOT a
-    // pending bucket).
+    // Mempool-excluded UTXOs do NOT show up in balance:
+    // `utxos_sorted_by_amount` already excludes mempool-spent
+    // outpoints; the `mempool_excluded_utxos` map is a separate
+    // workspace for the daemon's own bookkeeping, NOT a pending
+    // bucket.
     let state = make_state();
     let address_string = make_test_address_string();
     let wallet_addr = WalletAddress { cosigner_index: 0, key_chain: KeyChain::External, index: 1 };
@@ -266,9 +265,9 @@ async fn get_balance_aggregates_per_address_available_and_pending() {
 #[tokio::test]
 async fn get_balance_excludes_mempool_excluded_utxos() {
     // Mempool-excluded UTXOs must NOT contribute to either
-    // available or pending in the balance response (Go parity:
-    // mempool-conflicted outpoints are silently filtered out at
-    // the snapshot stage).
+    // available or pending in the balance response; mempool-
+    // conflicted outpoints are silently filtered out at the
+    // snapshot stage.
     let state = make_state();
     let address_string = make_test_address_string();
     let wallet_addr = WalletAddress { cosigner_index: 0, key_chain: KeyChain::External, index: 1 };
@@ -501,7 +500,7 @@ async fn new_address_bumps_index_persists_keyfile_and_derives_address() {
     let path = tmp.path().to_path_buf();
     let state = make_state();
     // Persist an initial keyfile to disk so the daemon's save
-    // path overwrites a real file (mirrors production semantics).
+    // path overwrites a real file (matches production semantics).
     crate::keyfile::save_to_path(&state.lock().await.keyfile, &path).expect("initial save");
     let (svc, _mock, _shutdown) = synced_service_with_keysfile_path(state.clone(), path.clone()).await;
     let resp = svc.new_address(Request::new(NewAddressRequest {})).await.expect("new_address").into_inner();

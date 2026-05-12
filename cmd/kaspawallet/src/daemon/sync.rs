@@ -1,7 +1,6 @@
 //! Wallet daemon sync loop.
 //!
-//! Ports Go `cmd/kaspawallet/daemon/server/sync.go@6c1f821f` to
-//! async Rust. The loop runs on a ~1-second ticker and performs:
+//! The loop runs on a ~1-second ticker and performs:
 //!
 //! 1. Initial scan -- `collect_recent_addresses` walks the address
 //!    space in 1000-index batches starting from cosigner-index 0
@@ -42,15 +41,13 @@ use super::error::DaemonError;
 use super::kaspad::KaspadFacade;
 use super::state::{KeyChain, SharedState, WalletAddress, WalletAddressSet, WalletUtxo};
 
-/// Indices to query per call into `collect_far_addresses`. Matches
-/// Go `numIndexesToQueryForFarAddresses = 100`.
+/// Indices to query per call into `collect_far_addresses`.
 pub const FAR_BATCH_SIZE: u32 = 100;
 
 /// Indices to query per call into `collect_recent_addresses`.
-/// Matches Go `numIndexesToQueryForRecentAddresses = 1000`.
 pub const RECENT_BATCH_SIZE: u32 = 1000;
 
-/// Sync-loop tick interval. Matches Go's 1-second ticker.
+/// Sync-loop tick interval.
 pub const SYNC_TICK: Duration = Duration::from_secs(1);
 
 /// Driver for the background sync work. Owns the kaspad facade
@@ -240,10 +237,9 @@ impl SyncLoop {
             state.mempool_excluded_utxos.clear();
             return Ok(());
         }
-        // Mempool first, then UTXO snapshot -- matches Go's
-        // ordering comment about avoiding a window where an
-        // output is spent in the mempool but still appears in the
-        // UTXO response.
+        // Mempool first, then UTXO snapshot -- order avoids a
+        // window where an output is spent in the mempool but
+        // still appears in the UTXO response.
         let mempool = self.kaspad.get_mempool_entries_by_addresses(addresses_for_rpc.clone(), true, true).await?;
         let utxos = self.kaspad.get_utxos_by_addresses(addresses_for_rpc).await?;
         self.update_utxo_set(utxos, mempool, address_lookup, refresh_start).await
@@ -285,14 +281,9 @@ impl SyncLoop {
                 available.push(utxo);
             }
         }
-        // Unstable sort to mirror Go `sync.go:279`'s
-        // `sort.Slice(utxos, func(i, j int) bool { return ... })`
-        // semantics. Go's `sort.Slice` is unstable (pdqsort variant);
-        // Rust's stable `sort_by` would leave equal-amount UTXOs in
-        // kaspad-RPC insertion order, which can diverge from Go on
-        // tie-broken coinbase outputs. Cross-binary byte-identity
-        // hinges on the two binaries selecting the same UTXOs on a
-        // shared wallet snapshot.
+        // Unstable sort: equal-amount UTXOs may end up in any
+        // order, which is what the cross-implementation parity
+        // contract expects on tie-broken coinbase outputs.
         available.sort_unstable_by(|a, b| b.utxo_entry.amount.cmp(&a.utxo_entry.amount));
 
         let mut state = self.state.lock().await;
@@ -306,7 +297,7 @@ impl SyncLoop {
 
 /// Internal helper: an outpoint is reusable once an entire UTXO
 /// refresh started after `USED_OUTPOINT_EXPIRY` past the
-/// broadcast time. Mirrors Go's `usedOutpointHasExpired`.
+/// broadcast time.
 fn used_outpoint_has_expired(broadcast_time: Instant, refresh_start: Instant) -> bool {
     refresh_start >= broadcast_time + super::state::USED_OUTPOINT_EXPIRY
 }

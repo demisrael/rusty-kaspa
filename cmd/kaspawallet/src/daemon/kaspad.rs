@@ -65,15 +65,12 @@ pub trait KaspadFacade: Send + Sync {
 
     /// Reports current DAG state. The wallet daemon consumes
     /// `virtual_daa_score` for the coinbase-maturity gate inside
-    /// the coin-selection loop (mirrors Go `GetBlockDAGInfo` calls
-    /// at `cmd/kaspawallet/daemon/server/create_unsigned_transaction.go:164`
-    /// and `bump_fee.go:62`).
+    /// the coin-selection loop and the bump-fee flow.
     async fn get_block_dag_info(&self) -> Result<GetBlockDagInfoResponse, DaemonError>;
 
     /// Reports a mempool entry by transaction-id. Used by
     /// `BumpFee` to recover the original transaction body and its
-    /// committed fee. Mirrors Go `GetMempoolEntry` at
-    /// `cmd/kaspawallet/daemon/server/bump_fee.go:18`.
+    /// committed fee.
     async fn get_mempool_entry(
         &self,
         transaction_id: RpcTransactionId,
@@ -83,8 +80,7 @@ pub trait KaspadFacade: Send + Sync {
 
     /// Reports kaspad's current feerate buckets. Used by the
     /// daemon's `calculate_fee_limits` helper for every FeePolicy
-    /// branch except `ExactFeeRate`. Mirrors Go `GetFeeEstimate`
-    /// usage at `cmd/kaspawallet/daemon/server/create_unsigned_transaction.go:58,67,74`.
+    /// branch except `ExactFeeRate`.
     async fn get_fee_estimate(&self) -> Result<RpcFeeEstimate, DaemonError>;
 }
 

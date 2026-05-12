@@ -1,53 +1,36 @@
 //! Platform-aware default-key-path resolver.
 //!
-//! The Go reference at
-//! `https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/keys/keys.go`
-//! computes the default keyfile path as
-//! `AppDir/<netParams.Name>/keys.json` where `AppDir` is per-OS:
+//! Default keyfile path:
+//! `<app-dir>/<network-name>/keys.json` where the app-dir is
+//! per-OS:
 //!
 //! - POSIX (Linux/BSD): `$HOME/.kaspawallet`
 //! - macOS: `$HOME/Library/Application Support/Kaspawallet`
-//! - Windows: `%LOCALAPPDATA%\Kaspawallet` (fallback `%APPDATA%`)
+//! - Windows: `%LOCALAPPDATA%\Kaspawallet`
+//!   (fallback `%APPDATA%`)
 //!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/util/appdata.go#L21
-//! (`appDir(goos, "kaspawallet", roaming=false)`).
-//!
-//! Reuse-existing-crates discipline: the home-dir / data-local-dir
-//! lookup uses the `dirs` crate (already pinned at workspace level
-//! at `Cargo.toml [workspace.dependencies] dirs = "5.0.1"`). The
-//! crate handles `$HOME` / `$XDG_*` / `%LOCALAPPDATA%` / `%APPDATA%`
-//! resolution per platform; this module composes its output into the
-//! Go-conformant directory tree.
-//!
-//! Windows-compat: `dirs::data_local_dir()` returns `%LOCALAPPDATA%`
-//! on Windows; no Unix-only syscalls used.
+//! Home-dir / data-local-dir lookup uses the `dirs` crate, which
+//! handles `$HOME` / `$XDG_*` / `%LOCALAPPDATA%` / `%APPDATA%`
+//! resolution per platform.
 
 use std::path::{Path, PathBuf};
 
 use super::error::KeySourceError;
 
-/// Application name segment used in the default-path tree. Mirrors
-/// Go's `util.AppDir("kaspawallet", false)` first argument; the
-/// platform-specific case adjustment (lowercase on POSIX, capitalised
-/// on macOS / Windows) follows the same convention `appDir` applies
-/// at `kaspad@4bb5bf25 util/appdata.go:29-30`.
+/// Application name segment used in the default-path tree. The
+/// platform-specific case adjustment is lowercase on POSIX,
+/// capitalised on macOS / Windows.
 const APP_NAME: &str = "kaspawallet";
 
-/// Keyfile filename. Matches Go's `defaultKeysFile`'s
-/// `"keys.json"` constant
-/// (`cmd/kaspawallet/keys/keys.go:23`).
+/// Keyfile filename.
 const KEYS_FILE_NAME: &str = "keys.json";
 
-/// Compute the default keyfile path for the given network name,
-/// mirroring Go's
-/// `defaultKeysFile(netParams) = filepath.Join(defaultAppDir,
-/// netParams.Name, "keys.json")`.
+/// Compute the default keyfile path for the given network name.
 ///
-/// `network_name` MUST be the canonical kaspa network name string
-/// matching the Go `dagconfig.Params.Name` field
-/// (`"kaspa-mainnet"`, `"kaspa-testnet-10"`, `"kaspa-simnet"`,
-/// `"kaspa-devnet"`). Callers derive it from the merged
-/// [`crate::cli::NetworkFlags`] via
+/// `network_name` MUST be the canonical kaspa network name
+/// string (`"kaspa-mainnet"`, `"kaspa-testnet-10"`,
+/// `"kaspa-simnet"`, `"kaspa-devnet"`). Callers derive it from
+/// the merged [`crate::cli::NetworkFlags`] via
 /// [`crate::cli::NetworkFlags::network_name`].
 pub fn default_keys_file(network_name: &str) -> Result<PathBuf, KeySourceError> {
     let app_dir = default_app_dir()?;
@@ -55,15 +38,14 @@ pub fn default_keys_file(network_name: &str) -> Result<PathBuf, KeySourceError> 
 }
 
 /// Resolve the effective keyfile path: the operator-supplied
-/// `--keys-file` override if present, otherwise the platform-aware
-/// default. Mirrors Go's `ReadKeysFile(netParams, path)` empty-path
-/// substitution at `cmd/kaspawallet/keys/keys.go:28-30` (`if path
-/// == "" { path = defaultKeysFile(netParams) }`).
+/// `--keys-file` override if present, otherwise the
+/// platform-aware default.
 ///
 /// Returns the resolved path WITHOUT touching the filesystem; the
 /// caller is responsible for opening it. Use
-/// [`require_existing_keyfile`] when "missing-at-resolved-path is an
-/// error" semantics are needed (e.g. `parse`, `sign`, `balance`).
+/// [`require_existing_keyfile`] when "missing-at-resolved-path
+/// is an error" semantics are needed (e.g. `parse`, `sign`,
+/// `balance`).
 pub fn resolve_keys_file_path(override_path: Option<&Path>, network_name: &str) -> Result<PathBuf, KeySourceError> {
     if let Some(p) = override_path {
         return Ok(p.to_path_buf());
@@ -72,10 +54,8 @@ pub fn resolve_keys_file_path(override_path: Option<&Path>, network_name: &str) 
 }
 
 /// As [`resolve_keys_file_path`], but additionally returns
-/// [`KeySourceError::DefaultPathMissing`] if the resolved path does
-/// not exist on disk. Mirrors Go's combined
-/// `os.Open(defaultKeysFile(netParams))` failure surface
-/// (`keys.go:31-33`).
+/// [`KeySourceError::DefaultPathMissing`] if the resolved path
+/// does not exist on disk.
 pub fn require_existing_keyfile(override_path: Option<&Path>, network_name: &str) -> Result<PathBuf, KeySourceError> {
     let resolved = resolve_keys_file_path(override_path, network_name)?;
     if !resolved.exists() {
@@ -85,21 +65,19 @@ pub fn require_existing_keyfile(override_path: Option<&Path>, network_name: &str
 }
 
 /// Compute the application-root directory (the parent of the
-/// per-network keyfile subdirectory) via the same per-OS rules the
-/// Go reference's `appDir` function applies.
+/// per-network keyfile subdirectory) per OS:
 ///
-/// Source mirroring (`util/appdata.go:21-80`):
-///
-/// - Windows: `%LOCALAPPDATA%\Kaspawallet` (or `%APPDATA%\Kaspawallet`
-///   if `LOCALAPPDATA` is unset; `dirs::data_local_dir()` already
-///   prefers `LOCALAPPDATA` and falls back to `APPDATA`).
+/// - Windows: `%LOCALAPPDATA%\Kaspawallet`
+///   (or `%APPDATA%\Kaspawallet` if `LOCALAPPDATA` is unset;
+///   `dirs::data_local_dir()` already prefers `LOCALAPPDATA` and
+///   falls back to `APPDATA`).
 /// - macOS: `$HOME/Library/Application Support/Kaspawallet`
 ///   (`dirs::data_local_dir()` returns
 ///   `~/Library/Application Support`).
-/// - Other Unix-like (Linux, BSD): `$HOME/.kaspawallet` (Go's
-///   default branch joins the lowercase app name with a leading
-///   `.`; the Rust port hard-codes the same shape since `dirs` does
-///   not have a "POSIX dot-prefix in $HOME" helper).
+/// - Other Unix-like (Linux, BSD): `$HOME/.kaspawallet` (POSIX
+///   convention joins the lowercase app name with a leading
+///   `.`; the path is hard-coded here since `dirs` has no
+///   "POSIX dot-prefix in $HOME" helper).
 fn default_app_dir() -> Result<PathBuf, KeySourceError> {
     #[cfg(target_os = "windows")]
     {
@@ -119,9 +97,7 @@ fn default_app_dir() -> Result<PathBuf, KeySourceError> {
 }
 
 /// Capitalised form of the application name. macOS + Windows use
-/// the `Appname` form; POSIX uses `.appname`. The split mirrors
-/// Go `util.AppDir`'s `appNameUpper` / `appNameLower` derivation
-/// (`util/appdata.go:29-30`).
+/// the `Appname` form; POSIX uses `.appname`.
 #[cfg(any(target_os = "windows", target_os = "macos"))]
 const APP_NAME_CAP: &str = "Kaspawallet";
 
@@ -194,8 +170,8 @@ mod tests {
     #[test]
     fn test_per_network_subdir_in_path() {
         // Each canonical network name produces a distinct
-        // subdirectory under the application root, mirroring Go's
-        // `filepath.Join(defaultAppDir, netParams.Name, "keys.json")`.
+        // subdirectory under the application root
+        // (`<app-dir>/<network-name>/keys.json`).
         let mainnet = default_keys_file("kaspa-mainnet").expect("mainnet");
         let testnet = default_keys_file("kaspa-testnet-10").expect("testnet");
         let simnet = default_keys_file("kaspa-simnet").expect("simnet");

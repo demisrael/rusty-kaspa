@@ -1,17 +1,11 @@
-//! Multi-transaction hex codec mirroring Go
-//! `cmd/kaspawallet/daemon/server/transactions_hex_encoding.go`.
-//!
-//! The Go reference joins multiple hex-encoded transactions using a
-//! literal `_` separator (`hexTransactionsSeparator`). The character
-//! is intentionally outside the hex alphabet so a double-click
-//! selection in a terminal still grabs one transaction; for Rust
-//! consumers we only care that the encode/decode is symmetric with
-//! the Go output.
+//! Multi-transaction hex codec: multiple hex-encoded transactions
+//! are joined using a literal `_` separator. The character is
+//! intentionally outside the hex alphabet so a double-click
+//! selection in a terminal still grabs one transaction.
 
 use thiserror::Error;
 
-/// Separator between transactions. Matches Go
-/// `cmd/kaspawallet/daemon/server/transactions_hex_encoding.go:hexTransactionsSeparator`.
+/// Separator between transactions.
 pub const HEX_TRANSACTIONS_SEPARATOR: char = '_';
 
 /// Failure modes of [`decode_transactions_from_hex`].
@@ -28,9 +22,8 @@ pub enum HexCodecError {
     },
 }
 
-/// Render a batch of binary transactions to the Go-compatible hex
-/// string (`hex0_hex1_..._hexN`). The output is byte-identical to
-/// Go's `EncodeTransactionsToHex`.
+/// Render a batch of binary transactions as
+/// `hex0_hex1_..._hexN`.
 pub fn encode_transactions_to_hex(transactions: &[Vec<u8>]) -> String {
     let mut out = String::with_capacity(transactions.iter().map(|t| t.len() * 2).sum::<usize>() + transactions.len());
     for (i, tx) in transactions.iter().enumerate() {
@@ -42,11 +35,9 @@ pub fn encode_transactions_to_hex(transactions: &[Vec<u8>]) -> String {
     out
 }
 
-/// Parse the Go-compatible hex-batch string back into binary
-/// transactions. Empty input yields a single empty-byte-vector
-/// entry, mirroring Go `strings.Split("", "_")` behavior which the
-/// Go `DecodeTransactionsFromHex` also feeds straight into
-/// `hex.DecodeString`.
+/// Parse the hex-batch string back into binary transactions.
+/// Empty input yields a single empty-byte-vector entry (the
+/// natural `split('_')` semantics on the empty string).
 pub fn decode_transactions_from_hex(transactions_hex: &str) -> Result<Vec<Vec<u8>>, HexCodecError> {
     let mut out = Vec::new();
     for (i, chunk) in transactions_hex.split(HEX_TRANSACTIONS_SEPARATOR).enumerate() {

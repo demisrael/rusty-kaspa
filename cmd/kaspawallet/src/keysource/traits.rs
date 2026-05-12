@@ -24,11 +24,11 @@ pub trait KeySource {
     /// `idx`.
     fn receiving_address(&self, idx: Option<u32>) -> Result<Address, KeySourceError>;
 
-    /// Change (internal) address. Single-address backends return
-    /// the same address `receiving_address` produces, per the lead
-    /// direction 2026-05-11 ("all change coming back to same
-    /// address" for Tangem). The Phase-1 `LegacyGoKeyfile` backend
-    /// returns the next unused internal-chain address.
+    /// Change (internal) address. Single-address backends (e.g.
+    /// Tangem) return the same address `receiving_address`
+    /// produces -- "all change coming back to same address". The
+    /// `LegacyGoKeyfile` backend returns the next unused
+    /// internal-chain address.
     fn change_address(&self) -> Result<Address, KeySourceError>;
 }
 

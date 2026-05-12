@@ -1,14 +1,6 @@
-//! Legacy Go-`kaspawallet` keyfile native read.
-//!
-//! On-disk format: JSON.
-//!
-//! Fields mirror the Go `keysFileJSON` struct at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/keys/keys.go#L40`
-//! (`type keysFileJSON struct`). Encryption is Argon2id KDF plus
-//! XChaCha20-Poly1305 AEAD with the 24-byte nonce prepended to the
-//! ciphertext, derived from
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/keys/keys.go#L378`
-//! (`getAEAD` / `decryptMnemonic`).
+//! Keyfile codec: on-disk JSON format with Argon2id-derived
+//! XChaCha20-Poly1305 AEAD encryption (24-byte nonce prepended to
+//! the ciphertext).
 
 mod codec;
 pub(crate) mod decrypt;

@@ -6,27 +6,17 @@ use crate::sign::SignError;
 use crate::transaction::TransactionError;
 
 /// Errors returned by [`super::select_utxos`] +
-/// [`super::estimate_fee`]. Mirrors the Go reference's `errors.Errorf`
-/// surface in `daemon/server/create_unsigned_transaction.go` (the
-/// `selectUTXOsWithPreselected` and `estimateFee` paths) plus the
-/// rustic addition of typed wrappers around the underlying
-/// transaction-build / mass-calc errors.
+/// [`super::estimate_fee`]. Adds typed wrappers around the
+/// underlying transaction-build / mass-calc errors.
 #[derive(Debug, Error)]
 pub enum CoinSelectError {
-    /// Mirrors Go's
-    /// `errors.Errorf("Insufficient funds for send: %f required, while only %f available", ...)`
-    /// at `create_unsigned_transaction.go:256-258`. Sompi values
-    /// (not the float Go formats) so callers can render whatever
-    /// unit they prefer; the message body uses sompi too for
-    /// debug clarity.
+    /// Coin selection could not assemble enough value to cover the
+    /// requested send. Values are in sompi.
     #[error("insufficient funds: {required} sompi required, {available} sompi available")]
     InsufficientFunds { required: u64, available: u64 },
 
-    /// Mirrors Go's
-    /// `errors.Errorf("requested fee rate %f is too low, minimum fee rate is %f", ...)`
-    /// at `calculateFeeLimits` (`create_unsigned_transaction.go:55,
-    /// 63`). Callers that compute a fee rate floor outside this
-    /// module (e.g. the daemon's policy layer) raise this directly.
+    /// The fee rate requested by the caller is below the mempool's
+    /// `MIN_FEE_RATE` floor.
     #[error("requested fee rate {requested} below minimum {minimum}")]
     FeeRateTooLow { requested: f64, minimum: f64 },
 

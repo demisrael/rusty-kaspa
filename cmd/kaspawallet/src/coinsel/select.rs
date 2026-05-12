@@ -1,23 +1,14 @@
-//! Verbatim port of Go's `selectUTXOs` /
-//! `selectUTXOsWithPreselected` -- the byte-deterministic UTXO
-//! ordering primitive that drives every send / sweep /
-//! create-unsigned-transaction path.
+//! Byte-deterministic UTXO selection primitive that drives every
+//! send / sweep / create-unsigned-transaction path.
 //!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/create_unsigned_transaction.go#L150
+//! `select_utxos` returns a deterministic selected-UTXO order, a
+//! `total_received`, and a `change_sompi` for the same logical
+//! input set. The daemon owns the pre-filter (spendability,
+//! `from_addresses`, `used_outpoints`); this module receives a
+//! pre-filtered, pre-sorted slice and runs the algorithm core.
 //!
-//! This is the cross-binary parity battlefield: the Rust port's
-//! `select_utxos` MUST return the same selected-UTXO order, the
-//! same `total_received`, and the same `change_sompi` as Go for the
-//! same logical input set. Daemon-level filtering
-//! (`fromAddresses`, `isUTXOSpendable`, `usedOutpoints`) is the
-//! caller's responsibility -- this module receives a pre-filtered,
-//! pre-sorted slice of UTXOs and runs the algorithm core. The
-//! daemon (B4) owns the filter; the algorithm core is the same
-//! across both layers.
-//!
-//! The two break conditions, the one-extra-input KIP-9 rule for
-//! change, and the iteration order are the load-bearing
-//! determinism rules. Read line-for-line against the Go source.
+//! Load-bearing determinism rules: two break conditions, the
+//! one-extra-input KIP-9 rule for change, and the iteration order.
 
 use kaspa_consensus_core::config::params::Params;
 
@@ -25,26 +16,20 @@ use super::error::CoinSelectError;
 use super::fee::{WalletConfig, estimate_fee};
 use crate::transaction::Utxo;
 
-/// The minimal change amount that the Go reference's selector
-/// targets to dodge KIP-9 storage-mass discontinuities. Source:
-/// `cmd/kaspawallet/daemon/server/create_unsigned_transaction.go:23`
-/// `const minChangeTarget = constants.SompiPerKaspa * 10`. With at
-/// least 10 KAS in the change output, KIP-9 storage mass charged
-/// for change is at most 1000 gram (Go reference comment lines
-/// 17-22).
+/// Minimum change-output amount the selector targets to dodge
+/// KIP-9 storage-mass discontinuities. With at least 10 KAS in
+/// the change output, KIP-9 storage mass charged for change is
+/// at most 1000 gram.
 const SOMPI_PER_KASPA: u64 = 100_000_000;
 const MIN_CHANGE_TARGET: u64 = SOMPI_PER_KASPA * 10;
 
-/// Result of a [`select_utxos`] call. Mirrors Go's
-/// `(selectedUTXOs []*libkaspawallet.UTXO, totalReceived uint64,
-/// changeSompi uint64, err error)` four-tuple.
+/// Result of a [`select_utxos`] call.
 #[derive(Clone, Debug)]
 pub struct Selection {
     /// UTXOs selected for the next unsigned transaction, in
-    /// iteration order (Go: append-order onto the `selectedUTXOs`
-    /// slice). Pre-selected UTXOs come first, followed by the
-    /// largest-amount-first ordering produced by the daemon's
-    /// `s.utxosSortedByAmount` slice.
+    /// iteration order. Pre-selected UTXOs come first, followed
+    /// by the largest-amount-first ordering produced by the
+    /// daemon's `utxos_sorted_by_amount` slice.
     pub selected: Vec<Utxo>,
 
     /// What the recipient receives. For `is_send_all = false` this
@@ -58,51 +43,43 @@ pub struct Selection {
     pub change_sompi: u64,
 }
 
-/// Verbatim Path-A port of Go's `selectUTXOsWithPreselected`
-/// (`create_unsigned_transaction.go:155-261`).
+/// UTXO selection with optional pre-selected inputs.
 ///
 /// Inputs:
 ///
 /// - `cfg` -- wallet keyfile parameters used by the inner
-///   `estimate_fee` call (the daemon's `*server` carries these via
-///   `s.keysFile.*` + `s.params.*`).
+///   `estimate_fee` call.
 /// - `params` -- consensus params for mass calculation.
-/// - `sorted_utxos` -- the daemon's `utxosSortedByAmount` slice
-///   (descending by `UTXOEntry.Amount()`), already filtered for
-///   spendability + `fromAddresses` + `usedOutpoints`. The caller
-///   is the daemon (B4); this module does not own the filters.
-/// - `pre_selected` -- explicit pre-selected UTXOs (Go's
-///   `preSelectedUTXOs`). The daemon's `bumpFee` flow uses this;
-///   normal `send` calls pass an empty slice. Iterated FIRST and
-///   excluded from the second-loop scan.
+/// - `sorted_utxos` -- a UTXO slice descending by amount,
+///   already filtered for spendability and source-address /
+///   used-outpoint membership.
+/// - `pre_selected` -- explicit pre-selected UTXOs. The
+///   `bump_fee` flow uses this; normal `send` calls pass an
+///   empty slice. Iterated FIRST and excluded from the
+///   second-loop scan.
 /// - `spend_amount`, `is_send_all`, `fee_rate`, `max_fee` --
-///   matches Go's parameter set.
+///   selection knobs.
 ///
-/// Algorithm summary (line numbers refer to the Go source):
+/// Algorithm summary:
 ///
-/// 1. Build a pre-selected outpoint set
-///    (`preSelectedSet`, lines 158-161).
-/// 2. Loop through `pre_selected` first with `avoidPreselected =
-///    false` (lines 222-232).
-/// 3. If still need more value, loop through `sorted_utxos` with
-///    `avoidPreselected = true`, skipping outpoints already in
-///    `preSelectedSet` (lines 234-245).
+/// 1. Build a pre-selected outpoint set.
+/// 2. Loop through `pre_selected` first.
+/// 3. If still more value needed, loop through `sorted_utxos`,
+///    skipping outpoints already in the pre-selected set.
 /// 4. Each iteration: append the UTXO, recompute `fee` via
-///    `estimate_fee` against the running selection + the projected
-///    recipient value, and check the two break conditions
-///    (lines 215-217):
+///    `estimate_fee` against the running selection + the
+///    projected recipient value, and check the two break
+///    conditions:
 ///    - `total_value == total_spend` -- single-input case,
 ///      no change needed -> stop.
 ///    - `total_value >= total_spend + MIN_CHANGE_TARGET &&
-///      len(selected) > 1` -- KIP-9 dust-margin met AND we have
-///      at least 2 inputs (Go comment lines 213-214: `go-nodes
-///      dust patch we try and find at least 2 inputs even though
-///      the next one is not necessary in terms of spend value`)
-///      -> stop.
-/// 5. After the loops, compute `total_spend` + `total_received` by
-///    `is_send_all` policy (lines 247-254).
-/// 6. If `total_value < total_spend`: return InsufficientFunds
-///    (lines 255-258).
+///      len(selected) > 1` -- KIP-9 dust-margin met AND at
+///      least 2 inputs are present (the second condition is the
+///      "small-input dust patch" that keeps the wallet from
+///      emitting a low-value change output) -> stop.
+/// 5. After the loops, compute `total_spend` + `total_received`
+///    per the `is_send_all` policy.
+/// 6. If `total_value < total_spend`: return InsufficientFunds.
 /// 7. Return `(selected, total_received, total_value - total_spend)`.
 pub fn select_utxos(
     cfg: &WalletConfig,
@@ -114,9 +91,9 @@ pub fn select_utxos(
     fee_rate: f64,
     max_fee: u64,
 ) -> Result<Selection, CoinSelectError> {
-    // Mirror Go's preSelectedSet construction (lines 158-161).
-    // The set is keyed by Outpoint = (transaction_id, index); we
-    // serialise that to (Vec<u8>, u32) for easy comparison.
+    // The pre-selected set is keyed by Outpoint =
+    // (transaction_id, index); serialise to (Vec<u8>, u32) for
+    // easy comparison.
     let pre_selected_keys: Vec<(Vec<u8>, u32)> = pre_selected
         .iter()
         .map(|u| (u.outpoint.transaction_id.as_ref().map(|t| t.bytes.clone()).unwrap_or_default(), u.outpoint.index))
@@ -126,21 +103,20 @@ pub fn select_utxos(
     let mut total_value: u64 = 0;
     let mut fee: u64 = 0;
 
-    // Closure mirroring Go's anonymous `iteration` (lines 170-220).
-    // Returns `Ok(true)` to continue the outer loop, `Ok(false)` to
-    // break it.
+    // Per-utxo iteration closure. Returns `Ok(true)` to continue
+    // the outer loop, `Ok(false)` to break it.
     let iteration = |utxo: &Utxo,
                      _avoid_preselected: bool,
                      selected: &mut Vec<Utxo>,
                      total_value: &mut u64,
                      fee: &mut u64|
      -> Result<bool, CoinSelectError> {
-        // Daemon-level filters (`fromAddresses` /
-        // `isUTXOSpendable` / `usedOutpoints`) are owned by the
-        // caller in this port (the daemon pre-filters the input
-        // slice). The `avoid_preselected` second-loop skip is
-        // implemented at the call site below so the closure stays
-        // free of borrow-collision with `pre_selected_keys`.
+        // Daemon-level filters (`from_addresses`,
+        // `is_utxo_spendable`, `used_outpoints`) are owned by the
+        // caller (the daemon pre-filters the input slice). The
+        // `avoid_preselected` second-loop skip is implemented at
+        // the call site below so the closure stays free of a
+        // borrow collision with `pre_selected_keys`.
 
         selected.push(utxo.clone());
         *total_value += utxo.utxo_entry.amount;
@@ -150,11 +126,11 @@ pub fn select_utxos(
         *fee = estimate_fee(cfg, params, selected, fee_rate, max_fee, estimated_recipient_value)?;
 
         let total_spend = spend_amount + *fee;
-        // Two break cases (mirror Go comment block lines 210-214 +
-        // condition line 215):
-        //   1. !is_send_all AND total_value == total_spend
-        //   2. !is_send_all AND total_value >= total_spend +
-        //      MIN_CHANGE_TARGET AND selected.len() > 1
+        // Two break cases:
+        //   1. !is_send_all AND total_value == total_spend.
+        //   2. !is_send_all AND
+        //      total_value >= total_spend + MIN_CHANGE_TARGET
+        //      AND selected.len() > 1.
         if !is_send_all && (*total_value == total_spend || (*total_value >= total_spend + MIN_CHANGE_TARGET && selected.len() > 1)) {
             return Ok(false);
         }
@@ -164,9 +140,8 @@ pub fn select_utxos(
 
     let mut should_continue = true;
 
-    // Loop 1: pre-selected (Go lines 222-232). avoidPreselected =
-    // false here; pre-selected outpoints are tried first regardless
-    // of whether they show up in `sorted_utxos`.
+    // Loop 1: pre-selected outpoints, tried first regardless of
+    // whether they appear in `sorted_utxos`.
     for utxo in pre_selected {
         should_continue = iteration(utxo, false, &mut selected, &mut total_value, &mut fee)?;
         if !should_continue {
@@ -174,8 +149,8 @@ pub fn select_utxos(
         }
     }
 
-    // Loop 2: sorted-by-amount (Go lines 234-245). avoidPreselected
-    // = true; skip any outpoint already covered by loop 1.
+    // Loop 2: sorted-by-amount; skip any outpoint already covered
+    // by loop 1.
     if should_continue {
         for utxo in sorted_utxos {
             let outpoint_key =
@@ -191,7 +166,8 @@ pub fn select_utxos(
         }
     }
 
-    // Mirror Go's tail block (lines 247-260).
+    // Tail block: compute total_spend / total_received and the
+    // change amount.
     let (total_spend, total_received) =
         if is_send_all { (total_value, total_value.saturating_sub(fee)) } else { (spend_amount + fee, spend_amount) };
 

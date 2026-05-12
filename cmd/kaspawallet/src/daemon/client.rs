@@ -19,11 +19,9 @@ use super::error::DaemonError;
 use super::pb::kaspawalletd_client::KaspawalletdClient;
 use super::pb::{GetVersionRequest, GetVersionResponse, ShutdownRequest};
 
-/// Default dial-connect timeout. Matches Go's per-RPC waitTimeout
-/// at the connection level for the initial channel handshake; the
-/// per-RPC waitTimeout itself remains a follow-on concern (the
-/// client subcommands carry it through to `Request::set_timeout`
-/// in the follow-on slice).
+/// Default dial-connect timeout for the initial channel
+/// handshake. The per-RPC wait timeout is carried separately by
+/// client subcommands via `Request::set_timeout`.
 pub const DEFAULT_CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// High-level client wrapper. Owns the channel and exposes typed
@@ -80,11 +78,11 @@ impl DaemonClient {
 }
 
 /// `Endpoint::from_shared` requires a URI; the daemon's
-/// `--daemonaddress` flag holds an authority-only `host:port` for
-/// Go-CLI compatibility. This helper inserts the `http://` scheme
-/// when the input lacks one. gRPC over TLS is out of scope here
-/// (Go's daemon is plaintext) and a follow-on slice can extend the
-/// dialer to accept `https://` URIs explicitly.
+/// `--daemonaddress` flag holds an authority-only `host:port`.
+/// This helper inserts the `http://` scheme when the input lacks
+/// one. gRPC over TLS is out of scope here (the daemon is
+/// plaintext); a follow-on slice can extend the dialer to accept
+/// `https://` URIs explicitly.
 fn ensure_scheme(addr: &str) -> String {
     if addr.starts_with("http://") || addr.starts_with("https://") { addr.to_owned() } else { format!("http://{addr}") }
 }

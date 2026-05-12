@@ -1,12 +1,11 @@
-//! `version` subcommand. Mirrors the Go `version` command, which
-//! prints the binary's semantic version on its own line.
+//! `version` subcommand. Prints the binary's semantic version on
+//! its own line.
 
 /// Compile-time version pulled from the crate's `Cargo.toml`.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");
 
 /// Print the binary's version line on stdout in the form
-/// `kaspawallet v<semver>`. Matches the Go output framing for the
-/// parity matrix's `version` row.
+/// `kaspawallet v<semver>`.
 pub fn print() {
     println!("kaspawallet v{VERSION}");
 }

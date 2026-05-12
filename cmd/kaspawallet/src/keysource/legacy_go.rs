@@ -1,9 +1,9 @@
-//! Legacy Go-keyfile `KeySource` implementation. The Go reference
-//! derives addresses at
-//! `m/<purpose>'/111111'/0'/<chain>/<index>`; the keyfile's
-//! `publicKeys` array stores the per-cosigner xpub already at
-//! level `m/<purpose>'/111111'/0'`, so per-address derivation is a
-//! non-hardened `<chain>/<index>` walk off each stored xpub.
+//! Keyfile-backed `KeySource` implementation. Addresses are
+//! derived at `m/<purpose>'/111111'/0'/<chain>/<index>`; the
+//! keyfile's `publicKeys` array stores the per-cosigner xpub
+//! already at level `m/<purpose>'/111111'/0'`, so per-address
+//! derivation is a non-hardened `<chain>/<index>` walk off each
+//! stored xpub.
 //!
 //! For single-cosigner keyfiles the derived public key is encoded
 //! directly as a P2PK address (Schnorr or ECDSA per the keyfile's

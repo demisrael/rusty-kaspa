@@ -1,27 +1,17 @@
-//! Verbatim port of `libkaspawallet/transaction.go`'s
-//! `CreateUnsignedTransaction` primitive (the `Payment`/`UTXO`/
-//! `CreateUnsignedTransaction` triplet that the Go daemon and CLI
-//! use to assemble an unsigned `PartiallySignedTransaction` from a
-//! coin-selection result).
+//! `CreateUnsignedTransaction` primitive: the `Payment` / `Utxo`
+//! / `create_unsigned_transaction` triplet used by the wallet
+//! daemon and CLI to assemble an unsigned
+//! `PartiallySignedTransaction` from a coin-selection result.
 //!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/libkaspawallet/transaction.go#L31
-//! (`CreateUnsignedTransaction` -> `sortPublicKeys` -> internal
-//! `createUnsignedTransaction`). The Go primitive is the only
-//! producer of unsigned PSTs both daemon-side and CLI-side, so a
-//! line-for-line port is the load-bearing prerequisite for the
-//! cross-binary wire-byte-identity property the cross-wallet
-//! multisig interop and side-by-side send / sweep parity tests
-//! depend on.
+//! The wire-byte-identity property is the load-bearing contract
+//! the cross-implementation parity tests depend on.
 //!
-//! Reuse-existing-crates discipline: the BIP-32 derivation comes
-//! from `kaspa_bip32::ExtendedPublicKey` (Go's
-//! `bip32.DeserializeExtendedKey` + `DeriveFromPath`); the
-//! script-pubkey emission for each payment comes from
-//! `kaspa_txscript::pay_to_address_script` (Go's
-//! `txscript.PayToAddrScript`); the `SUBNETWORK_ID_NATIVE`
-//! constant comes from `kaspa_consensus_core::subnets` (Go's
-//! `subnetworks.SubnetworkIDNative`). No new wire shape, no
-//! re-derivation primitive, no rolled crypto.
+//! Building blocks reused from the workspace:
+//!
+//! - BIP-32 derivation: `kaspa_bip32::ExtendedPublicKey`.
+//! - Script-pubkey emission:
+//!   `kaspa_txscript::pay_to_address_script`.
+//! - Subnetwork id: `kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE`.
 
 use kaspa_addresses::Address;
 use kaspa_bip32::{DerivationPath, ExtendedPublicKey, secp256k1::PublicKey};
@@ -32,9 +22,8 @@ use thiserror::Error;
 
 use crate::serialization::wire;
 
-/// Maximum supported transaction-version field. Mirrors Go's
-/// `constants.MaxTransactionVersion = 0`
-/// (`domain/consensus/utils/constants/constants.go:10`).
+/// Maximum supported transaction-version field
+/// (`MaxTransactionVersion = 0`).
 const MAX_TRANSACTION_VERSION: u32 = 0;
 
 /// Length of the kaspa subnetwork-id field on the wire (20 bytes).
@@ -44,8 +33,6 @@ const SUBNETWORK_ID_LEN: usize = 20;
 const TRANSACTION_ID_LEN: usize = 32;
 
 /// Recipient payment in a [`create_unsigned_transaction`] call.
-/// Mirrors Go's `libkaspawallet.Payment` struct
-/// (`libkaspawallet/transaction.go` lines 17-20).
 #[derive(Clone, Debug)]
 pub struct Payment {
     pub address: Address,
@@ -54,12 +41,10 @@ pub struct Payment {
 
 /// UTXO + derivation path bundle consumed by
 /// [`create_unsigned_transaction`] and the coin-selection layer.
-/// Mirrors Go's `libkaspawallet.UTXO` struct
-/// (`libkaspawallet/transaction.go` lines 22-28). Carries a
-/// [`UtxoEntry`] from `kaspa_consensus_core::tx` directly so the
-/// wallet daemon can populate it from `kaspad`'s
-/// `getUtxosByAddresses` response without a synthetic conversion
-/// step.
+/// Carries a [`UtxoEntry`] from `kaspa_consensus_core::tx`
+/// directly so the wallet daemon can populate it from `kaspad`'s
+/// `get_utxos_by_addresses` response without a synthetic
+/// conversion step.
 #[derive(Clone, Debug)]
 pub struct Utxo {
     pub outpoint: wire::Outpoint,
@@ -72,14 +57,12 @@ pub struct Utxo {
 #[derive(Debug, Error)]
 pub enum TransactionError {
     /// One of the cosigner xpub strings does not parse via
-    /// `kaspa_bip32::ExtendedPublicKey::from_str`. Mirrors Go's
-    /// `bip32.DeserializeExtendedKey` error path.
+    /// `kaspa_bip32::ExtendedPublicKey::from_str`.
     #[error("invalid extended public key: {reason}")]
     InvalidExtendedPublicKey { reason: String },
 
     /// The per-UTXO derivation-path string does not parse via
-    /// `kaspa_bip32::DerivationPath::from_str`. Mirrors Go's
-    /// `extendedKey.DeriveFromPath(path)` error path.
+    /// `kaspa_bip32::DerivationPath::from_str`.
     #[error("invalid derivation path '{path}': {reason}")]
     InvalidDerivationPath { path: String, reason: String },
 
@@ -96,14 +79,11 @@ pub enum TransactionError {
     InvalidAddress { reason: String },
 }
 
-/// Lexicographic in-place sort of cosigner xpub strings. Mirrors
-/// Go's `sortPublicKeys` at
-/// `libkaspawallet/keypair.go:135` (`sort.Slice` +
-/// `strings.Compare(extendedPublicKeys[i], extendedPublicKeys[j])
-/// < 0`). The sort is the load-bearing determinism step: every
-/// per-input pair-construction loop iterates the sorted xpub list
-/// in the same order, so two callers with the same logical xpub
-/// set produce byte-identical PSTs regardless of input ordering.
+/// Lexicographic in-place sort of cosigner xpub strings. The sort
+/// is the load-bearing determinism step: every per-input
+/// pair-construction loop iterates the sorted xpub list in the
+/// same order, so two callers with the same logical xpub set
+/// produce byte-identical PSTs regardless of input ordering.
 pub fn sort_extended_public_keys(extended_public_keys: &mut [String]) {
     extended_public_keys.sort();
 }
@@ -112,31 +92,25 @@ pub fn sort_extended_public_keys(extended_public_keys: &mut [String]) {
 /// keyfile's xpub set, the per-input UTXOs the coin selector
 /// returned, and the per-output payments the daemon assembled.
 ///
-/// Mirrors Go's `CreateUnsignedTransaction` +
-/// `createUnsignedTransaction` pair (`libkaspawallet/transaction.go`
-/// lines 31-159) line-for-line:
+/// Steps:
 ///
-/// 1. Sort the `extendedPublicKeys` slice in-place by lex order
-///    (Go: `sortPublicKeys`).
-/// 2. For each selected UTXO, build a `PartiallySignedInput` whose
-///    `pub_key_signature_pairs` carries one empty `PubKeySignaturePair`
-///    per cosigner xpub. Each pair's `extended_public_key` is the
-///    cosigner's xpub derived to the UTXO's `derivation_path`
-///    (Go: `extendedKey.DeriveFromPath(utxo.DerivationPath)` +
-///    `derivedKey.String()`).
+/// 1. Sort the cosigner xpub slice in-place by lex order.
+/// 2. For each selected UTXO, build a `PartiallySignedInput`
+///    whose `pub_key_signature_pairs` carries one empty
+///    `PubKeySignaturePair` per cosigner xpub. Each pair's
+///    `extended_public_key` is the cosigner's xpub derived to the
+///    UTXO's `derivation_path`.
 /// 3. For each payment, build a `wire::TransactionOutput` whose
-///    `script_public_key` is `kaspa_txscript::pay_to_address_script(addr)`.
-/// 4. Wrap the inputs/outputs in a `wire::TransactionMessage` with
-///    `version = MaxTransactionVersion (= 0)`, `lock_time = 0`,
-///    `subnetwork_id = SUBNETWORK_ID_NATIVE`, `gas = 0`,
-///    `payload = []`.
+///    `script_public_key` is
+///    `kaspa_txscript::pay_to_address_script(addr)`.
+/// 4. Wrap the inputs/outputs in a `wire::TransactionMessage`
+///    with `version = MAX_TRANSACTION_VERSION (= 0)`,
+///    `lock_time = 0`, `subnetwork_id = SUBNETWORK_ID_NATIVE`,
+///    `gas = 0`, `payload = []`.
 ///
-/// The returned `wire::PartiallySignedTransaction` serializes via
-/// [`crate::serialization::serialize_partially_signed_transaction`]
-/// into a byte sequence that is byte-identical to what Go's
-/// `serialization.SerializePartiallySignedTransaction` would
-/// produce for the same inputs (proto3 deterministic encoding
-/// + identical field ordering on both sides).
+/// Proto3's canonical encoding is deterministic, so two callers
+/// that supply identical logical inputs produce byte-identical
+/// serialized PSTs.
 pub fn create_unsigned_transaction(
     extended_public_keys: &[String],
     minimum_signatures: u32,
@@ -273,8 +247,7 @@ mod tests {
 
     #[test]
     fn test_sort_extended_public_keys_lex() {
-        // Mirror Go's strings.Compare(...) < 0 ordering: ASCII
-        // lex; "a" < "b" < "z".
+        // ASCII lex: "a" < "b" < "z".
         let mut keys = vec!["zeta".to_string(), "alpha".to_string(), "mu".to_string()];
         sort_extended_public_keys(&mut keys);
         assert_eq!(keys, vec!["alpha".to_string(), "mu".to_string(), "zeta".to_string()]);
@@ -293,7 +266,7 @@ mod tests {
         let payments = vec![Payment { address: dummy_address(0xAA), amount: 5_000_000 }];
         let pst = create_unsigned_transaction(&[XPUB_LO.to_string()], 1, &payments, &[utxo]).expect("create");
         let tx = pst.tx.as_ref().expect("tx populated");
-        assert_eq!(tx.version, MAX_TRANSACTION_VERSION, "version field must mirror Go's MaxTransactionVersion = 0");
+        assert_eq!(tx.version, MAX_TRANSACTION_VERSION, "version field must equal MAX_TRANSACTION_VERSION");
         assert_eq!(tx.lock_time, 0, "lock_time always 0 in CreateUnsignedTransaction");
         assert_eq!(tx.gas, 0, "gas always 0 in CreateUnsignedTransaction");
         assert!(tx.payload.is_empty(), "payload always empty in CreateUnsignedTransaction");
@@ -326,9 +299,9 @@ mod tests {
     fn test_create_unsigned_transaction_sorts_xpubs_lex_order() {
         // Two xpubs deliberately presented in reverse-lex order to
         // the function. The PSI's pair order MUST follow lex order
-        // (XPUB_LO first, XPUB_HI second) regardless of
-        // caller input ordering, mirroring Go's sortPublicKeys
-        // pre-loop sort.
+        // (XPUB_LO first, XPUB_HI second) regardless of caller
+        // input ordering -- the pre-loop
+        // `sort_extended_public_keys` step enforces this.
         let utxo = dummy_utxo(0, 10_000_000, "m/0/0");
         let payments = vec![Payment { address: dummy_address(0xAA), amount: 5_000_000 }];
 
@@ -362,10 +335,10 @@ mod tests {
 
     #[test]
     fn test_create_unsigned_transaction_zero_inputs_zero_outputs_is_valid_shape() {
-        // Mirrors Go's behavior when called with empty payments + empty
-        // selected_utxos (exercised by mass-calc helpers in the
-        // daemon's split_transaction.go path). Result is a syntactically
-        // valid PST with zero-length input/output vectors.
+        // Empty payments + empty selected_utxos (exercised by the
+        // mass-calc helpers in the daemon's splitter). Result is a
+        // syntactically valid PST with zero-length input/output
+        // vectors.
         let pst = create_unsigned_transaction(&[XPUB_LO.to_string()], 1, &[], &[]).expect("create empty");
         let tx = pst.tx.expect("tx populated");
         assert!(tx.inputs.is_empty());

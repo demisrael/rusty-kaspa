@@ -5,25 +5,22 @@
 //!
 //! 1. Handlers that depend only on the daemon's own state and do
 //!    not require a synced UTXO snapshot (`GetVersion`,
-//!    `Shutdown`). Fully implemented.
+//!    `Shutdown`).
 //! 2. Handlers that depend on the daemon's address-set and UTXO
 //!    snapshot (`ShowAddresses`, `GetBalance`,
-//!    `GetExternalSpendableUTXOs`). Fully implemented; gated on
-//!    `progress.is_synced()`. The Go reference returns
-//!    `errors.Errorf("wallet daemon is not synced yet, %s", ...)`
-//!    for these handlers when not synced; the Rust port surfaces
-//!    `Status::failed_precondition` carrying the same Go-style
-//!    message so operators see a structurally compatible response.
+//!    `GetExternalSpendableUTXOs`). Gated on
+//!    `progress.is_synced()`; unsynced calls return
+//!    `Status::failed_precondition("wallet daemon is not synced
+//!    yet, <state report>")`.
 //! 3. Handlers that mutate the keyfile (`NewAddress`) or construct
 //!    / sign / broadcast transactions (`CreateUnsignedTransactions`,
 //!    `Send`, `Sign`, `Broadcast`, `BroadcastReplacement`,
-//!    `BumpFee`). All implemented; gate on `state_or_unsynced` and
-//!    on the configured kaspad facade. The composition trio
+//!    `BumpFee`). All gate on `state_or_unsynced` and on the
+//!    configured kaspad facade. The composition trio
 //!    (`CreateUnsignedTransactions`, `Send`, `BumpFee`) routes
 //!    through the same coin-selection + change-address +
-//!    serialization helpers, so the cross-binary unsigned-PST
-//!    byte-identity guarantee from the standalone path carries
-//!    over to the daemon path.
+//!    serialization helpers, so the unsigned-PST wire bytes are
+//!    consistent across the standalone and daemon code paths.
 
 use std::collections::HashSet;
 use std::path::{Path, PathBuf};
@@ -56,15 +53,12 @@ use crate::serialization;
 use crate::sign::{extract_transaction, sign_pst_ecdsa_with_mnemonic, sign_pst_schnorr_with_mnemonic};
 use crate::transaction::{Payment, Utxo as LibUtxo, create_unsigned_transaction};
 
-/// Minimum mempool-accepted fee rate (sompi/gram). Mirrors Go
-/// `minFeeRate = 1.0` at
-/// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/create_unsigned_transaction.go#L26
+/// Minimum mempool-accepted fee rate (sompi/gram).
 const MIN_FEE_RATE: f64 = 1.0;
 
-/// Sompi-per-kaspa exchange constant. Mirrors Go's
-/// `constants.SompiPerKaspa = 1e8` -- used as the default
-/// `max_fee` when the request omits a fee policy entirely (Go
-/// `calculateFeeLimits` nil branch caps fee at 1 KAS by default).
+/// Sompi-per-kaspa exchange constant. Used as the default
+/// `max_fee` cap (1 KAS) when the request omits a fee policy
+/// entirely.
 const SOMPI_PER_KASPA: u64 = 100_000_000;
 
 pub struct KaspawalletdSvc {
@@ -162,8 +156,7 @@ impl KaspawalletdSvc {
     /// Record outpoints spent by a freshly-broadcast transaction
     /// into the daemon's `used_outpoints` map and poke the sync
     /// loop's force-refresh channel so the UTXO snapshot catches
-    /// up without waiting for the next 1-second tick. Mirrors Go
-    /// `broadcast` + `forceSync` post-submit semantics.
+    /// up without waiting for the next 1-second tick.
     async fn record_spent_outpoints_and_force_sync(&self, spent: Vec<Vec<TransactionOutpoint>>) {
         if let Some(state) = self.state.as_ref() {
             let now = Instant::now();
@@ -181,9 +174,7 @@ impl KaspawalletdSvc {
 
     /// Resolve the request's FeePolicy against the kaspad node's
     /// current feerate estimate, returning `(fee_rate, max_fee)`.
-    /// Mirrors Go `calculateFeeLimits` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/create_unsigned_transaction.go#L43
-    /// 1-for-1: nil/None and `MaxFee` policies cap with the
+    /// `None` and `MaxFee` policies cap with the
     /// `normal_buckets[0]` recommendation; `ExactFeeRate` uses the
     /// caller's value verbatim (validated against `MIN_FEE_RATE`);
     /// `MaxFeeRate` clamps the kaspad recommendation against the
@@ -226,14 +217,12 @@ impl KaspawalletdSvc {
         }
     }
 
-    /// Resolve the change address. Mirrors Go `changeAddress` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/address.go#L13
-    /// -- when `from_addresses` is non-empty AND `use_existing` is
-    /// true, recycle the first source-address as the change sink;
-    /// otherwise bump the keyfile's `last_used_internal_index` (Go
-    /// uses index 0 only when `use_existing` is true, every other
-    /// call bumps), persist the keyfile, and derive the address at
-    /// the new internal index.
+    /// Resolve the change address. When `from_addresses` is
+    /// non-empty AND `use_existing` is true, recycle the first
+    /// source-address as the change sink; otherwise bump the
+    /// keyfile's `last_used_internal_index` (index 0 only when
+    /// `use_existing` is true; every other call bumps), persist the
+    /// keyfile, and derive the address at the new internal index.
     fn change_address(
         state: &mut DaemonState,
         keysfile_path: &Path,
@@ -262,9 +251,8 @@ impl KaspawalletdSvc {
     }
 
     /// Resolve operator-supplied `from` address strings against the
-    /// daemon's `address_set`. Mirrors Go `from` lookup at
-    /// `cmd/kaspawallet/daemon/server/create_unsigned_transaction.go:103-110`
-    /// -- unknown addresses are an immediate error (Go: `fmt.Errorf`).
+    /// daemon's `address_set`. Unknown addresses are an immediate
+    /// `Status::invalid_argument`.
     fn resolve_from_addresses(state: &DaemonState, raw: &[String]) -> Result<Vec<WalletAddress>, Status> {
         let mut out = Vec::with_capacity(raw.len());
         for s in raw {
@@ -276,20 +264,17 @@ impl KaspawalletdSvc {
         Ok(out)
     }
 
-    /// Filter the daemon's UTXO snapshot the same way Go's
-    /// `selectUTXOsWithPreselected` filters its `s.utxosSortedByAmount`
-    /// iteration:
+    /// Filter the daemon's UTXO snapshot before coin selection:
     ///
     /// 1. drop UTXOs whose wallet-address is not in
     ///    `from_addresses` (no-op when `from_addresses` is empty),
     /// 2. drop UTXOs that fail the coinbase-maturity gate
-    ///    (`isUTXOSpendable`),
+    ///    (`is_utxo_spendable`),
     /// 3. drop UTXOs whose outpoint sits in `used_outpoints` and
-    ///    whose broadcast-time has not yet expired (Go's
-    ///    `usedOutpointHasExpired` 1-minute window) UNLESS the
-    ///    outpoint sits in `allow_used` (the BumpFee carve-out).
-    ///    Expired entries are removed from `used_outpoints` as a
-    ///    side effect, mirroring Go's in-place delete.
+    ///    whose broadcast-time has not yet expired (1-minute
+    ///    window) UNLESS the outpoint sits in `allow_used` (the
+    ///    BumpFee carve-out). Expired entries are removed from
+    ///    `used_outpoints` as a side effect.
     ///
     /// Returns the filtered slice in the same descending-amount
     /// order the daemon's snapshot maintains, converted to the
@@ -328,13 +313,11 @@ impl KaspawalletdSvc {
         filtered
     }
 
-    /// Build a unsigned-PST batch for the requested send. Shared by
-    /// `CreateUnsignedTransactions` and `Send`. Mirrors Go
-    /// `createUnsignedTransactions` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/create_unsigned_transaction.go#L86
-    /// -- decode the recipient, resolve `from` set, compute fee
-    /// limits, allocate a change address, run coin selection,
-    /// emit the unsigned PST and pass through the splitter.
+    /// Build an unsigned-PST batch for the requested send. Shared
+    /// by `CreateUnsignedTransactions` and `Send`: decode the
+    /// recipient, resolve the `from` set, compute fee limits,
+    /// allocate a change address, run coin selection, emit the
+    /// unsigned PST, and pass through the splitter.
     async fn create_unsigned_transactions_inner(
         &self,
         address: &str,
@@ -392,10 +375,8 @@ impl KaspawalletdSvc {
     }
 
     /// Sign each PSTX in the supplied batch under `password`'s
-    /// decrypted mnemonics. Shared by `Sign`, `Send`, `BumpFee`.
-    /// Mirrors Go `signTransactions` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/sign.go#L22
-    /// -- decrypt mnemonics once, walk every unsigned PSTX, and
+    /// decrypted mnemonics. Shared by `Sign`, `Send`, `BumpFee`:
+    /// decrypt mnemonics once, walk every unsigned PSTX, and
     /// dispatch to Schnorr or ECDSA per the keyfile's `ecdsa` flag.
     fn sign_transactions(keyfile: &KeysFile, unsigned: &[Vec<u8>], password: &str) -> Result<Vec<Vec<u8>>, Status> {
         let mnemonics = keyfile::decrypt_mnemonics(keyfile, password.as_bytes())
@@ -423,9 +404,6 @@ impl KaspawalletdSvc {
     /// Submit each transaction in the batch via plain
     /// `SubmitTransaction`, returning the list of accepted tx-ids
     /// in submission order. Shared by `Broadcast` and `Send`.
-    /// Mirrors Go `broadcast` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/broadcast.go#L29
-    /// (every transaction goes through `SubmitTransaction`).
     async fn broadcast_inner(&self, transactions: &[Vec<u8>], is_domain: bool) -> Result<Vec<String>, Status> {
         let kaspad = self.kaspad_or_unsynced()?;
         let ecdsa = self.state_or_unsynced().await?.keyfile.ecdsa;
@@ -448,11 +426,9 @@ impl KaspawalletdSvc {
 
     /// Submit each transaction via `SubmitTransactionReplacement`
     /// for the first entry and plain `SubmitTransaction` for the
-    /// rest. Shared by `BroadcastReplacement` and `BumpFee`.
-    /// Mirrors Go `broadcastReplacement` at
-    /// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/broadcast_replacement.go#L29
-    /// (only the first tx goes through RBF; the chained txs assume
-    /// the replacement landed and use the standard submit path).
+    /// rest. Shared by `BroadcastReplacement` and `BumpFee`: only
+    /// the first tx goes through RBF; chained txs assume the
+    /// replacement landed and use the standard submit path.
     async fn broadcast_replacement_inner(&self, transactions: &[Vec<u8>], is_domain: bool) -> Result<Vec<String>, Status> {
         let kaspad = self.kaspad_or_unsynced()?;
         let ecdsa = self.state_or_unsynced().await?.keyfile.ecdsa;
@@ -485,16 +461,14 @@ impl KaspawalletdSvc {
 #[tonic::async_trait]
 impl Kaspawalletd for KaspawalletdSvc {
     async fn get_balance(&self, _request: Request<GetBalanceRequest>) -> Result<Response<GetBalanceResponse>, Status> {
-        // Mirrors Go `cmd/kaspawallet/daemon/server/balance.go::GetBalance`:
-        // walk `utxosSortedByAmount`, split each UTXO into
+        // Walk `utxos_sorted_by_amount` and split each UTXO into
         // `available` (matured, spendable) or `pending` (immature
         // coinbase awaiting the COINBASE_MATURITY DAA gate) via
-        // `isUTXOSpendable(entry, virtualDAAScore)`. The
-        // mempool-excluded UTXO set is NOT counted into either
-        // bucket (Go's `utxosSortedByAmount` already excludes
-        // mempool-conflicted outpoints; the Rust port keeps them in
-        // `mempool_excluded_utxos` as a separate map but does NOT
-        // surface them through balance, matching Go's behavior).
+        // `is_utxo_spendable(entry, virtual_daa_score)`. The
+        // `mempool_excluded_utxos` set is intentionally NOT counted
+        // into either bucket -- mempool-conflicted outpoints are
+        // tracked separately for the BumpFee carve-out and do not
+        // appear in the user-visible balance.
         let kaspad = self.kaspad_or_unsynced()?;
         let dag_info = kaspad.get_block_dag_info().await.map_err(|e| Status::internal(format!("kaspad get_block_dag_info: {e}")))?;
         let virtual_daa_score = dag_info.virtual_daa_score;
@@ -570,8 +544,8 @@ impl Kaspawalletd for KaspawalletdSvc {
         let keysfile_path = self.keysfile_path_or_unsynced()?.to_path_buf();
         let mut state = self.state_or_unsynced().await?;
 
-        // Mirrors Go `NewAddress`: bump `lastUsedExternalIndex`,
-        // persist the keyfile, derive the address at the new index.
+        // Bump `last_used_external_index`, persist the keyfile,
+        // derive the address at the new index.
         let new_index = state.progress.last_used_external_index.saturating_add(1);
         state.progress.last_used_external_index = new_index;
         state.keyfile.last_used_external_index = new_index;
@@ -627,7 +601,7 @@ impl Kaspawalletd for KaspawalletdSvc {
         let password = Zeroizing::new(std::mem::take(&mut req.password));
         let signed = Self::sign_transactions(&keyfile, &unsigned, &password)?;
         // Send always submits via the standard mempool path
-        // (Go `Send` -> `s.broadcast(signedTransactions, false)`).
+        // (no RBF on the first-pass `send` flow).
         let tx_ids = self.broadcast_inner(&signed, false).await?;
         Ok(Response::new(SendResponse { tx_i_ds: tx_ids, signed_transactions: signed }))
     }
@@ -665,12 +639,11 @@ impl Kaspawalletd for KaspawalletdSvc {
         let mut state = self.state_or_unsynced().await?;
         let keysfile_path = self.keysfile_path_or_unsynced()?.to_path_buf();
 
-        // Mirrors Go `bump_fee.go:28-56`: walk the original
-        // transaction's inputs, find them in `mempoolExcludedUTXOs`
-        // (or fall back to `utxosSortedByAmount`), and pick the
-        // highest-amount one as the seed (`maxUTXO`). The
-        // `outpointsToInputs` map is the predicate for the
-        // `allowUsed` carve-out the coin-selector observes.
+        // Walk the original transaction's inputs, find them in
+        // `mempool_excluded_utxos` (or fall back to
+        // `utxos_sorted_by_amount`), and pick the highest-amount
+        // entry as the seed UTXO. The `allow_used` set is the
+        // BumpFee carve-out the coin-selector observes.
         let mut allow_used: HashSet<TransactionOutpoint> = HashSet::with_capacity(domain_tx.inputs.len());
         for input in &domain_tx.inputs {
             allow_used.insert(input.previous_outpoint);
@@ -687,9 +660,8 @@ impl Kaspawalletd for KaspawalletdSvc {
         }
         if max_seed.is_none() {
             // Fallback: scan utxos_sorted_by_amount for any of the
-            // original inputs (Go's same-name fallback at lines
-            // 43-56). The two iterations target disjoint snapshots
-            // of the daemon state, so order is preserved.
+            // original inputs. The two iterations target disjoint
+            // snapshots of the daemon state, so order is preserved.
             for utxo in &state.utxos_sorted_by_amount {
                 if !allow_used.contains(&utxo.outpoint) {
                     continue;
@@ -709,13 +681,11 @@ impl Kaspawalletd for KaspawalletdSvc {
         })?;
 
         // Compute the original fee rate via consensus mass.
-        // Mirrors Go `s.txMassCalculator.CalculateTransactionOverallMass`
-        // = max(compute_mass, storage_mass). The signed mempool
-        // transaction's compute mass comes straight from the
+        // `overall_mass = max(compute_mass, storage_mass)`: the
+        // signed mempool transaction's compute mass comes from the
         // non-contextual calculator; the storage mass needs each
-        // input's previous-output amount, which we recover from
-        // the daemon's `mempool_excluded_utxos` (the same map Go
-        // populates `input.UTXOEntry` from in lines 32-41).
+        // input's previous-output amount, recovered from the
+        // daemon's `mempool_excluded_utxos`.
         let original_fee_rate =
             calc_overall_mass_fee_rate(&state, &domain_tx, original_fee).map_err(|e| Status::internal(format!("mass calc: {e}")))?;
 
@@ -796,12 +766,11 @@ fn utxo_to_pb(utxo: &super::state::WalletUtxo) -> UtxosByAddressesEntry {
     }
 }
 
-/// Decode the broadcast-RPC's transaction payload. Mirrors Go
-/// `Broadcast` -> `if isDomain { DeserializeDomainTransaction }
-/// else { libkaspawallet.ExtractTransaction }`. The `is_domain=true`
-/// branch consumes a raw consensus-tx wire blob; the
-/// `is_domain=false` branch consumes a signed PSTX and extracts
-/// the consensus-tx via the sign module's `extract_transaction`.
+/// Decode the broadcast-RPC's transaction payload. The
+/// `is_domain=true` branch consumes a raw consensus-tx wire blob;
+/// the `is_domain=false` branch consumes a signed PSTX and
+/// extracts the consensus-tx via the sign module's
+/// `extract_transaction`.
 fn decode_broadcast_tx(bytes: &[u8], is_domain: bool, ecdsa: bool) -> Result<Transaction, Status> {
     if is_domain {
         let msg = serialization::deserialize_domain_transaction(bytes)
@@ -848,17 +817,14 @@ fn wallet_utxo_to_lib_utxo(utxo: &super::state::WalletUtxo, derivation_path: Str
     }
 }
 
-/// Helper: emit the unsigned-PSTX batch from a coin-selection
-/// `Selection`. Mirrors Go's tail block in
-/// `createUnsignedTransactions`
-/// (`create_unsigned_transaction.go:122-147`): build the
-/// `payments` (recipient + optional change), call
-/// `libkaspawallet.CreateUnsignedTransaction`, then run the
-/// splitter via `maybeAutoCompoundTransaction`. The splitter
+/// Emit the unsigned-PSTX batch from a coin-selection
+/// `Selection`: build the `payments` (recipient + optional
+/// change), call `create_unsigned_transaction`, then run the
+/// splitter via `maybe_auto_compound_transaction`. The splitter
 /// receives the post-filter "spare" UTXO pool minus anything the
 /// selection already consumed -- the merge step needs that pool
 /// when the splits do not cover the original recipient amount.
-#[allow(clippy::too_many_arguments)] // mirror Go's parameter set; collapsing into a struct hurts call-site clarity
+#[allow(clippy::too_many_arguments)] // collapsing into a struct hurts call-site clarity
 fn unsigned_transactions_from_selection(
     cfg: &WalletConfig,
     params: &kaspa_consensus_core::config::params::Params,
@@ -879,7 +845,7 @@ fn unsigned_transactions_from_selection(
     if selection.change_sompi > 0 {
         payments.push(Payment { address: change_address.clone(), amount: selection.change_sompi });
     }
-    let _ = spend_amount; // mirror Go's signature -- amount lives inside `selection.total_received`
+    let _ = spend_amount; // amount lives inside `selection.total_received`
 
     let unsigned_pst = create_unsigned_transaction(&cfg.extended_public_keys, cfg.minimum_signatures, &payments, &selection.selected)
         .map_err(|e| Status::internal(format!("create_unsigned_transaction failed: {e}")))?;
@@ -913,24 +879,20 @@ fn unsigned_transactions_from_selection(
 }
 
 /// Pick the first normal-priority feerate bucket from a kaspad
-/// fee estimate. Mirrors Go
-/// `estimate.Estimate.NormalBuckets[0].Feerate`. Returns an
-/// `internal` status when kaspad's response carries an empty
-/// normal-bucket vector (the protocol guarantees at least one
-/// entry; an empty response is a node-side bug).
+/// fee estimate. Returns an `internal` status when kaspad's
+/// response carries an empty normal-bucket vector (the protocol
+/// guarantees at least one entry; an empty response is a
+/// node-side bug).
 fn first_normal_bucket(estimate: &kaspa_rpc_core::RpcFeeEstimate) -> Result<kaspa_rpc_core::RpcFeerateBucket, Status> {
     estimate.normal_buckets.first().copied().ok_or_else(|| Status::internal("kaspad fee estimate is missing normal buckets"))
 }
 
-/// Compute `fee / overall_mass` for a signed transaction the way
-/// Go `bump_fee.go:62-63` does. `overall_mass = max(compute_mass,
-/// storage_mass)` per Go's `CalculateTransactionOverallMass`
-/// (`util/txmass/calculator.go:131-134`). The compute component
-/// comes from the consensus-core non-contextual mass calculator;
-/// the storage component is the KIP-0009 formula evaluated against
-/// each input's previous-output amount, which the daemon recovers
-/// from `mempool_excluded_utxos` (the same map Go populates
-/// `input.UTXOEntry` from in `bump_fee.go:32-56`). Inputs whose
+/// Compute `fee / overall_mass` for a signed transaction.
+/// `overall_mass = max(compute_mass, storage_mass)`. The compute
+/// component comes from the consensus-core non-contextual mass
+/// calculator; the storage component is the KIP-0009 formula
+/// evaluated against each input's previous-output amount, which
+/// the daemon recovers from `mempool_excluded_utxos`. Inputs whose
 /// previous-output is not in `mempool_excluded_utxos` AND not in
 /// `utxos_sorted_by_amount` produce an error -- the storage mass
 /// formula has no defined value without all input amounts.

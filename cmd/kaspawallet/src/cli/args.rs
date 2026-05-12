@@ -1,23 +1,17 @@
 //! Clap derive surface. Subcommand names, long flags, short
-//! flags, defaults, and `required` dispositions mirror the Go
-//! reference at
-//! `https://github.com/kaspanet/kaspad/blob/master/cmd/kaspawallet/config.go`.
-//! Help-text wording is paraphrased -- semantic deviation from
-//! the Go reference is not allowed; trivial wording polish is.
+//! flags, defaults, and `required` dispositions describe the
+//! observable wallet CLI.
 
 use clap::{Parser, Subcommand as ClapSubcommand};
 
 use super::network::NetworkFlags;
 use super::wallet_backend::WalletBackend;
 
-/// Default daemon listen address. Mirrors the Go `defaultListen`
-/// constant in `config.go`. The Rust port resolves the Go-side
-/// help-text vs binding-constant discrepancy toward the
-/// loopback-only binding behavior (lead ruling 2026-05-11).
+/// Default daemon listen address. Loopback-only binding is the
+/// shipped behaviour.
 pub const DEFAULT_LISTEN: &str = "localhost:8082";
 
-/// Default RPC server target. Mirrors the Go `defaultRPCServer`
-/// constant.
+/// Default RPC server target.
 pub const DEFAULT_RPC_SERVER: &str = "localhost";
 
 /// Default daemon wait-timeout in seconds.
@@ -38,8 +32,8 @@ pub const DEFAULT_NUM_PUBLIC_KEYS: u32 = 1;
 #[command(disable_help_subcommand = true)]
 pub struct Cli {
     /// Network flags accepted at the top level as well as on every
-    /// subcommand (mirrors the Go reference's top-level + per-
-    /// subcommand merge pattern via `combineNetworkFlags`).
+    /// subcommand; per-subcommand values merge with the top-level
+    /// value via [`NetworkFlags::combine`].
     #[command(flatten)]
     pub network: NetworkFlags,
 
@@ -94,7 +88,7 @@ pub enum Subcommand {
     GetDaemonVersion(GetDaemonVersionArgs),
 }
 
-/// `create` subcommand. Mirrors `createConfig` in Go.
+/// `create` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct CreateArgs {
     /// Keyfile location.
@@ -137,8 +131,7 @@ pub struct CreateArgs {
     pub network: NetworkFlags,
 }
 
-/// `dump-unencrypted-data` subcommand. Mirrors
-/// `dumpUnencryptedDataConfig`.
+/// `dump-unencrypted-data` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct DumpUnencryptedDataArgs {
     #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
@@ -157,7 +150,7 @@ pub struct DumpUnencryptedDataArgs {
     pub network: NetworkFlags,
 }
 
-/// `start-daemon` subcommand. Mirrors `startDaemonConfig`.
+/// `start-daemon` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct StartDaemonArgs {
     #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
@@ -170,8 +163,7 @@ pub struct StartDaemonArgs {
     #[arg(long = "rpcserver", short = 's', default_value = DEFAULT_RPC_SERVER, value_name = "HOST[:PORT]")]
     pub rpcserver: String,
 
-    /// Daemon gRPC listen address. Default matches the Go binary's
-    /// runtime binding constant, which is loopback-only.
+    /// Daemon gRPC listen address. Default is loopback-only.
     #[arg(long, short = 'l', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
     pub listen: String,
 
@@ -190,9 +182,9 @@ pub struct StartDaemonArgs {
     pub network: NetworkFlags,
 }
 
-/// `balance` subcommand. Mirrors `balanceConfig`. No
-/// `--wallet-backend` here: daemon-client subcommands inherit the
-/// backend the daemon was bound to at `start-daemon` time.
+/// `balance` subcommand arguments. Daemon-client subcommands have
+/// no `--wallet-backend` flag -- they inherit the backend the
+/// daemon was bound to at `start-daemon` time.
 #[derive(clap::Args, Debug)]
 pub struct BalanceArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
@@ -206,10 +198,9 @@ pub struct BalanceArgs {
     pub network: NetworkFlags,
 }
 
-/// `send` subcommand. Mirrors `sendConfig`. Go uses `-v` for
-/// `send-amount` here; same short flag as `balance --verbose`,
-/// but they are on different subcommands so there is no global
-/// conflict.
+/// `send` subcommand arguments. `-v` here is `send-amount`, the
+/// same short flag as `balance --verbose`; the two are on
+/// different subcommands so there is no global conflict.
 #[derive(clap::Args, Debug)]
 pub struct SendArgs {
     #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
@@ -263,8 +254,7 @@ pub struct SendArgs {
     pub network: NetworkFlags,
 }
 
-/// `create-unsigned-transaction` subcommand. Mirrors
-/// `createUnsignedTransactionConfig`.
+/// `create-unsigned-transaction` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct CreateUnsignedTransactionArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
@@ -298,8 +288,8 @@ pub struct CreateUnsignedTransactionArgs {
     pub network: NetworkFlags,
 }
 
-/// `sign` subcommand. Mirrors `signConfig`. Offline; reads the
-/// keyfile directly.
+/// `sign` subcommand arguments. Offline; reads the keyfile
+/// directly.
 #[derive(clap::Args, Debug)]
 pub struct SignArgs {
     #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
@@ -323,7 +313,7 @@ pub struct SignArgs {
     pub network: NetworkFlags,
 }
 
-/// `broadcast` subcommand. Mirrors `broadcastConfig`.
+/// `broadcast` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct BroadcastArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
@@ -339,9 +329,8 @@ pub struct BroadcastArgs {
     pub network: NetworkFlags,
 }
 
-/// `parse` subcommand. Mirrors `parseConfig`. Offline; the
-/// `--keys-file` arg is optional and enables address-ownership
-/// annotation.
+/// `parse` subcommand arguments. Offline; the `--keys-file` arg
+/// is optional and enables address-ownership annotation.
 #[derive(clap::Args, Debug)]
 pub struct ParseArgs {
     #[arg(long = "keys-file", short = 'f', value_name = "PATH")]
@@ -364,7 +353,7 @@ pub struct ParseArgs {
     pub network: NetworkFlags,
 }
 
-/// `show-addresses` subcommand. Mirrors `showAddressesConfig`.
+/// `show-addresses` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct ShowAddressesArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
@@ -374,7 +363,7 @@ pub struct ShowAddressesArgs {
     pub network: NetworkFlags,
 }
 
-/// `new-address` subcommand. Mirrors `newAddressConfig`.
+/// `new-address` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct NewAddressArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]
@@ -384,11 +373,11 @@ pub struct NewAddressArgs {
     pub network: NetworkFlags,
 }
 
-/// `version` subcommand. Mirrors `versionConfig` (no flags).
+/// `version` subcommand arguments (no flags).
 #[derive(clap::Args, Debug)]
 pub struct VersionArgs {}
 
-/// `sweep` subcommand. Mirrors `sweepConfig`.
+/// `sweep` subcommand arguments.
 #[derive(clap::Args, Debug)]
 pub struct SweepArgs {
     /// Hex-encoded private key.
@@ -405,9 +394,9 @@ pub struct SweepArgs {
     pub network: NetworkFlags,
 }
 
-/// `bump-fee` subcommand. Mirrors `bumpFeeConfig`. Local-signing
-/// flow: the daemon returns unsigned replacement transactions and
-/// the CLI signs them client-side, then broadcasts.
+/// `bump-fee` subcommand arguments. Local-signing flow: the
+/// daemon returns unsigned replacement transactions, the CLI
+/// signs them client-side, then broadcasts.
 #[derive(clap::Args, Debug)]
 pub struct BumpFeeArgs {
     /// Transaction ID of the pending mempool entry to replace.
@@ -449,9 +438,9 @@ pub struct BumpFeeArgs {
     pub network: NetworkFlags,
 }
 
-/// `bump-fee-unsigned` subcommand. Mirrors `bumpFeeUnsignedConfig`.
-/// Returns the daemon's unsigned replacement transaction(s) as
-/// hex; no keyfile is read.
+/// `bump-fee-unsigned` subcommand arguments. Returns the daemon's
+/// unsigned replacement transaction(s) as hex; no keyfile is
+/// read.
 #[derive(clap::Args, Debug)]
 pub struct BumpFeeUnsignedArgs {
     /// Transaction ID of the pending mempool entry to replace.
@@ -480,9 +469,9 @@ pub struct BumpFeeUnsignedArgs {
     pub network: NetworkFlags,
 }
 
-/// `get-daemon-version` subcommand. Mirrors
-/// `getDaemonVersionConfig`. Only `--daemonaddress`; no network
-/// flags (the daemon's reported version is network-agnostic).
+/// `get-daemon-version` subcommand arguments. Only
+/// `--daemonaddress`; no network flags (the daemon's reported
+/// version is network-agnostic).
 #[derive(clap::Args, Debug)]
 pub struct GetDaemonVersionArgs {
     #[arg(long = "daemonaddress", short = 'd', default_value = DEFAULT_LISTEN, value_name = "HOST:PORT")]

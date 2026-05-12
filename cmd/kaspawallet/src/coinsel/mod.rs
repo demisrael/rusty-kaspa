@@ -1,24 +1,16 @@
-//! Verbatim Path-A port of the Go daemon's coin-selection layer
-//! (`selectUTXOs` + `selectUTXOsWithPreselected` + `estimateFee` +
-//! `estimateFeePerInput`). The byte-deterministic UTXO ordering
-//! this module produces is the load-bearing property the
-//! cross-binary `send` parity test and the side-by-side
-//! `send` / `create-unsigned-transaction` / `sweep` parity matrix
-//! depend on. Every iteration order, every fee arithmetic step,
-//! and every break condition mirrors the Go reference exactly so
-//! two callers (Go binary and Rust port) seeing the same logical
-//! input produce byte-identical PSTs.
+//! Coin-selection layer (UTXO selection, fee estimation, and
+//! mass-bound batch splitting). The byte-deterministic UTXO
+//! ordering this module produces is the load-bearing property the
+//! cross-implementation parity tests depend on.
 //!
-//! Source: https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/create_unsigned_transaction.go
-//!
-//! Reuse-existing-crates discipline: the mass primitive
+//! The mass primitive
 //! ([`crate::mass::estimate_mass_after_signatures`]) is the only
 //! mass-formula owner; the unsigned-PST builder
 //! ([`crate::transaction::create_unsigned_transaction`]) is the
 //! only PST-shape owner. This module's responsibility is the
 //! ordering rule, the fee arithmetic, and the change-amount
-//! computation. No mass formula is re-derived here; no PST shape
-//! is re-emitted here.
+//! computation -- no mass formula is re-derived here; no PST
+//! shape is re-emitted here.
 
 mod error;
 mod fee;

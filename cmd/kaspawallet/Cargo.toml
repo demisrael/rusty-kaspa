@@ -1,6 +1,6 @@
 [package]
 name = "kaspawallet"
-description = "Subcommand-style wallet binary mirroring the legacy Go kaspawallet"
+description = "Subcommand-style wallet binary with daemon mode and BIP-32 / multisig signing"
 keywords = ["kaspa", "wallet", "cli"]
 rust-version.workspace = true
 version.workspace = true

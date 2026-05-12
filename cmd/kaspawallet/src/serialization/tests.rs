@@ -1,9 +1,8 @@
 //! Round-trip tests for the partial-signed-transaction wire
-//! format. Cross-binary byte-identity vs the Go binary is verified
-//! by the cross-binary parity harness scheduled for the
-//! validation-harness batch; the in-tree tests here prove
-//! encode/decode round-trip, default-value omission, and
-//! structural correctness of the wire shape.
+//! format. Cross-implementation byte-identity is exercised by
+//! the parity harness in `tests/parity.rs`; the in-tree tests
+//! here prove encode/decode round-trip, default-value omission,
+//! and structural correctness of the wire shape.
 
 use prost::Message;
 
@@ -160,47 +159,45 @@ fn test_default_values_are_omitted_from_wire() {
 
 /// Cross-wallet byte-identity gate. The fixture
 /// `tests/fixtures/go_emitted_pst.hex` is a hex-encoded
-/// `PartiallySignedTransaction` produced by the Go reference's
-/// `serialization.SerializePartiallySignedTransaction` on a
-/// deterministic synthetic input (see `fixtures/README.md` for
-/// the helper used to produce it). This test:
+/// `PartiallySignedTransaction` produced by the reference
+/// implementation's wire serializer on a deterministic
+/// synthetic input (see `fixtures/README.md` for the helper used
+/// to produce it). This test:
 ///
-///   1. Decodes the Go-emitted bytes via the Rust port -- proves
-///      the Rust decoder accepts the Go wire bytes.
-///   2. Re-encodes the decoded structure via the Rust port --
-///      proves the Rust encoder emits the same byte string the
-///      Go binary emitted.
-///   3. Re-decodes the Rust-re-encoded bytes -- proves the
-///      Go-via-Rust round-trip is wire-stable.
+///   1. Decodes the reference-emitted bytes via this crate --
+///      proves the decoder accepts the canonical wire bytes.
+///   2. Re-encodes the decoded structure -- proves the encoder
+///      emits the same byte string.
+///   3. Re-decodes the re-encoded bytes -- proves the round-trip
+///      is wire-stable.
 ///
-/// Together these three assertions are the structural cross-binary
-/// byte-identity claim the cross-wallet interop AC depends on
-/// (lead direction 2026-05-11, steer addendum 1778485777798-0).
-/// The fuller cross-wallet sign-flow round-trip lands once the
-/// sign module is in.
+/// Together these three assertions are the structural
+/// cross-implementation byte-identity claim the cross-wallet
+/// interop AC depends on. A fuller cross-wallet sign-flow
+/// round-trip is exercised by the sign module's tests.
 #[test]
 fn test_go_emitted_pst_round_trips_byte_identically_in_rust() {
     let hex_str = include_str!("../../tests/fixtures/go_emitted_pst.hex").trim();
     let go_bytes = hex::decode(hex_str).expect("fixture is valid hex");
 
-    let pst = deserialize_partially_signed_transaction(&go_bytes).expect("Rust decoder accepts Go-emitted bytes");
+    let pst = deserialize_partially_signed_transaction(&go_bytes).expect("decoder accepts reference-emitted bytes");
 
-    let rust_bytes = serialize_partially_signed_transaction(&pst).expect("Rust encoder runs");
+    let rust_bytes = serialize_partially_signed_transaction(&pst).expect("encoder runs");
     assert_eq!(
         rust_bytes,
         go_bytes,
-        "Rust re-encode of a Go-emitted PartiallySignedTransaction must equal the original Go bytes; lengths Go={} Rust={}",
+        "re-encoded PartiallySignedTransaction must equal the original reference bytes; lengths reference={} re-encoded={}",
         go_bytes.len(),
         rust_bytes.len()
     );
 
-    let pst_again = deserialize_partially_signed_transaction(&rust_bytes).expect("Rust decoder accepts Rust-re-encoded bytes");
+    let pst_again = deserialize_partially_signed_transaction(&rust_bytes).expect("decoder accepts re-encoded bytes");
     assert_eq!(pst, pst_again, "decoded structures must be identical after the round-trip");
 }
 
-/// The Go fixture should expose every wire-level field that
-/// matters for the cross-wallet sign flow. This test reads the
-/// fixture and pins each field's expected shape, so any
+/// The reference fixture should expose every wire-level field
+/// that matters for the cross-wallet sign flow. This test reads
+/// the fixture and pins each field's expected shape, so any
 /// regeneration of the fixture that drifts from the original
 /// synthetic input gets flagged.
 #[test]

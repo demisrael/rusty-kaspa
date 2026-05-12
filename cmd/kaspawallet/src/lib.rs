@@ -1,8 +1,5 @@
-//! Subcommand-style wallet binary mirroring the legacy Go `kaspawallet`.
-//!
-//! Crate scope: legacy Go-keyfile native read + multisig + CLI surface
-//! parity with the Go `cmd/kaspawallet` binary. Full architectural
-//! contract is documented in the task spec.
+//! Subcommand-style wallet binary: keyfile codec, multisig signing,
+//! transaction construction, and a gRPC daemon mode.
 
 pub mod cli;
 pub mod coinsel;

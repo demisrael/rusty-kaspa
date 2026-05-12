@@ -1,7 +1,7 @@
-//! Unit tests for the legacy Go-keyfile module. Tests use the
-//! fixtures committed under `cmd/kaspawallet/tests/fixtures/`; see
-//! that directory's `README.md` for the exact `kaspawallet
-//! create` commands that produced each fixture.
+//! Unit tests for the keyfile module. Tests use the fixtures
+//! committed under `cmd/kaspawallet/tests/fixtures/`; see that
+//! directory's `README.md` for the exact `kaspawallet create`
+//! commands that produced each fixture.
 
 use std::io::Cursor;
 use std::path::PathBuf;
@@ -36,7 +36,7 @@ fn test_v1_singlekey_decode_layout() {
     assert_eq!(kf.extended_public_keys.len(), 1);
     let em = &kf.encrypted_mnemonics[0];
     assert!(em.cipher.len() > 24, "cipher must be longer than the 24-byte nonce");
-    assert_eq!(em.salt.len(), 16, "Go reference emits a 16-byte salt");
+    assert_eq!(em.salt.len(), 16, "v1 keyfile format pins the salt at 16 bytes");
 }
 
 #[test]

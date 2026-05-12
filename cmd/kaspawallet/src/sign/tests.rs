@@ -209,11 +209,10 @@ fn test_sign_ecdsa_repeated_invocation_is_byte_identical() {
 /// non-empty signatures after the per-mnemonic sign loop -- NOT the
 /// full set of N. An over-signed PST would cause
 /// `extract_transaction` to push all N sigs into the on-chain
-/// sigscript, leaving an unconsumed extra item on the stack after
-/// `OpCheckMultiSig` ("stack contains 1 unexpected items"). The
-/// fix is the `is_pst_fully_signed` early-return at the head of
-/// both per-mnemonic sign flows; mirrors Go
-/// `cmd/kaspawallet/libkaspawallet/sign.go:47-49`.
+/// sigscript, leaving an unconsumed extra item on the stack
+/// after `OpCheckMultiSig` ("stack contains 1 unexpected
+/// items"). The fix is the `is_pst_fully_signed` early-return at
+/// the head of both per-mnemonic sign flows.
 #[test]
 fn test_grandpa_multisig_2of3_p2sh_spend_round_trip_with_kaspad_script_verify() {
     let kf = keyfile::read_from_path(fixture("legacy_go_v1_multisig_2of3.json")).unwrap();
