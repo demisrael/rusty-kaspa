@@ -1,0 +1,126 @@
+package main
+
+import (
+	"encoding/hex"
+	"fmt"
+	"os"
+
+	"github.com/kaspanet/kaspad/cmd/kaspawallet/libkaspawallet/bip32"
+	"github.com/kaspanet/kaspad/cmd/kaspawallet/libkaspawallet/serialization"
+	"github.com/kaspanet/kaspad/domain/consensus/model/externalapi"
+	"github.com/kaspanet/kaspad/domain/consensus/utils/subnetworks"
+)
+
+// Cosigner-level extended public key (testnet ktub version) sourced
+// verbatim from cmd/kaspawallet/tests/fixtures/legacy_go_v1_singlekey.json
+// -- the same cosigner xpub the keyfile-decryption tests use.
+const cosignerExtendedPublicKey = "ktub249YJayoDJS3tDjTW8NG3iAwufiDQ13uEptr8Wz2LgnzdVFLUQiRqFRPyq1xndcJMXFbYx268MSxHwukrnD52gWeshgeYseLmTBcUNHR1Xb"
+
+// Relative derivation path applied to the cosigner xpub. The Go
+// kaspawallet daemon's walletAddressPath() emits this exact form for
+// single-signer wallets (m/<keyChain>/<index>) at
+// https://github.com/kaspanet/kaspad/blob/4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2/cmd/kaspawallet/daemon/server/address.go#L116
+// and libkaspawallet.CreateUnsignedTransaction stores it on the
+// PartiallySignedInput.DerivationPath unchanged
+// (transaction.go:127).
+const relativeDerivationPath = "m/0/0"
+
+func main() {
+	cosignerKey, err := bip32.DeserializeExtendedKey(cosignerExtendedPublicKey)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "deserialize cosigner xpub:", err)
+		os.Exit(1)
+	}
+
+	leafKey, err := cosignerKey.DeriveFromPath(relativeDerivationPath)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "derive leaf:", err)
+		os.Exit(1)
+	}
+	leafExtendedPublicKey := leafKey.String()
+	fmt.Fprintln(os.Stderr, "leaf xpub:", leafExtendedPublicKey)
+
+	var prevHash [externalapi.DomainHashSize]byte
+	for i := 0; i < externalapi.DomainHashSize; i++ {
+		prevHash[i] = byte(i + 1)
+	}
+	prevID := externalapi.NewDomainTransactionIDFromByteArray(&prevHash)
+
+	scriptVer := &externalapi.ScriptPublicKey{
+		Script: []byte{
+			0xaa, 0x20, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88,
+			0x99, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00,
+			0xde, 0xad, 0xbe, 0xef, 0xfe, 0xed, 0xfa, 0xce,
+			0xca, 0xfe, 0xba, 0xbe, 0xa5, 0xa5, 0xa5, 0xa5, 0x87,
+		},
+		Version: 0,
+	}
+
+	prevOutput := &externalapi.DomainTransactionOutput{
+		Value:           500000000,
+		ScriptPublicKey: scriptVer,
+	}
+
+	tx := &externalapi.DomainTransaction{
+		Version: 0,
+		Inputs: []*externalapi.DomainTransactionInput{
+			{
+				PreviousOutpoint: externalapi.DomainOutpoint{TransactionID: *prevID, Index: 1},
+				SignatureScript:  []byte{},
+				Sequence:         0xffffffffffffffff,
+				SigOpCount:       1,
+			},
+		},
+		Outputs: []*externalapi.DomainTransactionOutput{
+			{
+				Value: 250000000,
+				ScriptPublicKey: &externalapi.ScriptPublicKey{
+					Script: []byte{
+						0x20, 0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x11, 0x22, 0x33,
+						0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0x00, 0x11, 0x22, 0x33,
+						0x44, 0x55, 0x66, 0x77, 0x88, 0x99, 0xaa, 0xbb, 0xcc, 0xdd,
+						0xee, 0xff, 0x00, 0xac,
+					},
+					Version: 0,
+				},
+			},
+			{
+				Value: 249990000,
+				ScriptPublicKey: &externalapi.ScriptPublicKey{
+					Script: []byte{
+						0x20, 0x11, 0x22, 0x33, 0x44, 0x55, 0x66, 0x77, 0x88, 0x99,
+						0xaa, 0xbb, 0xcc, 0xdd, 0xee, 0xff, 0x00, 0x99, 0x88, 0x77,
+						0x66, 0x55, 0x44, 0x33, 0x22, 0x11, 0xab, 0xcd, 0xef, 0x12,
+						0x34, 0x56, 0x78, 0xac,
+					},
+					Version: 0,
+				},
+			},
+		},
+		LockTime:     0,
+		SubnetworkID: subnetworks.SubnetworkIDNative,
+		Gas:          0,
+		Payload:      []byte{},
+	}
+
+	pst := &serialization.PartiallySignedTransaction{
+		Tx: tx,
+		PartiallySignedInputs: []*serialization.PartiallySignedInput{
+			{
+				PrevOutput:        prevOutput,
+				MinimumSignatures: 1,
+				PubKeySignaturePairs: []*serialization.PubKeySignaturePair{
+					{ExtendedPublicKey: leafExtendedPublicKey, Signature: nil},
+				},
+				DerivationPath: relativeDerivationPath,
+			},
+		},
+	}
+
+	bytes, err := serialization.SerializePartiallySignedTransaction(pst)
+	if err != nil {
+		fmt.Fprintln(os.Stderr, "serialize:", err)
+		os.Exit(1)
+	}
+	fmt.Println(hex.EncodeToString(bytes))
+}
