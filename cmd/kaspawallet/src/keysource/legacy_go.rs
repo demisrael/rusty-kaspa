@@ -17,7 +17,8 @@ use std::cell::Cell;
 use std::str::FromStr;
 
 use kaspa_addresses::{Address, Prefix as AddressPrefix, Version as AddressVersion};
-use kaspa_bip32::{ChildNumber, ExtendedPublicKey};
+use kaspa_bip32::{ChildNumber, DerivationPath, ExtendedPrivateKey, ExtendedPublicKey, Language, Mnemonic, SecretKey};
+use kaspa_consensus_core::hashing::sighash_type::SIG_HASH_ALL;
 use kaspa_txscript::{multisig_redeem_script, multisig_redeem_script_ecdsa};
 use zeroize::Zeroizing;
 
@@ -32,6 +33,25 @@ use super::traits::{DerivableKeySource, KeySource};
 /// length constant.
 const SCRIPT_HASH_LEN: usize = 32;
 
+/// Sighash digest length (bytes) the `sign_for` entry point expects.
+/// Both Schnorr (BIP-340) and ECDSA (`secp256k1`) sign over a
+/// 32-byte digest.
+const SIGHASH_DIGEST_LEN: usize = 32;
+
+/// Raw signature length (bytes) for both supported curves. Schnorr
+/// BIP-340 signatures are 64 bytes; ECDSA compact serialization
+/// (`Signature::serialize_compact`) is also 64 bytes.
+const RAW_SIGNATURE_LEN: usize = 64;
+
+/// BIP-43 purpose component for single-signer wallets.
+const SINGLE_SIGNER_PURPOSE: u32 = 44;
+
+/// BIP-43-style purpose component for multisig wallets.
+const MULTISIG_PURPOSE: u32 = 45;
+
+/// Kaspa SLIP-0044 coin-type component.
+const COIN_TYPE: u32 = 111111;
+
 /// Concrete `LegacyGoKeyfile` key source. Holds the decoded
 /// keyfile fields plus a lexicographically-sorted xpub view that
 /// the multisig derivation path uses without re-sorting per call.
@@ -44,11 +64,11 @@ pub struct LegacyGoKeyfile {
     last_used_internal_index: Cell<u32>,
     address_prefix: AddressPrefix,
     /// Decrypted mnemonics. Populated when the keyfile was opened
-    /// with a password and signing might happen later. Kept
-    /// off-thread; the sign module consumes this in a follow-on
-    /// batch. Wrapped in `Zeroizing` so plaintext mnemonic bytes are
-    /// scrubbed when this `LegacyGoKeyfile` is dropped.
-    #[allow(dead_code)] // Consumed by the sign module in a follow-on batch.
+    /// with a password and signing might happen later. Consumed
+    /// by `sign_for` -- the per-input signing entry point on the
+    /// `KeySource` trait. Wrapped in `Zeroizing` so plaintext
+    /// mnemonic bytes are scrubbed when this `LegacyGoKeyfile`
+    /// is dropped.
     decrypted_mnemonics: Zeroizing<Vec<String>>,
 }
 
@@ -158,6 +178,46 @@ impl KeySource for LegacyGoKeyfile {
     fn change_address(&self) -> Result<Address, KeySourceError> {
         let i = self.next_index(KeyChain::Internal);
         self.address_at(KeyChain::Internal, i)
+    }
+
+    fn sign_for(&self, cosigner_idx: u32, derivation_path: &str, msg: &[u8]) -> Result<Vec<u8>, KeySourceError> {
+        let mnemonic_count = self.decrypted_mnemonics.len();
+        let idx = usize::try_from(cosigner_idx).ok().filter(|i| *i < mnemonic_count).ok_or_else(|| KeySourceError::Invalid {
+            field: "cosigner_idx",
+            reason: format!("cosigner_idx {cosigner_idx} out of range; this keyfile holds {mnemonic_count} cosigner mnemonic(s)"),
+        })?;
+        if msg.len() != SIGHASH_DIGEST_LEN {
+            return Err(KeySourceError::Invalid {
+                field: "msg",
+                reason: format!("expected a {SIGHASH_DIGEST_LEN}-byte sighash digest, got {} bytes", msg.len()),
+            });
+        }
+
+        // Derive the leaf signing key: master <- seed(mnemonic) ->
+        // cosigner prefix walk (purpose / coin / 0') -> relative
+        // path walk (the input's `derivation_path` field of the
+        // PartiallySignedInput, e.g. "m/0/3").
+        let mnemonic = Mnemonic::new(self.decrypted_mnemonics[idx].as_str(), Language::English)?;
+        let seed = mnemonic.to_seed("");
+        let master = ExtendedPrivateKey::<SecretKey>::new(seed.as_bytes())?;
+        let purpose = if self.is_multisig() { MULTISIG_PURPOSE } else { SINGLE_SIGNER_PURPOSE };
+        let cosigner_prefix = DerivationPath::from_str(&format!("m/{purpose}'/{COIN_TYPE}'/0'"))?;
+        let relative = DerivationPath::from_str(derivation_path)?;
+        let leaf = master.derive_path(&cosigner_prefix)?.derive_path(&relative)?;
+        let secret_key = *leaf.private_key();
+
+        let sighash_msg = secp256k1::Message::from_digest_slice(msg)?;
+        let sig_bytes: [u8; RAW_SIGNATURE_LEN] = if self.ecdsa {
+            secret_key.sign_ecdsa(sighash_msg).serialize_compact()
+        } else {
+            let keypair = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &secret_key);
+            *keypair.sign_schnorr(sighash_msg).as_ref()
+        };
+
+        let mut sig_with_hash_type = Vec::with_capacity(RAW_SIGNATURE_LEN + 1);
+        sig_with_hash_type.extend_from_slice(&sig_bytes);
+        sig_with_hash_type.push(SIG_HASH_ALL.to_u8());
+        Ok(sig_with_hash_type)
     }
 }
 

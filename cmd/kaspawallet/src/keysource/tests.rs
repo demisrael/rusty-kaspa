@@ -159,3 +159,174 @@ fn test_resolve_with_wrong_password_propagates_mac_failure() {
         }
     }
 }
+
+// `sign_for` unit tests. Cover the 65-byte wire shape, the
+// cosigner_idx / msg-length error paths, the Schnorr-vs-ECDSA
+// dispatch, and the ECDSA RFC-6979 determinism property.
+
+/// Single-cosigner Schnorr-key fixture's BIP-43 cosigner prefix.
+/// Used to derive the leaf x-only pubkey for in-test signature
+/// verification.
+const SINGLE_SIG_COSIGNER_PREFIX: &str = "m/44'/111111'/0'";
+
+/// Multisig 2-of-3 fixture's BIP-43 cosigner prefix.
+const MULTISIG_COSIGNER_PREFIX: &str = "m/45'/111111'/0'";
+
+/// Test relative path used across sign_for tests.
+const TEST_LEAF_RELATIVE_PATH: &str = "m/0/0";
+
+/// Test sighash digest: 32 bytes covering ASCII-printable values 0..32.
+const TEST_SIGHASH: [u8; 32] = [
+    0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15,
+    0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f, 0x20,
+];
+
+/// `SIG_HASH_ALL` byte value (`SigHashType::All.to_u8()` in the
+/// kaspa-consensus-core enum). Mirrored here to keep the assertion
+/// readable without a kaspa-consensus-core import in the test
+/// module.
+const SIG_HASH_ALL_BYTE: u8 = 0x01;
+
+/// Expected signature-plus-sighash-type blob length: 64-byte raw
+/// signature + 1-byte sighash type.
+const EXPECTED_SIG_BLOB_LEN: usize = 65;
+
+fn derive_leaf_xonly_pubkey(mnemonic_phrase: &str, cosigner_prefix: &str, relative: &str) -> secp256k1::XOnlyPublicKey {
+    use std::str::FromStr;
+
+    use kaspa_bip32::{DerivationPath, ExtendedPrivateKey, Language, Mnemonic, SecretKey};
+
+    let mnemonic = Mnemonic::new(mnemonic_phrase, Language::English).expect("mnemonic parses");
+    let seed = mnemonic.to_seed("");
+    let master = ExtendedPrivateKey::<SecretKey>::new(seed.as_bytes()).expect("master xpriv");
+    let prefix_path = DerivationPath::from_str(cosigner_prefix).expect("cosigner-prefix path parses");
+    let relative_path = DerivationPath::from_str(relative).expect("relative path parses");
+    let leaf = master.derive_path(&prefix_path).expect("cosigner walk").derive_path(&relative_path).expect("relative walk");
+    let secret = *leaf.private_key();
+    let keypair = secp256k1::Keypair::from_secret_key(secp256k1::SECP256K1, &secret);
+    keypair.x_only_public_key().0
+}
+
+fn derive_leaf_pubkey(mnemonic_phrase: &str, cosigner_prefix: &str, relative: &str) -> secp256k1::PublicKey {
+    use std::str::FromStr;
+
+    use kaspa_bip32::{DerivationPath, ExtendedPrivateKey, Language, Mnemonic, SecretKey};
+
+    let mnemonic = Mnemonic::new(mnemonic_phrase, Language::English).expect("mnemonic parses");
+    let seed = mnemonic.to_seed("");
+    let master = ExtendedPrivateKey::<SecretKey>::new(seed.as_bytes()).expect("master xpriv");
+    let prefix_path = DerivationPath::from_str(cosigner_prefix).expect("cosigner-prefix path parses");
+    let relative_path = DerivationPath::from_str(relative).expect("relative path parses");
+    let leaf = master.derive_path(&prefix_path).expect("cosigner walk").derive_path(&relative_path).expect("relative walk");
+    let secret = *leaf.private_key();
+    secp256k1::PublicKey::from_secret_key(secp256k1::SECP256K1, &secret)
+}
+
+fn singlekey_mnemonic() -> String {
+    let kf = keyfile::read_from_path(fixture("legacy_go_v1_singlekey.json")).unwrap();
+    let decrypted = keyfile::decrypt_mnemonics(&kf, b"test fixture passphrase").expect("decrypt");
+    decrypted[0].clone()
+}
+
+fn ecdsa_singlekey_mnemonic() -> String {
+    let kf = keyfile::read_from_path(fixture("legacy_go_v1_ecdsa_singlekey.json")).unwrap();
+    let decrypted = keyfile::decrypt_mnemonics(&kf, b"ecdsa test passphrase").expect("decrypt");
+    decrypted[0].clone()
+}
+
+#[test]
+fn test_sign_for_single_key_schnorr_returns_65_byte_blob_with_sighash_type() {
+    let src = open_legacy_derivable("legacy_go_v1_singlekey.json", b"test fixture passphrase");
+    let blob = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("sign_for succeeds");
+    assert_eq!(blob.len(), EXPECTED_SIG_BLOB_LEN, "Schnorr sig-with-hash-type blob is exactly 65 bytes");
+    assert_eq!(*blob.last().unwrap(), SIG_HASH_ALL_BYTE, "trailing byte must be SIG_HASH_ALL");
+}
+
+#[test]
+fn test_sign_for_single_key_ecdsa_returns_65_byte_blob_with_sighash_type() {
+    let src = open_legacy_derivable("legacy_go_v1_ecdsa_singlekey.json", b"ecdsa test passphrase");
+    let blob = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("sign_for succeeds");
+    assert_eq!(blob.len(), EXPECTED_SIG_BLOB_LEN, "ECDSA compact sig-with-hash-type blob is exactly 65 bytes");
+    assert_eq!(*blob.last().unwrap(), SIG_HASH_ALL_BYTE, "trailing byte must be SIG_HASH_ALL");
+}
+
+#[test]
+fn test_sign_for_rejects_out_of_range_cosigner_idx() {
+    let src = open_legacy_derivable("legacy_go_v1_singlekey.json", b"test fixture passphrase");
+    let err =
+        src.sign_for(1, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect_err("single-cosigner keyfile must reject cosigner_idx >= 1");
+    let msg = format!("{err}");
+    assert!(msg.contains("cosigner_idx"), "error must name the offending field: {msg}");
+}
+
+#[test]
+fn test_sign_for_rejects_short_sighash() {
+    let src = open_legacy_derivable("legacy_go_v1_singlekey.json", b"test fixture passphrase");
+    let short = [0u8; 16];
+    let err = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &short).expect_err("16-byte digest must be rejected");
+    let msg = format!("{err}");
+    assert!(msg.contains("32-byte sighash") || msg.contains("msg"), "error must surface the sighash-length mismatch: {msg}");
+}
+
+#[test]
+fn test_sign_for_schnorr_signature_verifies_under_derived_xonly_pubkey() {
+    let src = open_legacy_derivable("legacy_go_v1_singlekey.json", b"test fixture passphrase");
+    let blob = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("sign_for succeeds");
+    let sig_bytes: &[u8] = &blob[..64];
+    let sig = secp256k1::schnorr::Signature::from_slice(sig_bytes).expect("64-byte schnorr signature");
+
+    let mnemonic = singlekey_mnemonic();
+    let xonly = derive_leaf_xonly_pubkey(&mnemonic, SINGLE_SIG_COSIGNER_PREFIX, TEST_LEAF_RELATIVE_PATH);
+    let msg = secp256k1::Message::from_digest_slice(&TEST_SIGHASH).expect("digest");
+
+    secp256k1::SECP256K1
+        .verify_schnorr(&sig, &msg, &xonly)
+        .expect("Schnorr signature must verify under the derived leaf x-only pubkey");
+}
+
+#[test]
+fn test_sign_for_ecdsa_signature_verifies_under_derived_pubkey() {
+    let src = open_legacy_derivable("legacy_go_v1_ecdsa_singlekey.json", b"ecdsa test passphrase");
+    let blob = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("sign_for succeeds");
+    let sig_bytes: &[u8] = &blob[..64];
+    let sig = secp256k1::ecdsa::Signature::from_compact(sig_bytes).expect("64-byte compact ECDSA signature");
+
+    let mnemonic = ecdsa_singlekey_mnemonic();
+    let pubkey = derive_leaf_pubkey(&mnemonic, SINGLE_SIG_COSIGNER_PREFIX, TEST_LEAF_RELATIVE_PATH);
+    let msg = secp256k1::Message::from_digest_slice(&TEST_SIGHASH).expect("digest");
+
+    secp256k1::SECP256K1.verify_ecdsa(&msg, &sig, &pubkey).expect("ECDSA signature must verify under the derived leaf pubkey");
+}
+
+#[test]
+fn test_sign_for_ecdsa_signature_is_deterministic_rfc6979() {
+    let src = open_legacy_derivable("legacy_go_v1_ecdsa_singlekey.json", b"ecdsa test passphrase");
+    let a = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("first signing succeeds");
+    let b = src.sign_for(0, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("second signing succeeds");
+    assert_eq!(a, b, "ECDSA sign over RFC 6979 deterministic nonces must be byte-identical across invocations on the same (key, msg)");
+}
+
+#[test]
+fn test_sign_for_multisig_signs_with_specified_cosigner() {
+    let src = open_legacy_derivable("legacy_go_v1_multisig_2of3.json", b"multisig test passphrase");
+    // The 2-of-3 fixture holds 3 mnemonics. Signing with each cosigner index
+    // must succeed and the resulting signature must verify under the
+    // corresponding cosigner's derived leaf x-only pubkey.
+    let kf = keyfile::read_from_path(fixture("legacy_go_v1_multisig_2of3.json")).unwrap();
+    let decrypted = keyfile::decrypt_mnemonics(&kf, b"multisig test passphrase").expect("decrypt");
+    for (cosigner_idx, mnemonic) in decrypted.iter().enumerate() {
+        let cosigner_u32 = u32::try_from(cosigner_idx).unwrap();
+        let blob =
+            src.sign_for(cosigner_u32, TEST_LEAF_RELATIVE_PATH, &TEST_SIGHASH).expect("sign_for succeeds for valid cosigner_idx");
+        assert_eq!(blob.len(), EXPECTED_SIG_BLOB_LEN);
+        assert_eq!(*blob.last().unwrap(), SIG_HASH_ALL_BYTE);
+
+        let sig_bytes: &[u8] = &blob[..64];
+        let sig = secp256k1::schnorr::Signature::from_slice(sig_bytes).expect("schnorr signature");
+        let xonly = derive_leaf_xonly_pubkey(mnemonic, MULTISIG_COSIGNER_PREFIX, TEST_LEAF_RELATIVE_PATH);
+        let msg = secp256k1::Message::from_digest_slice(&TEST_SIGHASH).expect("digest");
+        secp256k1::SECP256K1
+            .verify_schnorr(&sig, &msg, &xonly)
+            .expect("multisig cosigner signature must verify under that cosigner's derived leaf x-only pubkey");
+    }
+}

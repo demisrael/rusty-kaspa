@@ -10,10 +10,9 @@ use kaspa_addresses::Address;
 use super::error::KeySourceError;
 use super::resolver::KeyChain;
 
-/// Base capability: every backend can name its cosigner count and
-/// produce a receiving / change address on demand. `sign_for` is a
-/// placeholder for the eventual signing surface; the sign module
-/// lands in a follow-on batch.
+/// Base capability: every backend can name its cosigner count,
+/// produce a receiving / change address, and sign a per-input
+/// sighash digest with one of its cosigner keys.
 pub trait KeySource {
     /// Number of cosigners the backend holds. `1` for single-sig.
     fn cosigner_count(&self) -> u32;
@@ -30,6 +29,22 @@ pub trait KeySource {
     /// `LegacyGoKeyfile` backend returns the next unused
     /// internal-chain address.
     fn change_address(&self) -> Result<Address, KeySourceError>;
+
+    /// Sign a 32-byte per-input sighash digest. `cosigner_idx`
+    /// selects which of the backend's available cosigner keys
+    /// signs (single-cosigner backends accept only `0`);
+    /// `derivation_path` is the path -- relative to the backend's
+    /// cosigner prefix -- that identifies the leaf signing key
+    /// (matches a `PartiallySignedInput.derivation_path`); `msg` is
+    /// the 32-byte sighash bytes the caller has already computed
+    /// for the input.
+    ///
+    /// Returns the 65-byte signature-plus-sighash-type blob that the
+    /// wire-format `PubKeySignaturePair.signature` field stores:
+    /// the 64-byte raw signature (Schnorr BIP-340 64-byte form, or
+    /// 64-byte compact ECDSA serialization), followed by a single
+    /// `SIG_HASH_ALL` byte.
+    fn sign_for(&self, cosigner_idx: u32, derivation_path: &str, msg: &[u8]) -> Result<Vec<u8>, KeySourceError>;
 }
 
 /// Optional capability: backends that hold a BIP-32 derivation

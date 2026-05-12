@@ -22,6 +22,8 @@ pub enum KeySourceError {
     Keyfile(#[from] KeyfileError),
     #[error("bip32 derivation error: {0}")]
     Bip32(#[from] kaspa_bip32::Error),
+    #[error("secp256k1 error: {0}")]
+    Secp256k1(#[from] secp256k1::Error),
     #[error("invalid keyfile field {field}: {reason}")]
     Invalid { field: &'static str, reason: String },
     #[error("redeem-script construction failed: {0}")]
