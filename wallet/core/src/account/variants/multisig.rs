@@ -3,8 +3,14 @@
 //!
 
 use crate::account::Inner;
+use crate::account::pskb::{PSKBSigner, PSKTGenerator, bundle_from_pskt_generator, pskb_signer_for_multisig_cosigner};
+use crate::account::{Fees, GenerationNotifier, PaymentDestination};
 use crate::derivation::{AddressDerivationManager, AddressDerivationManagerTrait};
 use crate::imports::*;
+use crate::tx::{Generator, GeneratorSettings, GeneratorSummary, Signer};
+use kaspa_bip32::{AddressType, ChildNumber, Prefix as KeyPrefix};
+use kaspa_txscript::{extract_script_pub_key_address, multisig_redeem_script};
+use kaspa_wallet_pskt::bundle::Bundle;
 
 pub const MULTISIG_ACCOUNT_KIND: &str = "kaspa-multisig-standard";
 
@@ -160,6 +166,44 @@ impl MultiSig {
     fn watch_only(&self) -> bool {
         self.prv_key_data_ids.is_none()
     }
+
+    /// Whether send/sweep/pskb_from_send_generator should route through the
+    /// single-signature signing path (P2PK) rather than the K-of-N multisig
+    /// signing path (P2SH-multisig).
+    ///
+    /// A single-cosigner multisig account derives a P2PK receive/change
+    /// address: see `create_address`, where `keys.len() <= 1` returns a P2PK
+    /// address rather than a P2SH-multisig address. Spending such an address
+    /// requires a single-sig `script_sig` (one signature push, no
+    /// redeem-script push); finalizing it through the K-of-N path emits a
+    /// P2SH-multisig `script_sig` shape and fails `OpCheckSig` at consensus
+    /// extract. Watch-only accounts (no local cosigner material) cannot
+    /// produce signatures via either path and are excluded here so the K-of-N
+    /// path's existing `MultisigInsufficientCosignerMaterial` error surfaces
+    /// to the caller.
+    ///
+    /// Source: `Address` in `libkaspawallet/keypair.go` (1-of-1 branch
+    /// returns `p2pkAddress`).
+    /// Source: `ExtractTransaction` in `libkaspawallet/transaction.go`
+    /// (per-input branch on `PubKeySignaturePairs` count: multi-pair builds
+    /// P2SH-multisig `sigScript`, single-pair builds P2PK `sigScript`).
+    fn route_as_single_sig(&self) -> bool {
+        // Single xpub (P2PK address shape per `derivation::create_address`)
+        // AND exactly one local cosigner key-data id, which is the operator's
+        // seed and the only signer needed for the P2PK spend. Watch-only
+        // (`None`) and any malformed multi-id-with-single-xpub construction
+        // fall through to the K-of-N branch, whose error path remains the
+        // single observable for missing cosigner material.
+        self.xpub_keys.len() == 1 && self.prv_key_data_ids.as_ref().map(|ids| ids.len()) == Some(1)
+    }
+
+    /// Load the single local cosigner's key data for the P2PK send routing
+    /// branch. Precondition: `route_as_single_sig` returned `true`, which
+    /// guarantees `prv_key_data_ids` is `Some(_)` with exactly one entry.
+    async fn load_sole_cosigner_keydata(&self, wallet_secret: &Secret) -> Result<PrvKeyData> {
+        let id = self.prv_key_data_ids.as_ref().expect("route_as_single_sig guarantees Some(_)")[0];
+        self.inner.store().as_prv_key_data_store()?.load_key_data(wallet_secret, &id).await?.ok_or(Error::PrivateKeyNotFound(id))
+    }
 }
 
 #[async_trait]
@@ -248,6 +292,367 @@ impl Account for MultiSig {
     fn as_derivation_capable(self: Arc<Self>) -> Result<Arc<dyn DerivationCapableAccount>> {
         Ok(self.clone())
     }
+
+    /// Build, sign, and submit transactions spending this multisig account.
+    ///
+    /// Routing decision: `route_as_single_sig` (single xpub + single local
+    /// cosigner id) takes the P2PK `Signer` path -- one signature push, no
+    /// redeem-script push. Every other shape, including watch-only and any
+    /// malformed single-xpub-with-multi-id construction, falls through to the
+    /// K-of-N PSKB path which assembles `build_multisig_signed_bundle` from
+    /// the local cosigner key-data ids and broadcasts via `pskb_broadcast`;
+    /// `MultisigInsufficientCosignerMaterial` surfaces when `prv_key_data_ids`
+    /// is absent. See `route_as_single_sig` for the P2PK branch rationale.
+    async fn send(
+        self: Arc<Self>,
+        destination: PaymentDestination,
+        fee_rate: Option<f64>,
+        priority_fee_sompi: Fees,
+        payload: Option<Vec<u8>>,
+        wallet_secret: Secret,
+        payment_secret: Option<Secret>,
+        abortable: &Abortable,
+        notifier: Option<GenerationNotifier>,
+    ) -> Result<(GeneratorSummary, Vec<kaspa_hashes::Hash>)> {
+        if self.route_as_single_sig() {
+            let keydata = self.load_sole_cosigner_keydata(&wallet_secret).await?;
+            let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
+            let settings = GeneratorSettings::try_new_with_account(
+                self.clone().as_dyn_arc(),
+                destination,
+                fee_rate,
+                priority_fee_sompi,
+                payload,
+            )?;
+            let generator = Generator::try_new(settings, Some(signer), Some(abortable))?;
+
+            let mut stream = generator.stream();
+            let mut ids = vec![];
+            while let Some(transaction) = stream.try_next().await? {
+                transaction.try_sign()?;
+                ids.push(transaction.try_submit(&self.wallet().rpc_api()).await?);
+
+                if let Some(notifier) = notifier.as_ref() {
+                    notifier(&transaction);
+                }
+                yield_executor().await;
+            }
+
+            return Ok((generator.summary(), ids));
+        }
+
+        let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let prv_key_data_ids: Vec<PrvKeyDataId> = self
+            .prv_key_data_ids
+            .as_ref()
+            .ok_or(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures })?
+            .as_ref()
+            .clone();
+        let settings =
+            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, fee_rate, priority_fee_sompi, payload)?;
+
+        let (bundle, summary) = build_multisig_signed_bundle(
+            self.clone().as_dyn_arc(),
+            xpub_keys_strings,
+            prv_key_data_ids,
+            self.minimum_signatures,
+            settings,
+            wallet_secret,
+            payment_secret,
+            abortable,
+            notifier,
+        )
+        .await?;
+
+        let ids = self.clone().as_dyn_arc().pskb_broadcast(&bundle).await?;
+        Ok((summary, ids))
+    }
+
+    /// Drain every spendable UTXO to a fresh change address and broadcast.
+    ///
+    /// Same routing decision as `send`: `route_as_single_sig` -> P2PK `Signer`
+    /// path; everything else falls through to the K-of-N PSKB path via
+    /// `build_multisig_signed_bundle` + `pskb_broadcast`, with
+    /// `MultisigInsufficientCosignerMaterial` surfacing when local cosigner
+    /// material is absent. See `route_as_single_sig` for the P2PK branch
+    /// rationale.
+    async fn sweep(
+        self: Arc<Self>,
+        wallet_secret: Secret,
+        payment_secret: Option<Secret>,
+        fee_rate: Option<f64>,
+        abortable: &Abortable,
+        notifier: Option<GenerationNotifier>,
+    ) -> Result<(GeneratorSummary, Vec<kaspa_hashes::Hash>)> {
+        if self.route_as_single_sig() {
+            let keydata = self.load_sole_cosigner_keydata(&wallet_secret).await?;
+            let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
+            let settings = GeneratorSettings::try_new_with_account(
+                self.clone().as_dyn_arc(),
+                PaymentDestination::Change,
+                fee_rate,
+                Fees::None,
+                None,
+            )?;
+            let generator = Generator::try_new(settings, Some(signer), Some(abortable))?;
+
+            let mut stream = generator.stream();
+            let mut ids = vec![];
+            while let Some(transaction) = stream.try_next().await? {
+                transaction.try_sign()?;
+                ids.push(transaction.try_submit(&self.wallet().rpc_api()).await?);
+
+                if let Some(notifier) = notifier.as_ref() {
+                    notifier(&transaction);
+                }
+                yield_executor().await;
+            }
+
+            return Ok((generator.summary(), ids));
+        }
+
+        let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let prv_key_data_ids: Vec<PrvKeyDataId> = self
+            .prv_key_data_ids
+            .as_ref()
+            .ok_or(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures })?
+            .as_ref()
+            .clone();
+        let settings = GeneratorSettings::try_new_with_account(
+            self.clone().as_dyn_arc(),
+            PaymentDestination::Change,
+            fee_rate,
+            Fees::None,
+            None,
+        )?;
+
+        let (bundle, summary) = build_multisig_signed_bundle(
+            self.clone().as_dyn_arc(),
+            xpub_keys_strings,
+            prv_key_data_ids,
+            self.minimum_signatures,
+            settings,
+            wallet_secret,
+            payment_secret,
+            abortable,
+            notifier,
+        )
+        .await?;
+
+        let ids = self.clone().as_dyn_arc().pskb_broadcast(&bundle).await?;
+        Ok((summary, ids))
+    }
+
+    /// Build a signed PSKT bundle for the spend without broadcasting.
+    ///
+    /// Same routing decision as `send`: `route_as_single_sig` -> P2PK path,
+    /// driven through `PSKBSigner` + `PSKTGenerator` rather than the
+    /// stream-and-submit `Signer` shape used by `send`/`sweep`. The K-of-N
+    /// fall-through reuses `build_multisig_signed_bundle` and returns the
+    /// bundle directly, leaving broadcast to the caller. See
+    /// `route_as_single_sig` for the P2PK branch rationale.
+    async fn pskb_from_send_generator(
+        self: Arc<Self>,
+        destination: PaymentDestination,
+        fee_rate: Option<f64>,
+        priority_fee_sompi: Fees,
+        payload: Option<Vec<u8>>,
+        wallet_secret: Secret,
+        payment_secret: Option<Secret>,
+        abortable: &Abortable,
+    ) -> Result<Bundle, Error> {
+        if self.route_as_single_sig() {
+            let keydata = self.load_sole_cosigner_keydata(&wallet_secret).await?;
+            let signer = Arc::new(PSKBSigner::new(self.clone().as_dyn_arc(), keydata, payment_secret));
+            let settings = GeneratorSettings::try_new_with_account(
+                self.clone().as_dyn_arc(),
+                destination,
+                fee_rate,
+                priority_fee_sompi,
+                payload,
+            )?;
+            let generator = Generator::try_new(settings, None, Some(abortable))?;
+            let pskt_generator = PSKTGenerator::new(generator, signer, self.wallet().address_prefix()?);
+            return bundle_from_pskt_generator(pskt_generator).await;
+        }
+
+        let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let prv_key_data_ids: Vec<PrvKeyDataId> = self
+            .prv_key_data_ids
+            .as_ref()
+            .ok_or(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures })?
+            .as_ref()
+            .clone();
+        let settings =
+            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, fee_rate, priority_fee_sompi, payload)?;
+
+        let (bundle, _summary) = build_multisig_signed_bundle(
+            self.clone().as_dyn_arc(),
+            xpub_keys_strings,
+            prv_key_data_ids,
+            self.minimum_signatures,
+            settings,
+            wallet_secret,
+            payment_secret,
+            abortable,
+            None,
+        )
+        .await?;
+        Ok(bundle)
+    }
+}
+
+/// Build a fully-signed PSKB across the operator's local cosigner set.
+///
+/// Algorithm: build the empty PSKT bundle once via the standard PSKBSigner
+/// machinery (the placeholder signer is held but never invoked during stream
+/// polling), then iterate over the local cosigner key-data IDs. Each
+/// iteration's per-cosigner signature accumulates via `Input::add`
+/// (per-input `partial_sigs` merge with previous-outpoint validation). A
+/// per-input K-cap break-out gate caps the bundle at exactly K signatures
+/// per input; `OpCheckMultiSig` pops K, and any L-K leftover signatures
+/// trip the `CleanStack` consensus check.
+#[allow(clippy::too_many_arguments)]
+pub(crate) async fn build_multisig_signed_bundle(
+    account: Arc<dyn Account>,
+    xpub_keys_strings: Vec<String>,
+    prv_key_data_ids: Vec<PrvKeyDataId>,
+    minimum_signatures: u16,
+    settings: GeneratorSettings,
+    wallet_secret: Secret,
+    payment_secret: Option<Secret>,
+    abortable: &Abortable,
+    _notifier: Option<GenerationNotifier>,
+) -> Result<(Bundle, GeneratorSummary)> {
+    let k = minimum_signatures;
+    let l = prv_key_data_ids.len();
+    if prv_key_data_ids.is_empty() || l < k as usize {
+        return Err(Error::MultisigInsufficientCosignerMaterial { local: l, required: k });
+    }
+
+    let network_id = account.wallet().clone().network_id()?;
+    let prv_key_data_store = account.wallet().store().as_prv_key_data_store()?;
+
+    // BIP-32 derivation step shared across every cosigner in this multisig account; the
+    // same value drives the redeem-script's pubkey list at `AddressDerivationManager::new`.
+    // Per-cosigner sign-time derivation must reuse it; a per-cosigner positional value
+    // would derive each non-anchor cosigner's signing key off a slot that does not match
+    // the redeem-script's pubkey at the cosigner's index.
+    let multisig_derivation_index = account.clone().as_derivation_capable()?.cosigner_index();
+
+    // PSKTGenerator requires a PSKBSigner by construction but does not invoke
+    // it during stream polling; the placeholder uses the first cosigner's
+    // keydata.
+    let placeholder_keydata = prv_key_data_store
+        .load_key_data(&wallet_secret, &prv_key_data_ids[0])
+        .await?
+        .ok_or(Error::PrivateKeyNotFound(prv_key_data_ids[0]))?;
+    let placeholder_signer = Arc::new(PSKBSigner::new(account.clone(), placeholder_keydata, payment_secret.clone()));
+
+    let generator = Generator::try_new(settings, None, Some(abortable))?;
+    let pskt_generator = PSKTGenerator::new(generator.clone(), placeholder_signer, account.wallet().address_prefix()?);
+    let mut accumulator = bundle_from_pskt_generator(pskt_generator).await?;
+
+    // Populate `redeem_script` on every PSKT input. The PSKT-conversion path
+    // (`wallet/pskt/src/convert.rs::Inner::try_from`) builds inputs without populating
+    // this field; the Finalizer's `Some(redeem_script)` branch is what assembles
+    // a P2SH-multisig `script_sig` of the shape `OpData65 || sig_1 || sighash_type
+    // || ... || OpData65 || sig_K || sighash_type || PUSHDATA(redeem_script)`.
+    // Without `redeem_script`, the Finalizer's `None` branch emits sigs with no trailing
+    // redeem-script push; consensus-script-verify then fails P2SH BLAKE2B match and
+    // returns `EvalFalse` at extract.
+    //
+    // The redeem_script per input is `multisig_redeem_script(slot_pubkeys, K)` where
+    // `slot_pubkeys[i] = xpub_keys[i].derive_child(cosigner_index).derive_child(address_type)
+    // .derive_child(address_index).public_key()` -- the same reduction the
+    // `AddressDerivationManager` walks when assembling the receive/change address. The
+    // `(address_type, address_index)` pair is recovered from the input's UTXO address
+    // via the same `addresses_indexes` lookup `pskb_signer_for_multisig_cosigner` uses
+    // for per-cosigner key resolution.
+    {
+        let derivation_capable = account.clone().as_derivation_capable()?;
+        let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?.clone();
+        for pskt_inner in accumulator.0.iter_mut() {
+            for input in pskt_inner.inputs.iter_mut() {
+                if input.redeem_script.is_some() {
+                    continue;
+                }
+                let utxo_entry = input.utxo_entry.as_ref().ok_or_else(|| Error::custom("input missing utxo_entry"))?;
+                let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
+                let address_ref = &address;
+                let (receive_idxs, change_idxs) = derivation_capable.derivation().addresses_indexes(&[address_ref])?;
+                let (address_type, address_index) = if let Some((_, idx)) = receive_idxs.first() {
+                    (AddressType::Receive, *idx)
+                } else if let Some((_, idx)) = change_idxs.first() {
+                    (AddressType::Change, *idx)
+                } else {
+                    return Err(Error::custom(format!("address {address} not in derivation manager")));
+                };
+                let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+                for xpub in xpub_keys.iter() {
+                    let derived = xpub
+                        .clone()
+                        .derive_child(ChildNumber::new(multisig_derivation_index, false)?)?
+                        .derive_child(ChildNumber::new(address_type.index(), false)?)?
+                        .derive_child(ChildNumber::new(address_index, false)?)?;
+                    slot_pubkeys.push(*derived.public_key());
+                }
+                let redeem_script =
+                    multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)?;
+                input.redeem_script = Some(redeem_script);
+            }
+        }
+    }
+
+    for prv_key_data_id in prv_key_data_ids.iter() {
+        let already_fully_signed =
+            accumulator.iter().all(|pskt_inner| pskt_inner.inputs.iter().all(|input| input.partial_sigs.len() >= k as usize));
+        if already_fully_signed {
+            break;
+        }
+
+        let prv_key_data = prv_key_data_store
+            .load_key_data(&wallet_secret, prv_key_data_id)
+            .await?
+            .ok_or(Error::PrivateKeyNotFound(*prv_key_data_id))?;
+
+        let this_xpub = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?;
+        let this_xpub_string = this_xpub.to_string(Some(KeyPrefix::XPUB));
+
+        // Validate the cosigner's seed is part of the multisig set. Use a linear scan: the
+        // re-emitted `xpub_keys_strings` vector preserves the persisted vector's order,
+        // which is not guaranteed to be sorted under the xpub-prefix form (a wallet
+        // persisted under a code path that did not normalize xpub prefixes stores the
+        // vector in a mixed-prefix sort order whose entries reorder when re-encoded as `xpub`).
+        if !xpub_keys_strings.iter().any(|s| s == &this_xpub_string) {
+            return Err(Error::MultisigCosignerXpubNotFound { prv_key_data_id: *prv_key_data_id, derived_xpub: this_xpub_string });
+        }
+
+        let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+            &accumulator,
+            account.clone(),
+            &prv_key_data,
+            payment_secret.as_ref(),
+            multisig_derivation_index,
+            network_id,
+        )
+        .await?;
+
+        if accumulator.0.len() != per_cosigner_bundle.0.len() {
+            return Err(Error::custom("multisig signed bundle PSKT count mismatch with accumulator"));
+        }
+        for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
+            if accumulator.0[pskt_idx].inputs.len() != signed_pskt_inner.inputs.len() {
+                return Err(Error::custom("multisig signed bundle PSKT input count mismatch with accumulator"));
+            }
+            for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).map_err(|e| Error::custom(e.to_string()))?;
+            }
+        }
+    }
+
+    Ok((accumulator, generator.summary()))
 }
 
 impl DerivationCapableAccount for MultiSig {
@@ -257,6 +662,16 @@ impl DerivationCapableAccount for MultiSig {
 
     fn account_index(&self) -> u64 {
         0
+    }
+
+    /// Override the trait-default `cosigner_index() -> 0` with the value persisted on the
+    /// multisig account at create-time. The same value is fed to `AddressDerivationManager`
+    /// as the shared BIP-32 derivation step applied to every cosigner's xpub when assembling
+    /// the redeem-script's pubkey list. Sign-time per-cosigner key derivation MUST use the
+    /// same value or the signing key's pubkey will not match the redeem-script slot it
+    /// occupies, producing an `EvalFalse` consensus rejection at PSKT extract.
+    fn cosigner_index(&self) -> u32 {
+        self.cosigner_index.map(|v| v as u32).unwrap_or(0)
     }
 }
 
