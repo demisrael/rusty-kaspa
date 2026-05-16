@@ -720,7 +720,7 @@ impl Wallet {
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
         prv_key_data_args: Vec<PrvKeyDataArgs>,
-        mut xpub_keys: Vec<String>,
+        xpub_keys: Vec<String>,
         account_name: Option<String>,
         minimum_signatures: u16,
     ) -> Result<Arc<dyn Account>> {
@@ -744,8 +744,7 @@ impl Wallet {
             }
 
             generated_xpubs.sort_unstable();
-            xpub_keys.extend_from_slice(generated_xpubs.as_slice());
-            xpub_keys.sort_unstable();
+            let xpub_keys = normalize_and_merge_xpubs(xpub_keys, &generated_xpubs, minimum_signatures)?;
 
             let min_cosigner_index =
                 generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
@@ -1668,16 +1667,6 @@ impl Wallet {
         minimum_signatures: u16,
         additional_xpub_keys: Vec<String>,
     ) -> Result<Arc<dyn Account>> {
-        let mut additional_xpub_keys = additional_xpub_keys
-            .into_iter()
-            .map(|xpub| {
-                ExtendedKey::from_str(&xpub).map(|mut xpub| {
-                    xpub.prefix = KeyPrefix::XPUB;
-                    xpub.to_string()
-                })
-            })
-            .collect::<Result<Vec<_>, kaspa_bip32::Error>>()?;
-
         let mut generated_xpubs = Vec::with_capacity(mnemonics_secrets.len());
         let mut prv_key_data_ids = Vec::with_capacity(mnemonics_secrets.len());
         let prv_key_data_store = self.store().as_prv_key_data_store()?;
@@ -1695,9 +1684,7 @@ impl Wallet {
         }
 
         generated_xpubs.sort_unstable();
-        additional_xpub_keys.extend_from_slice(generated_xpubs.as_slice());
-        let mut xpub_keys = additional_xpub_keys;
-        xpub_keys.sort_unstable();
+        let xpub_keys = normalize_and_merge_xpubs(additional_xpub_keys, &generated_xpubs, minimum_signatures)?;
 
         let min_cosigner_index =
             generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
@@ -1778,6 +1765,86 @@ impl Wallet {
     pub fn network_format_xpub(&self, xpub_key: &ExtendedPublicKeySecp256k1) -> String {
         NetworkTaggedXpub::from((xpub_key.clone(), self.network_id().unwrap())).to_string()
     }
+}
+
+/// Normalize every user-supplied xpub to the canonical `xpub` BIP-32 prefix,
+/// merge with the wallet-generated xpub set into a single sorted vector, and
+/// validate that the resulting K-of-N parameters fit consensus rules.
+///
+/// Validation order:
+/// 1. `min_sigs >= 1`.
+/// 2. The final cosigner count `N` does not exceed
+///    `kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG` (the consensus
+///    `OpCheckMultiSig` stack-pubkey-count cap).
+/// 3. `min_sigs <= N` (otherwise the signature threshold is mathematically
+///    unreachable).
+/// 4. The Schnorr P2SH redeem script predicted from `(min_sigs, N)` fits
+///    the consensus script-element-size limit
+///    `kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE`. The script_sig that
+///    spends a P2SH multisig pushes the redeem script as a single
+///    PUSHDATA element; an element above the limit cannot be pushed.
+///
+/// `sorted_generated_xpubs` MUST already be sorted in ascending lexicographic
+/// order so callers can subsequently resolve a cosigner's position via
+/// `binary_search`. Network-version prefixes (`ktub`, `kpub`, `tpub`, `ypub`,
+/// `zpub`) carry no key material; the base58-decoded key bytes are
+/// prefix-invariant, so re-encoding under `KeyPrefix::XPUB` preserves the
+/// parsed public key while making the lexicographic-sort order deterministic
+/// across both code paths that build a multisig account.
+pub(crate) fn normalize_and_merge_xpubs(
+    user_xpubs: Vec<String>,
+    sorted_generated_xpubs: &[String],
+    min_sigs: u16,
+) -> Result<Vec<String>> {
+    let mut normalized: Vec<String> = user_xpubs
+        .into_iter()
+        .map(|xpub| {
+            ExtendedKey::from_str(&xpub).map(|mut xpub| {
+                xpub.prefix = KeyPrefix::XPUB;
+                xpub.to_string()
+            })
+        })
+        .collect::<Result<Vec<_>, kaspa_bip32::Error>>()?;
+    normalized.extend_from_slice(sorted_generated_xpubs);
+    normalized.sort_unstable();
+
+    let n = normalized.len();
+    let max = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
+    if n > max {
+        return Err(Error::MultisigPubKeyCountExceedsConsensus { count: n, max });
+    }
+    if min_sigs == 0 || (min_sigs as usize) > n {
+        return Err(Error::MultisigInvalidThreshold { k: min_sigs, n });
+    }
+    let predicted = predicted_schnorr_redeem_script_size(min_sigs, n);
+    if predicted > kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE {
+        return Err(Error::MultisigRedeemScriptExceedsElementSize { size: predicted, max: kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE });
+    }
+    // After sort, duplicate xpubs are adjacent; reject so the redeem script's
+    // pubkey list does not collapse two cosigners onto the same slot (a single
+    // signer producing two signatures could otherwise satisfy K of the
+    // collapsed slots).
+    if let Some(window) = normalized.windows(2).find(|w| w[0] == w[1]) {
+        return Err(Error::MultisigDuplicateXpub { xpub: window[0].clone() });
+    }
+
+    Ok(normalized)
+}
+
+/// Predict the byte size of the canonical Schnorr P2SH multisig redeem script
+/// for given `(min_sigs, n)` -- matching what `kaspa_txscript::multisig_redeem_script`
+/// emits -- so creation can refuse parameter combinations that would not fit a
+/// single P2SH PUSHDATA element.
+///
+/// Layout: `K` (1 or 2 bytes) + `N` 32-byte Schnorr pubkey pushdatas (1 + 32
+/// bytes each) + `N` (1 or 2 bytes) + `OpCheckMultiSig` (1 byte). Values
+/// 1..=16 emit as a single small-int opcode; values 17..127 emit as a
+/// one-byte PUSHDATA (`OpData1` + value byte).
+const fn predicted_schnorr_redeem_script_size(min_sigs: u16, n: usize) -> usize {
+    const SCHNORR_PUBKEY_PUSH_LEN: usize = 1 + secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE;
+    let k_bytes = if (min_sigs as usize) <= 16 { 1 } else { 2 };
+    let n_bytes = if n <= 16 { 1 } else { 2 };
+    k_bytes + SCHNORR_PUBKEY_PUSH_LEN * n + n_bytes + 1
 }
 
 // fn decrypt_mnemonic<T: AsRef<[u8]>>(
