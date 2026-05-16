@@ -121,6 +121,7 @@ features = [
 home.workspace = true
 
 [dev-dependencies]
+blake2b_simd.workspace = true
 hex-literal.workspace = true
 serde_repr.workspace = true
 

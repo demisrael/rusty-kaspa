@@ -3995,6 +3995,7 @@ dependencies = [
  "async-lock",
  "async-trait",
  "base64",
+ "blake2b_simd",
  "borsh",
  "cfb-mode",
  "cfg-if 1.0.0",

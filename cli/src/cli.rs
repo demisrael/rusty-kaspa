@@ -5,9 +5,11 @@ use crate::modules::miner::Miner;
 use crate::modules::node::Node;
 use crate::notifier::{Notification, Notifier};
 use crate::result::Result;
+use kaspa_bip32::{Language, Mnemonic, WordCount};
 use kaspa_daemon::{DaemonEvent, DaemonKind, Daemons};
 use kaspa_wallet_core::account::Account;
 use kaspa_wallet_core::rpc::DynRpcApi;
+use kaspa_wallet_core::storage::keydata::PrvKeyDataVariantKind;
 use kaspa_wallet_core::storage::{IdT, PrvKeyDataInfo};
 use kaspa_wrpc_client::{KaspaRpcClient, Resolver};
 use workflow_core::channel::*;
@@ -680,6 +682,92 @@ impl KaspaCli {
         tprintln!(self, "\nselecting private key: {prv_key_data_info}\n");
 
         Ok(prv_key_data_info)
+    }
+
+    pub async fn select_private_key_or_create(&self) -> Result<Arc<PrvKeyDataInfo>> {
+        let mut selection = None;
+        let mut flat_list = Vec::<Arc<PrvKeyDataInfo>>::new();
+
+        let mut keys = self.wallet.keys().await?;
+        while let Some(key) = keys.try_next().await? {
+            flat_list.push(key);
+        }
+
+        while selection.is_none() {
+            tprintln!(self);
+            flat_list.iter().enumerate().for_each(|(seq, prv_key_data_info)| {
+                tprintln!(self, "    {seq}: {prv_key_data_info}");
+            });
+            tprintln!(self, "    N: Create a new mnemonic private key");
+            tprintln!(self);
+
+            let range = if flat_list.len() > 1 { format!("[{}..{}] or ", 0, flat_list.len() - 1) } else { "".to_string() };
+            let text = self
+                .term()
+                .ask(false, &format!("Please select private key {range}N, or <enter> to abort: "))
+                .await?
+                .trim()
+                .to_string();
+            if text.is_empty() {
+                return Err(Error::UserAbort);
+            }
+            if text.eq_ignore_ascii_case("n") {
+                let prv_key_data_info = self.create_mnemonic_private_key_interactive().await?;
+                tprintln!(self, "\nselecting private key: {prv_key_data_info}\n");
+                return Ok(prv_key_data_info);
+            }
+            match text.parse::<usize>() {
+                Ok(seq) if seq < flat_list.len() => selection = flat_list.get(seq).cloned(),
+                _ => {}
+            };
+        }
+
+        let prv_key_data_info = selection.unwrap();
+        tprintln!(self, "\nselecting private key: {prv_key_data_info}\n");
+        Ok(prv_key_data_info)
+    }
+
+    async fn create_mnemonic_private_key_interactive(&self) -> Result<Arc<PrvKeyDataInfo>> {
+        let word_count_answer = self.term().ask(false, "Mnemonic length in words (12 or 24, press <enter> for default 24): ").await?;
+        let word_count = match word_count_answer.trim() {
+            "" | "24" => WordCount::Words24,
+            "12" => WordCount::Words12,
+            other => {
+                return Err(Error::Custom(format!("invalid mnemonic word count '{other}'; expected 12 or 24")));
+            }
+        };
+
+        let payment_secret = self.term().ask(true, "Enter bip39 mnemonic passphrase (optional): ").await?;
+        let payment_secret =
+            if payment_secret.trim().is_empty() { None } else { Some(Secret::new(payment_secret.trim().as_bytes().to_vec())) };
+        if let Some(payment_secret) = payment_secret.as_ref() {
+            let payment_secret_validate =
+                Secret::new(self.term().ask(true, "Please re-enter mnemonic passphrase: ").await?.trim().as_bytes().to_vec());
+            if payment_secret_validate.as_ref() != payment_secret.as_ref() {
+                return Err(Error::PaymentSecretMatch);
+            }
+        }
+
+        let mnemonic = Mnemonic::random(word_count, Language::default())?;
+        tprintln!(self, "");
+        tprintln!(self, "{}", style("IMPORTANT:").red());
+        tprintln!(self, "Back up this mnemonic before continuing. It controls every account created from this key.");
+        tprintln!(self, "");
+        tprintln!(self, "{}", mnemonic.phrase());
+        tprintln!(self, "");
+        let confirm = self.term().ask(false, "Type 'yes' after you have backed it up: ").await?;
+        if confirm.trim() != "yes" {
+            return Err(Error::UserAbort);
+        }
+
+        let wallet_secret = Secret::new(self.term().ask(true, "Enter wallet password: ").await?.trim().as_bytes().to_vec());
+        if wallet_secret.as_ref().is_empty() {
+            return Err(Error::WalletSecretRequired);
+        }
+        let args =
+            PrvKeyDataCreateArgs::new(None, payment_secret, Secret::from(mnemonic.phrase_string()), PrvKeyDataVariantKind::Mnemonic);
+        let prv_key_data_id = self.wallet.create_prv_key_data(&wallet_secret, args).await?;
+        self.wallet.store().as_prv_key_data_store()?.load_key_info(&prv_key_data_id).await?.ok_or(Error::KeyDataNotFound)
     }
 
     pub async fn list(&self) -> Result<()> {

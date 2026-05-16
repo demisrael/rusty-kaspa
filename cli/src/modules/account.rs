@@ -5,6 +5,21 @@ use kaspa_wallet_core::account::MULTISIG_ACCOUNT_KIND;
 use crate::imports::*;
 use crate::wizards;
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum CreateKeySource {
+    StoredOnly,
+    StoredOrGenerate,
+    FreshLegacy,
+}
+
+fn create_key_source(account_kind: &AccountKind, explicit_kind: bool) -> CreateKeySource {
+    match account_kind.as_ref() {
+        LEGACY_ACCOUNT_KIND => CreateKeySource::FreshLegacy,
+        BIP32_ACCOUNT_KIND | MULTISIG_ACCOUNT_KIND if explicit_kind => CreateKeySource::StoredOrGenerate,
+        _ => CreateKeySource::StoredOnly,
+    }
+}
+
 #[derive(Default, Handler)]
 #[help("Account management operations")]
 pub struct Account;
@@ -42,11 +57,12 @@ impl Account {
                 }
             }
             "create" => {
-                let account_kind = if argv.is_empty() {
-                    BIP32_ACCOUNT_KIND.into()
-                } else {
+                let explicit_kind = !argv.is_empty();
+                let account_kind = if explicit_kind {
                     let kind = argv.remove(0);
                     kind.parse::<AccountKind>()?
+                } else {
+                    BIP32_ACCOUNT_KIND.into()
                 };
 
                 let account_name = if argv.is_empty() {
@@ -58,10 +74,17 @@ impl Account {
                     Some(name)
                 };
 
-                let prv_key_data_info = ctx.select_private_key().await?;
-
                 let account_name = account_name.as_deref();
-                wizards::account::create(&ctx, prv_key_data_info, account_kind, account_name).await?;
+                match create_key_source(&account_kind, explicit_kind) {
+                    CreateKeySource::StoredOnly | CreateKeySource::FreshLegacy => {
+                        let prv_key_data_info = ctx.select_private_key().await?;
+                        wizards::account::create(&ctx, prv_key_data_info, account_kind, account_name).await?;
+                    }
+                    CreateKeySource::StoredOrGenerate => {
+                        let prv_key_data_info = ctx.select_private_key_or_create().await?;
+                        wizards::account::create(&ctx, prv_key_data_info, account_kind, account_name).await?;
+                    }
+                };
             }
             "import" => {
                 if argv.is_empty() {
@@ -315,5 +338,36 @@ impl Account {
             .await?;
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn account_create_key_source_matches_final_create_table() {
+        let bip32: AccountKind = BIP32_ACCOUNT_KIND.into();
+        let multisig: AccountKind = MULTISIG_ACCOUNT_KIND.into();
+        let legacy: AccountKind = LEGACY_ACCOUNT_KIND.into();
+        let keypair: AccountKind = "keypair".parse().unwrap();
+
+        assert_eq!(create_key_source(&bip32, false), CreateKeySource::StoredOnly, "bare create uses stored-key picker only");
+        assert_eq!(
+            create_key_source(&bip32, true),
+            CreateKeySource::StoredOrGenerate,
+            "explicit bip32 create offers stored-or-generate picker",
+        );
+        assert_eq!(
+            create_key_source(&multisig, true),
+            CreateKeySource::StoredOrGenerate,
+            "explicit multisig create offers stored-or-generate picker",
+        );
+        assert_eq!(create_key_source(&legacy, true), CreateKeySource::FreshLegacy, "legacy create bypasses stored-key picker");
+        assert_eq!(
+            create_key_source(&keypair, true),
+            CreateKeySource::StoredOnly,
+            "unlisted explicit create kinds keep stored-key picker"
+        );
     }
 }
