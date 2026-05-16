@@ -6,6 +6,8 @@ use crate::imports::{AccountId, AccountKind, AssocPrvKeyDataIds, PrvKeyDataId};
 use base64::DecodeError;
 use downcast::DowncastError;
 use kaspa_bip32::Error as BIP32Error;
+use kaspa_bip32::Prefix as KeyPrefix;
+use kaspa_consensus_core::network::NetworkType;
 use kaspa_consensus_core::sign::Error as CoreSignError;
 use kaspa_rpc_core::RpcError as KaspaRpcError;
 use kaspa_wrpc_client::error::Error as KaspaWorkflowRpcError;
@@ -396,6 +398,9 @@ pub enum Error {
 
     #[error("Multisig cosigner set contains duplicate xpub: {xpub}")]
     MultisigDuplicateXpub { xpub: String },
+
+    #[error("Multisig user-supplied xpub uses prefix {supplied_prefix:?} which is not valid for wallet network {wallet_network:?}")]
+    MultisigXpubNetworkMismatch { supplied_prefix: KeyPrefix, wallet_network: NetworkType },
 }
 
 impl From<Aborted> for Error {

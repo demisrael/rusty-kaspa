@@ -725,61 +725,64 @@ impl Wallet {
         minimum_signatures: u16,
     ) -> Result<Arc<dyn Account>> {
         let account_store = self.inner.store.clone().as_account_store()?;
+        let wallet_network = self.network_id()?.network_type();
 
-        let account: Arc<dyn Account> = if prv_key_data_args.is_not_empty() {
-            let mut generated_xpubs = Vec::with_capacity(prv_key_data_args.len());
-            let mut prv_key_data_ids = Vec::with_capacity(prv_key_data_args.len());
-            for prv_key_data_arg in prv_key_data_args.into_iter() {
-                let PrvKeyDataArgs { prv_key_data_id, payment_secret } = prv_key_data_arg;
-                let prv_key_data = self
-                    .inner
-                    .store
-                    .as_prv_key_data_store()?
-                    .load_key_data(wallet_secret, &prv_key_data_id)
-                    .await?
-                    .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
-                let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
-                generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
-                prv_key_data_ids.push(prv_key_data_id);
-            }
+        // Derive an xpub per local seed; the cosigner_index and the
+        // prv_key_data_ids vector are populated only when the operator
+        // contributes one or more local seeds. The vectors are empty
+        // for an all-external-cosigner (watch-only) multisig.
+        let mut generated_xpubs = Vec::with_capacity(prv_key_data_args.len());
+        let mut prv_key_data_ids = Vec::with_capacity(prv_key_data_args.len());
+        for prv_key_data_arg in prv_key_data_args.into_iter() {
+            let PrvKeyDataArgs { prv_key_data_id, payment_secret } = prv_key_data_arg;
+            let prv_key_data = self
+                .inner
+                .store
+                .as_prv_key_data_store()?
+                .load_key_data(wallet_secret, &prv_key_data_id)
+                .await?
+                .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
+            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
+            generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
+            prv_key_data_ids.push(prv_key_data_id);
+        }
+        generated_xpubs.sort_unstable();
 
-            generated_xpubs.sort_unstable();
-            let xpub_keys = normalize_and_merge_xpubs(xpub_keys, &generated_xpubs, minimum_signatures)?;
+        // Unconditional construction-time guard set so the same checks
+        // (cross-network xpub, count cap, threshold bounds, redeem-script
+        // element-size, duplicate xpub) apply to both the local-seed-bearing
+        // and the all-external-cosigner paths; otherwise the watch-only
+        // path persists multisig accounts that the consensus engine would
+        // reject at first spend.
+        let xpub_keys = normalize_and_merge_xpubs(xpub_keys, &generated_xpubs, minimum_signatures, wallet_network)?;
 
-            let min_cosigner_index =
-                generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
-
-            let xpub_keys = xpub_keys
-                .into_iter()
-                .map(|xpub_key| {
-                    ExtendedPublicKeySecp256k1::from_str(&xpub_key).map_err(|err| Error::InvalidExtendedPublicKey(xpub_key, err))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            Arc::new(
-                multisig::MultiSig::try_new(
-                    self,
-                    account_name,
-                    Arc::new(xpub_keys),
-                    Some(Arc::new(prv_key_data_ids)),
-                    min_cosigner_index,
-                    minimum_signatures,
-                    false,
-                )
-                .await?,
-            )
+        let (prv_key_data_ids_opt, min_cosigner_index) = if prv_key_data_ids.is_empty() {
+            (None, None)
         } else {
-            let xpub_keys = xpub_keys
-                .into_iter()
-                .map(|xpub_key| {
-                    ExtendedPublicKeySecp256k1::from_str(&xpub_key).map_err(|err| Error::InvalidExtendedPublicKey(xpub_key, err))
-                })
-                .collect::<Result<Vec<_>>>()?;
-
-            Arc::new(
-                multisig::MultiSig::try_new(self, account_name, Arc::new(xpub_keys), None, None, minimum_signatures, false).await?,
-            )
+            let mci =
+                generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
+            (Some(Arc::new(prv_key_data_ids)), mci)
         };
+
+        let xpub_keys = xpub_keys
+            .into_iter()
+            .map(|xpub_key| {
+                ExtendedPublicKeySecp256k1::from_str(&xpub_key).map_err(|err| Error::InvalidExtendedPublicKey(xpub_key, err))
+            })
+            .collect::<Result<Vec<_>>>()?;
+
+        let account: Arc<dyn Account> = Arc::new(
+            multisig::MultiSig::try_new(
+                self,
+                account_name,
+                Arc::new(xpub_keys),
+                prv_key_data_ids_opt,
+                min_cosigner_index,
+                minimum_signatures,
+                false,
+            )
+            .await?,
+        );
 
         if account_store.load_single(account.id()).await?.is_some() {
             return Err(Error::AccountAlreadyExists(*account.id()));
@@ -1684,7 +1687,8 @@ impl Wallet {
         }
 
         generated_xpubs.sort_unstable();
-        let xpub_keys = normalize_and_merge_xpubs(additional_xpub_keys, &generated_xpubs, minimum_signatures)?;
+        let wallet_network = self.network_id()?.network_type();
+        let xpub_keys = normalize_and_merge_xpubs(additional_xpub_keys, &generated_xpubs, minimum_signatures, wallet_network)?;
 
         let min_cosigner_index =
             generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
@@ -1798,7 +1802,35 @@ pub(crate) fn normalize_and_merge_xpubs(
     user_xpubs: Vec<String>,
     sorted_generated_xpubs: &[String],
     min_sigs: u16,
+    wallet_network: kaspa_consensus_core::network::NetworkType,
 ) -> Result<Vec<String>> {
+    // Validate every user-supplied xpub's BIP-32 prefix against the
+    // wallet's network BEFORE the canonical prefix rewrite. The accept-list
+    // for kaspa-network-discriminating prefixes is `KPUB` on Mainnet and
+    // `KTUB` on Testnet / Simnet / Devnet (per `wallet/bip32/src/prefix.rs`).
+    // Foreign prefixes (`TPUB`, `YPUB`, `ZPUB`) and the canonical-stripped
+    // `XPUB` form are rejected at user-input time, since the canonical form
+    // is what the wallet PERSISTS internally after normalization and a
+    // user-supplied `XPUB` carries no recoverable network discriminator.
+    // Wallet-generated xpubs in `sorted_generated_xpubs` were emitted as
+    // `XPUB` at construction time on the wallet's own network by definition
+    // and bypass this check by virtue of not being in the user-supplied set.
+    // Already-persisted wallets whose `xpub_keys` carry `XPUB` entries also
+    // bypass: this validation runs at user-input time only, not on
+    // storage-read paths.
+    use kaspa_consensus_core::network::NetworkType;
+    for raw_xpub in user_xpubs.iter() {
+        let parsed = ExtendedKey::from_str(raw_xpub)?;
+        let accepted = matches!(
+            (parsed.prefix, wallet_network),
+            (KeyPrefix::KPUB, NetworkType::Mainnet)
+                | (KeyPrefix::KTUB, NetworkType::Testnet | NetworkType::Simnet | NetworkType::Devnet)
+        );
+        if !accepted {
+            return Err(Error::MultisigXpubNetworkMismatch { supplied_prefix: parsed.prefix, wallet_network });
+        }
+    }
+
     let mut normalized: Vec<String> = user_xpubs
         .into_iter()
         .map(|xpub| {
@@ -1839,15 +1871,25 @@ pub(crate) fn normalize_and_merge_xpubs(
 /// emits -- so creation can refuse parameter combinations that would not fit a
 /// single P2SH PUSHDATA element.
 ///
-/// Layout: `K` (1 or 2 bytes) + `N` 32-byte Schnorr pubkey pushdatas (1 + 32
-/// bytes each) + `N` (1 or 2 bytes) + `OpCheckMultiSig` (1 byte). Values
-/// 1..=16 emit as a single small-int opcode; values 17..127 emit as a
-/// one-byte PUSHDATA (`OpData1` + value byte).
-const fn predicted_schnorr_redeem_script_size(min_sigs: u16, n: usize) -> usize {
+/// Layout: `K` (`canonical_i64_size`) + `N` 32-byte Schnorr pubkey pushdatas
+/// (`1 + 32` bytes each) + `N` (`canonical_i64_size`) + `OpCheckMultiSig`
+/// (1 byte). The K/N integer-push sizes are delegated to
+/// [`kaspa_txscript::ScriptBuilder::canonical_i64_size`], which is the
+/// int-push counterpart of `canonical_data_size` and is branch-for-branch
+/// derived from `ScriptBuilder::add_i64` -- the same encoder
+/// `multisig_redeem_script` invokes. The cross-check test
+/// [`multisig_tests::predicted_schnorr_redeem_script_size_matches_canonical_builder`]
+/// guards the parametric K/N sweep against any future drift on either side.
+///
+/// Not `const fn`: `canonical_i64_size` calls `OpcodeData::<i64>::serialize`,
+/// which allocates a `Vec`. The sole caller in `normalize_and_merge_xpubs`
+/// runs in async/non-const context, so the downgrade has no callsite impact.
+fn predicted_schnorr_redeem_script_size(min_sigs: u16, n: usize) -> usize {
     const SCHNORR_PUBKEY_PUSH_LEN: usize = 1 + secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE;
-    let k_bytes = if (min_sigs as usize) <= 16 { 1 } else { 2 };
-    let n_bytes = if n <= 16 { 1 } else { 2 };
-    k_bytes + SCHNORR_PUBKEY_PUSH_LEN * n + n_bytes + 1
+    kaspa_txscript::script_builder::ScriptBuilder::canonical_i64_size(min_sigs as i64)
+        + SCHNORR_PUBKEY_PUSH_LEN * n
+        + kaspa_txscript::script_builder::ScriptBuilder::canonical_i64_size(n as i64)
+        + 1
 }
 
 // fn decrypt_mnemonic<T: AsRef<[u8]>>(
@@ -2049,6 +2091,17 @@ mod multisig_tests {
         xpub.to_string(Some(KeyPrefix::XPUB))
     }
 
+    /// Derive a user-supplied external xpub for the test wallet's network
+    /// (Testnet); the helper re-encodes the canonical XPUB form to KTUB so
+    /// it passes the cross-network prefix gate when threaded into
+    /// `Wallet::create_account_multisig` / `import_multisig_with_mnemonic`.
+    async fn external_xpub_for_testnet(phrase: &str) -> String {
+        let raw = xpub_from_mnemonic_phrase(phrase).await;
+        let mut k = kaspa_bip32::ExtendedKey::from_str(&raw).unwrap();
+        k.prefix = KeyPrefix::KTUB;
+        k.to_string()
+    }
+
     /// Generate `count` fresh random 24-word English BIP-39 mnemonics for
     /// in-test local-cosigner construction.
     async fn make_local_mnemonics(count: usize) -> Vec<Mnemonic> {
@@ -2059,12 +2112,13 @@ mod multisig_tests {
         out
     }
 
-    /// Every entry of the full BIP-32 PUBLIC prefix set `{xpub, kpub, ktub,
-    /// tpub, ypub, zpub}` supplied as the external xpub produces the same final
-    /// stored xpub set as an `xpub`-prefixed equivalent. The `normalize_and_merge_xpubs`
-    /// helper is the contract; exercising it directly with each prefix re-encoding
-    /// pins prefix invariance independent of `create_account_multisig` /
-    /// `import_multisig_with_mnemonic` plumbing.
+    /// Network-version prefixes carry no key material; for the wallet's own
+    /// network the supplied prefix re-encodes to the canonical `xpub` form
+    /// preserving the parsed public key. The cross-network gate narrows the user-input
+    /// accept-list to the network-discriminating kaspa prefixes (`KPUB` on
+    /// Mainnet, `KTUB` on Testnet/Simnet/Devnet); rejection of the other
+    /// four entries of the full BIP-32 PUBLIC prefix set is exercised by
+    /// the cross-network reject tests below.
     #[tokio::test]
     async fn multisig_xpub_prefix_invariant() {
         let canonical_xpub =
@@ -2076,16 +2130,24 @@ mod multisig_tests {
         let mut generated_xpubs = vec![generated_xpub.clone()];
         generated_xpubs.sort_unstable();
 
-        // 2-of-2 satisfies the new K-vs-N validation in the helper (K=2 = N=2 cosigners).
-        let canonical_output = normalize_and_merge_xpubs(vec![canonical_xpub.clone()], &generated_xpubs, 2).unwrap();
-
-        let prefixes = [KeyPrefix::XPUB, KeyPrefix::KPUB, KeyPrefix::KTUB, KeyPrefix::TPUB, KeyPrefix::YPUB, KeyPrefix::ZPUB];
-        for prefix in prefixes.iter().copied() {
+        // For each network, the accepted prefix re-encodes through the canonical
+        // form and yields a normalized vector whose `xpub`-encoded entries equal
+        // those produced from the canonical form via the wallet-generated bypass.
+        for (network, accepted_prefix) in [(NetworkType::Mainnet, KeyPrefix::KPUB), (NetworkType::Testnet, KeyPrefix::KTUB)] {
             let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical_xpub).unwrap();
-            reprefixed.prefix = prefix;
+            reprefixed.prefix = accepted_prefix;
             let user_xpub = reprefixed.to_string();
-            let output = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2).unwrap();
-            assert_eq!(output, canonical_output, "prefix {prefix:?} produced a different normalized set");
+
+            // Drive the canonical-form entry through `sorted_generated_xpubs` so it
+            // bypasses cross-network validation (wallet-generated xpubs are XPUB-form by
+            // construction and skip the user-input check).
+            let mut gens_with_canonical = generated_xpubs.clone();
+            gens_with_canonical.push(canonical_xpub.clone());
+            gens_with_canonical.sort_unstable();
+            let canonical_output = normalize_and_merge_xpubs(Vec::new(), &gens_with_canonical, 2, network).unwrap();
+
+            let output = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, network).unwrap();
+            assert_eq!(output, canonical_output, "prefix {accepted_prefix:?} on {network:?} produced a different normalized set");
         }
     }
 
@@ -2156,7 +2218,7 @@ mod multisig_tests {
     async fn multisig_post_import_open() {
         let mnemonics = make_local_mnemonics(2).await;
         let external_xpub =
-            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+            external_xpub_for_testnet("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
                 .await;
 
         let wallet = test_wallet().await;
@@ -2382,7 +2444,7 @@ mod multisig_tests {
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = local_mnemonics.iter().cloned().map(|m| (m, None)).collect();
         let mut external_xpubs: Vec<String> = Vec::with_capacity(externals);
         for em in external_mnemonics.iter() {
-            external_xpubs.push(xpub_from_mnemonic_phrase(em.phrase()).await);
+            external_xpubs.push(external_xpub_for_testnet(em.phrase()).await);
         }
 
         let wallet = test_wallet().await;
@@ -2557,7 +2619,7 @@ mod multisig_tests {
         let xpub =
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         let generated_xpubs: Vec<String> = vec![xpub; 222];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 111)
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 111, NetworkType::Testnet)
             .expect_err("222-cosigner multisig must be rejected before redeem-script construction");
         match err {
             Error::MultisigPubKeyCountExceedsConsensus { count, max } => {
@@ -2576,7 +2638,7 @@ mod multisig_tests {
         let xpub =
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         let generated_xpubs: Vec<String> = vec![xpub; 14];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 45)
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 45, NetworkType::Testnet)
             .expect_err("45-of-14 must be rejected before redeem-script construction");
         match err {
             Error::MultisigInvalidThreshold { k, n } => {
@@ -2605,7 +2667,7 @@ mod multisig_tests {
         let cells: &[(usize, usize)] = &[(16, 531), (17, 565), (18, 598), (19, 631), (20, 664)];
         for &(n, expected_size) in cells {
             let generated_xpubs: Vec<String> = vec![xpub.clone(); n];
-            let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 1)
+            let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 1, NetworkType::Testnet)
                 .expect_err("Schnorr multisig at boundary N must reject (redeem script exceeds element-size cap)");
             match err {
                 Error::MultisigRedeemScriptExceedsElementSize { size, max } => {
@@ -2628,7 +2690,7 @@ mod multisig_tests {
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         // Two identical xpubs, K=2 over N=2, well inside the count and element-size guards.
         let generated_xpubs: Vec<String> = vec![xpub.clone(); 2];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 2)
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 2, NetworkType::Testnet)
             .expect_err("duplicate-xpub multisig must be rejected at creation time");
         match err {
             Error::MultisigDuplicateXpub { xpub: dup } => {
@@ -2656,6 +2718,351 @@ mod multisig_tests {
             let actual = multisig_redeem_script(pubkeys.iter().copied(), k as usize).expect("canonical redeem script");
             let predicted = predicted_schnorr_redeem_script_size(k, n);
             assert_eq!(actual.len(), predicted, "predicted size must match canonical builder output for {k}-of-{n}");
+        }
+    }
+
+    /// Cross-network xpub rejection at the construction-time gate.
+    /// Parametrized across the four mismatched cells of the kaspa-network
+    /// accept-list (Mainnet wants KPUB, Testnet wants KTUB; the four
+    /// non-matching kaspa or canonical XPUB combinations are rejected)
+    /// plus the foreign-network cases (TPUB, YPUB). For each cell
+    /// `normalize_and_merge_xpubs` must return
+    /// `Error::MultisigXpubNetworkMismatch` naming the supplied prefix
+    /// and the wallet network; the helper is the contract surface both
+    /// `Wallet::create_account_multisig` and
+    /// `Wallet::import_multisig_with_mnemonic` route through, so a single
+    /// helper-level parametric covers both API paths.
+    #[tokio::test]
+    async fn multisig_create_rejects_cross_network_xpub() {
+        let canonical =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+        let cells: &[(NetworkType, KeyPrefix)] = &[
+            (NetworkType::Mainnet, KeyPrefix::KTUB),
+            (NetworkType::Testnet, KeyPrefix::KPUB),
+            (NetworkType::Mainnet, KeyPrefix::XPUB),
+            (NetworkType::Testnet, KeyPrefix::XPUB),
+            (NetworkType::Mainnet, KeyPrefix::TPUB),
+            (NetworkType::Testnet, KeyPrefix::YPUB),
+        ];
+        let generated_xpub =
+            xpub_from_mnemonic_phrase("legal winner thank year wave sausage worth useful legal winner thank yellow").await;
+        let mut generated_xpubs = vec![generated_xpub];
+        generated_xpubs.sort_unstable();
+        for &(wallet_network, supplied) in cells {
+            let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical).unwrap();
+            reprefixed.prefix = supplied;
+            let user_xpub = reprefixed.to_string();
+            let err = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, wallet_network)
+                .expect_err("cross-network or foreign-prefix user-supplied xpub must reject");
+            match err {
+                Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network: rejected_for } => {
+                    assert_eq!(
+                        supplied_prefix, supplied,
+                        "({wallet_network:?}, {supplied:?}) cell: rejection names the supplied prefix"
+                    );
+                    assert_eq!(
+                        rejected_for, wallet_network,
+                        "({wallet_network:?}, {supplied:?}) cell: rejection names the wallet network"
+                    );
+                }
+                other => panic!("({wallet_network:?}, {supplied:?}) cell: expected MultisigXpubNetworkMismatch, got {other:?}"),
+            }
+        }
+    }
+
+    /// Cross-network accept path: network-discriminating kaspa prefix matching
+    /// the wallet network passes the gate. Pairs the create/import-side
+    /// reject coverage above with the two same-network success cells.
+    #[tokio::test]
+    async fn multisig_accept_same_network_kaspa_xpub() {
+        let canonical =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+        let generated_xpub =
+            xpub_from_mnemonic_phrase("legal winner thank year wave sausage worth useful legal winner thank yellow").await;
+        let mut generated_xpubs = vec![generated_xpub];
+        generated_xpubs.sort_unstable();
+        let cells: &[(NetworkType, KeyPrefix)] = &[(NetworkType::Mainnet, KeyPrefix::KPUB), (NetworkType::Testnet, KeyPrefix::KTUB)];
+        for &(wallet_network, accepted) in cells {
+            let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical).unwrap();
+            reprefixed.prefix = accepted;
+            let user_xpub = reprefixed.to_string();
+            let result = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, wallet_network);
+            assert!(result.is_ok(), "({wallet_network:?}, {accepted:?}) cell: accept path must succeed, got {result:?}");
+            // Output preserves the count and contains XPUB-canonical entries.
+            let output = result.unwrap();
+            assert_eq!(output.len(), 2, "two cosigner entries after merge");
+            assert!(output.iter().all(|s| s.starts_with("xpub")), "every entry stored in canonical XPUB form");
+        }
+    }
+
+    /// Cross-network end-to-end at the `Wallet::import_multisig_with_mnemonic`
+    /// API surface: rejection of a cross-network user-supplied xpub
+    /// propagates through the wallet's import wizard to the same error
+    /// variant the helper raises, with the supplied_prefix and
+    /// wallet_network fields populated from the caller context.
+    #[tokio::test]
+    async fn multisig_import_rejects_cross_network_xpub_at_api() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let canonical =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+
+        // Wallet is Testnet; KPUB user-supplied xpub is the wrong-network case.
+        let mut reprefixed_kpub = kaspa_bip32::ExtendedKey::from_str(&canonical).unwrap();
+        reprefixed_kpub.prefix = KeyPrefix::KPUB;
+        let user_xpub_kpub = reprefixed_kpub.to_string();
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![user_xpub_kpub]).await;
+        match result {
+            Ok(_) => panic!("KPUB external xpub on Testnet wallet must reject at import-time"),
+            Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
+                assert_eq!(supplied_prefix, KeyPrefix::KPUB);
+                assert_eq!(wallet_network, NetworkType::Testnet);
+            }
+            Err(other) => panic!("expected MultisigXpubNetworkMismatch, got {other:?}"),
+        }
+    }
+
+    /// Derive `n` distinct KTUB-prefixed external xpubs for the Testnet
+    /// test wallet. Each xpub comes from a fresh random mnemonic so the
+    /// returned set is unique, mirroring how the wizard would receive
+    /// distinct external cosigner xpubs at user-input time.
+    async fn external_xpubs_for_testnet(n: usize) -> Vec<String> {
+        let mnemonics = make_local_mnemonics(n).await;
+        let mut xpubs = Vec::with_capacity(n);
+        for mnemonic in mnemonics {
+            xpubs.push(external_xpub_for_testnet(mnemonic.phrase()).await);
+        }
+        xpubs
+    }
+
+    /// Import-path mirror of `multisig_create_rejects_pub_key_count_above_consensus_max`.
+    /// One local mnemonic plus `MAX_PUB_KEYS_PER_MUTLTISIG` external xpubs
+    /// lifts the merged cosigner count one above the consensus
+    /// stack-pubkey-count cap. The wallet import API must surface the same
+    /// `MultisigPubKeyCountExceedsConsensus` the helper raises on the create
+    /// path.
+    #[tokio::test]
+    async fn multisig_import_rejects_pub_key_count_above_consensus_max() {
+        const CONSENSUS_CAP: usize = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
+        const OVER_CAP_TOTAL: usize = CONSENSUS_CAP + 1;
+        let mnemonics = make_local_mnemonics(1).await;
+        let externals = external_xpubs_for_testnet(OVER_CAP_TOTAL - mnemonics.len()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, externals).await;
+        match result {
+            Err(Error::MultisigPubKeyCountExceedsConsensus { count, max }) => {
+                assert_eq!(count, OVER_CAP_TOTAL, "rejection names the merged cosigner count");
+                assert_eq!(max, CONSENSUS_CAP, "rejection names the consensus max");
+            }
+            Ok(_) => panic!("over-cap import must reject"),
+            Err(other) => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+        }
+    }
+
+    /// Import-path mirror of `multisig_create_rejects_threshold_above_cosigner_count`.
+    /// A 3-of-2 (`min_sigs > N`) threshold is mathematically unreachable;
+    /// the wallet import API must reject with `MultisigInvalidThreshold`.
+    #[tokio::test]
+    async fn multisig_import_rejects_threshold_above_cosigner_count() {
+        let mnemonics = make_local_mnemonics(1).await;
+        let externals = external_xpubs_for_testnet(1).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 3, externals).await;
+        match result {
+            Err(Error::MultisigInvalidThreshold { k, n }) => {
+                assert_eq!(k, 3, "rejection names the supplied K");
+                assert_eq!(n, 2, "rejection names the merged cosigner count");
+            }
+            Ok(_) => panic!("3-of-2 import must reject"),
+            Err(other) => panic!("expected MultisigInvalidThreshold, got {other:?}"),
+        }
+    }
+
+    /// Import-path mirror of
+    /// `multisig_create_rejects_redeem_script_above_element_size_at_each_boundary_n`.
+    /// At N=16 the predicted Schnorr redeem script is 531 bytes, above the
+    /// consensus `MAX_SCRIPT_ELEMENT_SIZE = 520` PUSHDATA cap. The wallet
+    /// import API must refuse rather than letting `ScriptBuilder::add_data`
+    /// fail later during script_sig assembly.
+    #[tokio::test]
+    async fn multisig_import_rejects_redeem_script_above_element_size() {
+        let mnemonics = make_local_mnemonics(1).await;
+        let externals = external_xpubs_for_testnet(15).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 1, externals).await;
+        match result {
+            Err(Error::MultisigRedeemScriptExceedsElementSize { size, max }) => {
+                assert_eq!(size, 531, "N=16 K=1: rejection names the predicted redeem-script size");
+                assert_eq!(max, kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE, "rejection names the consensus element-size cap");
+            }
+            Ok(_) => panic!("N=16 import must reject (redeem script exceeds element-size cap)"),
+            Err(other) => panic!("expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+        }
+    }
+
+    /// Import-path mirror of `multisig_create_rejects_duplicate_xpubs`. A
+    /// mnemonic and an external xpub that re-derives the same key (the
+    /// canonical form of the mnemonic's multisig xpub, re-prefixed to
+    /// KTUB so it passes the cross-network gate) collapse to the same
+    /// redeem-script slot after canonicalization. The wallet import API
+    /// must reject so a single signer cannot satisfy K of those slots and
+    /// silently weaken the K-of-N threshold guarantee.
+    #[tokio::test]
+    async fn multisig_import_rejects_duplicate_xpubs() {
+        let mnemonic = make_local_mnemonics(1).await.pop().unwrap();
+        let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let generated_xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let canonical = generated_xpub.to_string(Some(KeyPrefix::XPUB));
+        let mut reprefixed = ExtendedKey::from_str(&canonical).unwrap();
+        reprefixed.prefix = KeyPrefix::KTUB;
+        let external = reprefixed.to_string();
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, vec![(mnemonic, None)], 1, vec![external]).await;
+        match result {
+            Err(Error::MultisigDuplicateXpub { xpub: dup }) => {
+                assert_eq!(dup, canonical, "rejection names the duplicate xpub in canonical XPUB form");
+            }
+            Ok(_) => panic!("import with duplicate xpub must reject"),
+            Err(other) => panic!("expected MultisigDuplicateXpub, got {other:?}"),
+        }
+    }
+
+    /// All six construction-time guards (cross-network xpub, duplicate
+    /// xpub, threshold K=0, threshold K>N, count cap N>20, redeem-script
+    /// element-size cap at N=16 Schnorr) MUST fire when
+    /// `Wallet::create_account_multisig` is invoked with no local cosigner
+    /// seeds (`prv_key_data_args.is_empty()`) -- the all-external-cosigner
+    /// path that the wizard exposes when the operator answers 0 to the
+    /// "number of private keys to generate" prompt. Without the unified
+    /// helper call the wallet silently persists multisig accounts that
+    /// the consensus engine would reject at first spend.
+    #[tokio::test]
+    async fn multisig_create_with_no_local_seeds_enforces_guards() {
+        let wallet_secret = Secret::new(vec![]);
+
+        // Cell 1 -- cross-network xpub. A canonical-stripped XPUB is
+        // ambiguous about its origin network and the helper rejects it
+        // on every wallet network.
+        {
+            let wallet = test_wallet().await;
+            let canonical = xpub_from_mnemonic_phrase(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            )
+            .await;
+            let valid_ktub =
+                external_xpub_for_testnet("legal winner thank year wave sausage worth useful legal winner thank yellow").await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![canonical, valid_ktub], None, 2).await;
+            match result {
+                Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
+                    assert_eq!(supplied_prefix, KeyPrefix::XPUB, "rejection names the supplied prefix");
+                    assert_eq!(wallet_network, NetworkType::Testnet, "rejection names the wallet network");
+                }
+                Ok(_) => panic!("watch-only create with canonical XPUB on Testnet must reject"),
+                Err(other) => panic!("expected MultisigXpubNetworkMismatch, got {other:?}"),
+            }
+        }
+
+        // Cell 2 -- duplicate xpub. Two identical KTUB-prefixed entries
+        // collapse to the same redeem-script slot after canonicalization.
+        {
+            let wallet = test_wallet().await;
+            let ext = external_xpub_for_testnet(
+                "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+            )
+            .await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![ext.clone(), ext], None, 2).await;
+            match result {
+                Err(Error::MultisigDuplicateXpub { xpub }) => {
+                    assert!(xpub.starts_with("xpub"), "duplicate reported in canonical XPUB form, got: {xpub}");
+                }
+                Ok(_) => panic!("watch-only create with duplicate xpub must reject"),
+                Err(other) => panic!("expected MultisigDuplicateXpub, got {other:?}"),
+            }
+        }
+
+        // Cell 3 -- threshold K=0. The threshold check is reached after
+        // the cross-network and count caps; supply two valid distinct
+        // KTUB entries so only K=0 trips the guard.
+        {
+            let wallet = test_wallet().await;
+            let externals = external_xpubs_for_testnet(2).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 0).await;
+            match result {
+                Err(Error::MultisigInvalidThreshold { k, n }) => {
+                    assert_eq!(k, 0, "rejection names the supplied K");
+                    assert_eq!(n, 2, "rejection names the cosigner count");
+                }
+                Ok(_) => panic!("watch-only create with K=0 must reject"),
+                Err(other) => panic!("expected MultisigInvalidThreshold, got {other:?}"),
+            }
+        }
+
+        // Cell 4 -- threshold K>N. Two distinct KTUB cosigners with K=3
+        // is mathematically unreachable.
+        {
+            let wallet = test_wallet().await;
+            let externals = external_xpubs_for_testnet(2).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 3).await;
+            match result {
+                Err(Error::MultisigInvalidThreshold { k, n }) => {
+                    assert_eq!(k, 3, "rejection names the supplied K");
+                    assert_eq!(n, 2, "rejection names the cosigner count");
+                }
+                Ok(_) => panic!("watch-only create with K=3 N=2 must reject"),
+                Err(other) => panic!("expected MultisigInvalidThreshold, got {other:?}"),
+            }
+        }
+
+        // Cell 5 -- count cap. One cosigner above the consensus
+        // stack-pubkey-count cap must reject.
+        {
+            const CONSENSUS_CAP: usize = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
+            const OVER_CAP_TOTAL: usize = CONSENSUS_CAP + 1;
+            let wallet = test_wallet().await;
+            let externals = external_xpubs_for_testnet(OVER_CAP_TOTAL).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 2).await;
+            match result {
+                Err(Error::MultisigPubKeyCountExceedsConsensus { count, max }) => {
+                    assert_eq!(count, OVER_CAP_TOTAL, "rejection names the cosigner count");
+                    assert_eq!(max, CONSENSUS_CAP, "rejection names the consensus max");
+                }
+                Ok(_) => panic!("watch-only create above consensus cap must reject"),
+                Err(other) => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+            }
+        }
+
+        // Cell 6 -- size cap N=16 Schnorr. Sixteen distinct KTUB cosigners
+        // produce a 531-byte Schnorr P2SH redeem script that exceeds the
+        // consensus 520-byte PUSHDATA cap.
+        {
+            let wallet = test_wallet().await;
+            let externals = external_xpubs_for_testnet(16).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 1).await;
+            match result {
+                Err(Error::MultisigRedeemScriptExceedsElementSize { size, max }) => {
+                    assert_eq!(size, 531, "N=16 K=1: rejection names the predicted redeem-script size");
+                    assert_eq!(max, kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE, "rejection names the consensus element-size cap");
+                }
+                Ok(_) => panic!("watch-only create with N=16 must reject (redeem script exceeds element-size cap)"),
+                Err(other) => panic!("expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+            }
         }
     }
 
@@ -2688,7 +3095,7 @@ mod multisig_tests {
         let mnemonics = make_local_mnemonics(3).await;
         let local_a = mnemonics[0].clone();
         let local_b = mnemonics[1].clone();
-        let external_xpub = xpub_from_mnemonic_phrase(mnemonics[2].phrase()).await;
+        let external_xpub = external_xpub_for_testnet(mnemonics[2].phrase()).await;
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
