@@ -1710,6 +1710,9 @@ impl Wallet {
         );
 
         self.inner.store.clone().as_account_store()?.store_single(&account.to_storage()?, None).await?;
+        // Mirror `create_account_multisig`'s post-write commit; clears LocalStore's
+        // modified flag so the next wallet open does not trip the dirty-store guard.
+        self.inner.store.commit(wallet_secret).await?;
         account.clone().start().await?;
 
         Ok(account)
