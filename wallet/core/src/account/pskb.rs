@@ -13,6 +13,7 @@ use kaspa_consensus_client::UtxoEntry as ClientUTXO;
 use kaspa_consensus_core::hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash};
 use kaspa_consensus_core::tx::VerifiableTransaction;
 use kaspa_consensus_core::tx::{TransactionInput, UtxoEntry};
+use kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG;
 use kaspa_txscript::extract_script_pub_key_address;
 use kaspa_txscript::opcodes::codes::{Op1, Op16, OpCheckMultiSig, OpCheckMultiSigECDSA, OpData1, OpData32, OpData33, OpData65};
 use kaspa_txscript::script_builder::ScriptBuilder;
@@ -253,9 +254,18 @@ pub async fn pskb_signer_for_address(
 /// `ScriptBuilder::add_i64` emits 1..16 as a single small-int opcode
 /// (`Op1..Op16`) and emits 17..127 as a one-byte PUSHDATA (`OpData1`
 /// followed by the value as an unsigned byte with the sign bit unset).
-/// The consensus `OpCheckMultiSig` walk reads either form. Returns the
-/// decoded value and the number of bytes consumed from `bytes`.
+/// The consensus `OpCheckMultiSig` walk reads either form. Values above
+/// `MAX_PUB_KEYS_PER_MUTLTISIG` exceed the consensus stack-pubkey-count
+/// cap and are refused as parse errors so a downstream caller never
+/// processes a K or N the script engine itself would reject. Returns
+/// the decoded value and the number of bytes consumed from `bytes`.
 fn decode_multisig_script_int(bytes: &[u8]) -> Result<(usize, usize), Error> {
+    // High bit of a one-byte txscript integer = sign bit (per
+    // `crypto/txscript/src/data_stack.rs::serialize_i64`). A positive K/N
+    // value below the consensus cap MUST clear this bit; anything with it
+    // set is a negative encoding and is rejected before the cap check.
+    const TXSCRIPT_SIGN_BIT: u8 = 0x80;
+
     if bytes.is_empty() {
         return Err(Error::custom("multisig script integer expected but bytes empty"));
     }
@@ -268,8 +278,13 @@ fn decode_multisig_script_int(bytes: &[u8]) -> Result<(usize, usize), Error> {
             return Err(Error::custom("OpData1 multisig script integer missing value byte"));
         }
         let val = bytes[1];
-        if val & 0x80 != 0 {
+        if val & TXSCRIPT_SIGN_BIT != 0 {
             return Err(Error::custom(format!("multisig script integer 0x{val:02x} has sign bit set; not a positive K/N value")));
+        }
+        if (val as i32) > MAX_PUB_KEYS_PER_MUTLTISIG {
+            return Err(Error::custom(format!(
+                "multisig script integer {val} exceeds the consensus stack-pubkey-count cap {MAX_PUB_KEYS_PER_MUTLTISIG}"
+            )));
         }
         return Ok((val as usize, 2));
     }
@@ -938,6 +953,45 @@ mod tests {
         }
     }
 
+    /// Over-range K or N (> `MAX_PUB_KEYS_PER_MUTLTISIG = 20`) must surface
+    /// as a parse error. Wallet-side construction guards refuse over-range
+    /// at account-creation time; the parser-side cap is defense-in-depth
+    /// for external bundles or future wizards that bypass the construction
+    /// guard. Both decode positions (the leading K and the trailing N) are
+    /// exercised so neither branch silently accepts a count the consensus
+    /// stack-side `OpCheckMultiSig` would later reject as
+    /// `InvalidPubKeyCount`.
+    #[test]
+    fn test_parse_redeem_script_pubkeys_rejects_over_consensus_pub_key_cap() {
+        // One above the consensus cap on multisig pubkeys: the smallest value
+        // that must be rejected at parse time.
+        const OVER_CAP: usize = MAX_PUB_KEYS_PER_MUTLTISIG as usize + 1;
+        let pubkeys: Vec<[u8; SCHNORR_PUBLIC_KEY_SIZE]> = (0..OVER_CAP).map(|i| [i as u8; SCHNORR_PUBLIC_KEY_SIZE]).collect();
+
+        // K = OVER_CAP is the very first script integer. The K-decode call
+        // refuses before any pubkey is parsed.
+        let over_range_k =
+            multisig_redeem_script(pubkeys.iter().copied(), OVER_CAP).expect("OVER_CAP-of-OVER_CAP canonical builder output");
+        let err_k = parse_redeem_script_pubkeys(&over_range_k).expect_err("over-range K must reject");
+        let msg_k = format!("{err_k}");
+        assert!(
+            msg_k.contains("exceeds the consensus stack-pubkey-count cap"),
+            "K-decode rejection names the consensus cap, got: {msg_k}"
+        );
+
+        // K = 1 (small-int Op1) with N = OVER_CAP (over-range PUSHDATA
+        // trailer): K and pubkeys parse cleanly, then the N-trailer decode
+        // hits the cap and refuses before the trailer-vs-pubkey-count
+        // consistency check.
+        let over_range_n = multisig_redeem_script(pubkeys.iter().copied(), 1).expect("1-of-OVER_CAP canonical builder output");
+        let err_n = parse_redeem_script_pubkeys(&over_range_n).expect_err("over-range N trailer must reject");
+        let msg_n = format!("{err_n}");
+        assert!(
+            msg_n.contains("exceeds the consensus stack-pubkey-count cap"),
+            "N-decode rejection names the consensus cap, got: {msg_n}"
+        );
+    }
+
     /// Builds a 2-of-2 multisig where the redeem-script's pubkey order is the
     /// reverse of the `partial_sigs` BTreeMap iteration order. The finalizer
     /// MUST emit signatures in redeem-script order, not BTreeMap order, so a
@@ -1018,5 +1072,152 @@ mod tests {
             first_sig_bytes, &btreemap_first_expected_sig,
             "Finalizer's first-emitted signature must differ from what BTreeMap iteration order would produce",
         );
+    }
+
+    /// Drive the Finalizer through `TxScriptEngine::execute()` over a
+    /// parametric matrix of K-of-N cells crossed with the Schnorr and ECDSA
+    /// multisig schemes. For each cell the test builds a synthetic transaction
+    /// whose input spends a P2SH output committed to a redeem script whose
+    /// pubkey order has been chosen to differ from `secp256k1::PublicKey`'s
+    /// `Ord` order (the order `BTreeMap<PublicKey, _>` iterates), then signs
+    /// with K of the N cosigners, drives `PartialSigs` through the Finalizer
+    /// reorder body, sets the result as the input's `signature_script`, and
+    /// asserts `TxScriptEngine::execute()` returns `Ok(())`. A complementary
+    /// arm bypasses the reorder by emitting the same K signatures in
+    /// `BTreeMap` iteration order directly and asserts the script engine
+    /// rejects the resulting consensus walk -- pinning that the SAME setup
+    /// with the reorder removed fails consensus and demonstrating that the
+    /// reorder body is load-bearing for the `OpCheckMultiSig` forward-walk's
+    /// irreversible pubkey-iter consumption.
+    #[test]
+    fn test_finalizer_reorders_property_over_k_of_n_cells() {
+        use kaspa_consensus_core::hashing::sighash::calc_ecdsa_signature_hash;
+        use kaspa_consensus_core::hashing::sighash_type::SIG_HASH_ALL;
+        use kaspa_consensus_core::subnets::SUBNETWORK_ID_NATIVE;
+        use kaspa_consensus_core::tx::{MutableTransaction, Transaction, TransactionInput, TransactionOutpoint, UtxoEntry};
+        use kaspa_txscript::caches::Cache;
+        use kaspa_txscript::{TxScriptEngine, pay_to_script_hash_script};
+
+        // K-of-N cells exercised in the multi-cosigner send tests. The (1, 1)
+        // cell is excluded per the existing single-key P2PK topology
+        // divergence (see `create_address`).
+        let cells: &[(usize, usize)] = &[(2, 2), (2, 3), (3, 5)];
+        let secp = Secp256k1::new();
+
+        for &(k, n) in cells {
+            for &is_ecdsa in &[false, true] {
+                // Generate N keypairs and sort by the order BTreeMap<PublicKey, _>
+                // iterates (the secp256k1::PublicKey `Ord` impl over the 33-byte
+                // compressed form). Pick the redeem-script pubkey order to be the
+                // reverse of that BTreeMap order so the Finalizer's reorder body
+                // has nontrivial work to do.
+                let mut keypairs: Vec<Keypair> = (0..n).map(|_| Keypair::new(&secp, &mut thread_rng())).collect();
+                keypairs.sort_by_key(|kp| kp.public_key());
+                let rs_pubkeys_btmap_reverse: Vec<&Keypair> = keypairs.iter().rev().collect();
+
+                // Build the redeem script in the reversed-BTreeMap-order. Schnorr
+                // uses 32-byte x-only pubkeys; ECDSA uses 33-byte compressed.
+                let redeem_script = if is_ecdsa {
+                    let pks: Vec<[u8; PUBLIC_KEY_SIZE]> =
+                        rs_pubkeys_btmap_reverse.iter().map(|kp| kp.public_key().serialize()).collect();
+                    kaspa_txscript::multisig_redeem_script_ecdsa(pks.iter().copied(), k).expect("ecdsa redeem script")
+                } else {
+                    let pks: Vec<[u8; SCHNORR_PUBLIC_KEY_SIZE]> =
+                        rs_pubkeys_btmap_reverse.iter().map(|kp| kp.x_only_public_key().0.serialize()).collect();
+                    multisig_redeem_script(pks.iter().copied(), k).expect("schnorr redeem script")
+                };
+
+                // Synthetic transaction whose single input spends a P2SH UTXO
+                // committed to the redeem script.
+                let prev_outpoint = TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0xab; HASH_SIZE]), index: 0 };
+                let tx_in = TransactionInput {
+                    previous_outpoint: prev_outpoint,
+                    signature_script: vec![],
+                    sequence: 0,
+                    sig_op_count: n as u8,
+                };
+                let tx = Transaction::new(0, vec![tx_in], vec![], 0, SUBNETWORK_ID_NATIVE, 0, vec![]);
+                let entry = UtxoEntry {
+                    amount: 1_000_000,
+                    script_public_key: pay_to_script_hash_script(redeem_script.as_slice()),
+                    block_daa_score: 1,
+                    is_coinbase: false,
+                };
+
+                // Compute the sighash so signatures verify under the engine.
+                let mut signing_tx = MutableTransaction::with_entries(tx.clone(), vec![entry.clone()]);
+                let reused_values = SigHashReusedValuesUnsync::new();
+                let sig_hash = if is_ecdsa {
+                    calc_ecdsa_signature_hash(&signing_tx.as_verifiable(), 0, SIG_HASH_ALL, &reused_values)
+                } else {
+                    calc_schnorr_signature_hash(&signing_tx.as_verifiable(), 0, SIG_HASH_ALL, &reused_values)
+                };
+                let msg = secp256k1::Message::from_digest_slice(sig_hash.as_bytes().as_slice()).expect("msg");
+
+                // Sign with the first K keypairs (any K of the N suffices for K-of-N).
+                let signers: Vec<&Keypair> = keypairs.iter().take(k).collect();
+                let mut partial_sigs = kaspa_wallet_pskt::pskt::PartialSigs::new();
+                for kp in signers.iter() {
+                    let sig = if is_ecdsa {
+                        Signature::ECDSA(kp.secret_key().sign_ecdsa(msg))
+                    } else {
+                        Signature::Schnorr(kp.sign_schnorr(msg))
+                    };
+                    partial_sigs.insert(kp.public_key(), sig);
+                }
+
+                // Build a PSKT input carrying the partial sigs + redeem_script and
+                // run it through the Finalizer.
+                let mut input = InputBuilder::default()
+                    .utxo_entry(entry.clone())
+                    .previous_outpoint(prev_outpoint)
+                    .sig_op_count(n as u8)
+                    .redeem_script(redeem_script.clone())
+                    .build()
+                    .expect("input");
+                input.partial_sigs = partial_sigs.clone();
+                let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+                let pskt_finalizer = pskt_creator.constructor().input(input).updater().signer().finalizer();
+                let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(pskt_finalizer).expect("finalize");
+                let inner = finalized.deref();
+                let reordered_script_sig = inner.inputs[0].final_script_sig.clone().expect("final_script_sig populated");
+
+                // Positive arm: ordered script_sig passes consensus-script-verify.
+                signing_tx.tx.inputs[0].signature_script = reordered_script_sig;
+                let verifiable = signing_tx.as_verifiable();
+                let (vtx_in, vtx_entry) = verifiable.populated_inputs().next().expect("populated input");
+                let cache = Cache::new(10_000);
+                let mut engine = TxScriptEngine::from_transaction_input(&verifiable, vtx_in, 0, vtx_entry, &reused_values, &cache);
+                assert!(
+                    engine.execute().is_ok(),
+                    "({k}-of-{n}, ecdsa={is_ecdsa}): ordered script_sig must pass TxScriptEngine::execute",
+                );
+
+                // Negative arm: BTreeMap-order signatures (skipping the Finalizer
+                // reorder) emit sigs in `secp256k1::PublicKey::Ord` order, which
+                // for this fixture is the reverse of redeem-script order; the
+                // consensus walk's irreversible pubkey-iter consumption then
+                // abandons the walk and the engine rejects.
+                let mut btmap_only: Vec<u8> = Vec::new();
+                for (_pk, signature) in partial_sigs.iter() {
+                    btmap_only.push(OpData65);
+                    btmap_only.extend_from_slice(&(*signature).into_bytes());
+                    btmap_only.push(SIG_HASH_ALL.to_u8());
+                }
+                btmap_only
+                    .extend(kaspa_txscript::script_builder::ScriptBuilder::new().add_data(redeem_script.as_slice()).unwrap().drain());
+                let mut signing_tx_neg = MutableTransaction::with_entries(tx.clone(), vec![entry.clone()]);
+                signing_tx_neg.tx.inputs[0].signature_script = btmap_only;
+                let verifiable_neg = signing_tx_neg.as_verifiable();
+                let (vneg_in, vneg_entry) = verifiable_neg.populated_inputs().next().expect("populated input");
+                let cache_neg = Cache::new(10_000);
+                let mut engine_neg =
+                    TxScriptEngine::from_transaction_input(&verifiable_neg, vneg_in, 0, vneg_entry, &reused_values, &cache_neg);
+                assert!(
+                    engine_neg.execute().is_err(),
+                    "({k}-of-{n}, ecdsa={is_ecdsa}): unordered (map iteration order) script_sig must fail TxScriptEngine::execute",
+                );
+            }
+        }
     }
 }
