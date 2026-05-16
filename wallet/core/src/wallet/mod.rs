@@ -515,7 +515,20 @@ impl Wallet {
     }
 
     pub async fn is_account_key_encrypted(&self, account: &Arc<dyn Account>) -> Result<Option<bool>> {
-        Ok(self.get_prv_key_info(account).await?.map(|info| info.is_encrypted()))
+        let store = self.inner.store.as_prv_key_data_store()?;
+        let prv_key_data_ids = account.to_storage()?.prv_key_data_ids;
+        let mut any_seen = false;
+        let mut any_encrypted = false;
+        for id in &prv_key_data_ids {
+            any_seen = true;
+            if let Some(info) = store.load_key_info(&id).await?
+                && info.is_encrypted()
+            {
+                any_encrypted = true;
+                break;
+            }
+        }
+        if any_seen { Ok(Some(any_encrypted)) } else { Ok(None) }
     }
 
     pub fn try_wrpc_client(&self) -> Option<Arc<KaspaRpcClient>> {
