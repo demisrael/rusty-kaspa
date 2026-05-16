@@ -2001,3 +2001,870 @@ mod test {
     }
     */
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod multisig_tests {
+    use super::*;
+    use crate::account::pskb::finalize_pskt_one_or_more_sig_and_redeem_script;
+    use crate::account::pskb::pskb_signer_for_multisig_cosigner;
+    use crate::account::variants::multisig::{MULTISIG_ACCOUNT_KIND, MultiSig};
+    use kaspa_bip32::{ChildNumber, Language, Mnemonic, Prefix as KeyPrefix};
+    use kaspa_consensus_core::config::params::Params;
+    use kaspa_consensus_core::network::{NetworkId, NetworkType};
+    use kaspa_txscript::{multisig_redeem_script, pay_to_address_script, pay_to_script_hash_script};
+    use kaspa_wallet_pskt::bundle::Bundle;
+    use kaspa_wallet_pskt::input::InputBuilder;
+    use kaspa_wallet_pskt::pskt::{Creator, PSKT};
+
+    /// Build an empty Testnet-10 resident-store wallet ready for account
+    /// import / creation; used as the substrate for every multisig test in
+    /// this module.
+    async fn test_wallet() -> Arc<Wallet> {
+        let resident_store = Wallet::resident_store().unwrap();
+        let wallet = Arc::new(Wallet::try_new(resident_store, None, Some(NetworkId::with_suffix(NetworkType::Testnet, 10))).unwrap());
+        let wallet_secret = Secret::new(vec![]);
+        wallet
+            .create_wallet(
+                &wallet_secret,
+                WalletCreateArgs {
+                    title: None,
+                    filename: None,
+                    encryption_kind: EncryptionKind::XChaCha20Poly1305,
+                    user_hint: None,
+                    overwrite_wallet_storage: false,
+                },
+            )
+            .await
+            .unwrap();
+        wallet
+    }
+
+    /// Derive the canonical XPUB-prefixed extended public key from a BIP-39
+    /// mnemonic phrase at the multisig account-kind derivation path.
+    async fn xpub_from_mnemonic_phrase(phrase: &str) -> String {
+        let mnemonic = Mnemonic::new(phrase, Language::English).unwrap();
+        let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        xpub.to_string(Some(KeyPrefix::XPUB))
+    }
+
+    /// Generate `count` fresh random 24-word English BIP-39 mnemonics for
+    /// in-test local-cosigner construction.
+    async fn make_local_mnemonics(count: usize) -> Vec<Mnemonic> {
+        let mut out = Vec::with_capacity(count);
+        for _ in 0..count {
+            out.push(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap());
+        }
+        out
+    }
+
+    /// Every entry of the full BIP-32 PUBLIC prefix set `{xpub, kpub, ktub,
+    /// tpub, ypub, zpub}` supplied as the external xpub produces the same final
+    /// stored xpub set as an `xpub`-prefixed equivalent. The `normalize_and_merge_xpubs`
+    /// helper is the contract; exercising it directly with each prefix re-encoding
+    /// pins prefix invariance independent of `create_account_multisig` /
+    /// `import_multisig_with_mnemonic` plumbing.
+    #[tokio::test]
+    async fn multisig_xpub_prefix_invariant() {
+        let canonical_xpub =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+        let generated_xpub =
+            xpub_from_mnemonic_phrase("legal winner thank year wave sausage worth useful legal winner thank yellow").await;
+
+        let mut generated_xpubs = vec![generated_xpub.clone()];
+        generated_xpubs.sort_unstable();
+
+        // 2-of-2 satisfies the new K-vs-N validation in the helper (K=2 = N=2 cosigners).
+        let canonical_output = normalize_and_merge_xpubs(vec![canonical_xpub.clone()], &generated_xpubs, 2).unwrap();
+
+        let prefixes = [KeyPrefix::XPUB, KeyPrefix::KPUB, KeyPrefix::KTUB, KeyPrefix::TPUB, KeyPrefix::YPUB, KeyPrefix::ZPUB];
+        for prefix in prefixes.iter().copied() {
+            let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical_xpub).unwrap();
+            reprefixed.prefix = prefix;
+            let user_xpub = reprefixed.to_string();
+            let output = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2).unwrap();
+            assert_eq!(output, canonical_output, "prefix {prefix:?} produced a different normalized set");
+        }
+    }
+
+    /// `create_account_multisig` and `import_multisig_with_mnemonic` produce
+    /// byte-equal P2SH first-receive addresses when given equivalent inputs
+    /// (same mnemonics + same external xpub + same `minimum_signatures`).
+    /// Without the shared `normalize_and_merge_xpubs` helper the create-path
+    /// would skip prefix normalization on the user-supplied xpub and mix
+    /// `ktub`/`kpub` into the sort, producing a different sorted xpub set
+    /// than the import-path.
+    #[tokio::test]
+    async fn multisig_create_import_parity() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let mnemonic_a = mnemonics[0].clone();
+        let mnemonic_b = mnemonics[1].clone();
+        let external_xpub =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+        let external_xpub_ktub = {
+            let mut k = kaspa_bip32::ExtendedKey::from_str(&external_xpub).unwrap();
+            k.prefix = KeyPrefix::KTUB;
+            k.to_string()
+        };
+
+        // Create path.
+        let create_wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data_a =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_a.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_b =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_b.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store_a = create_wallet.store().as_prv_key_data_store().unwrap();
+        store_a.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
+        store_a.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
+        create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
+        let create_account = create_wallet
+            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2)
+            .await
+            .unwrap();
+        let create_address = create_account.receive_address().unwrap();
+
+        // Import path with the SAME mnemonics + SAME external xpub (also `ktub`-prefixed).
+        let import_wallet = test_wallet().await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
+        let import_account = import_wallet
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()])
+            .await
+            .unwrap();
+        let import_address = import_account.receive_address().unwrap();
+
+        assert_eq!(create_address, import_address, "create-path and import-path produce identical P2SH first-receive addresses");
+    }
+
+    /// After `import_multisig_with_mnemonic` returns, a subsequent `Wallet::open`
+    /// proceeds without panic. `LocalStore::open` panics when
+    /// `is_modified == true`. The resident-store test substrate that
+    /// `Wallet::resident_store()` returns uses `Store::Resident` mode in which
+    /// `set_modified` is a no-op and `is_modified` always returns `false`
+    /// (see `LocalStore::set_modified` / `LocalStore::is_modified` bodies).
+    /// The resident substrate therefore
+    /// cannot exercise the panic site by construction; this test pins only
+    /// that the import path does not introduce a different panic of its own
+    /// and that `Wallet::open` reaches `try_load`. The runtime evidence
+    /// against the disk-backed `Store::Storage` substrate is the Validator's
+    /// gate on testnet.
+    #[tokio::test]
+    async fn multisig_post_import_open() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let external_xpub =
+            xpub_from_mnemonic_phrase("abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about")
+                .await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        // Import the multisig account. Without a `commit` after the account
+        // `store_single`, the local store's `is_modified` flag would remain set.
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub.clone()]).await.unwrap();
+
+        // Re-open the same wallet payload. `LocalStore::open` checks the modified
+        // flag first and panics on `is_modified == true`. With the import-path
+        // `commit`, the flag is cleared by the time `open` runs and the open
+        // routes through to `try_load`. In the resident-store
+        // test substrate `try_load` fails because no file was persisted to the
+        // "disk" surface; that Err return is the all-clear signal: the modified
+        // flag check was reached without panicking and a non-panic return path
+        // was taken.
+        let lock = wallet.guard();
+        let guard = lock.lock().await;
+        let open_result = wallet.open(&wallet_secret, None, WalletOpenArgs::default(), &guard).await;
+        assert!(
+            matches!(open_result, Err(Error::NoWalletInStorage(_))),
+            "post-import Wallet::open must reach try_load (resident store reports NoWalletInStorage) without panicking; \
+             got {open_result:?}",
+        );
+    }
+
+    /// For a fixed `(N=2, K=2)` multisig account, the per-cosigner signing
+    /// primitive inserts a `partial_sigs[pub_key]` entry where `pub_key` equals
+    /// the pubkey reached by deriving the cosigner's own xpub through the
+    /// unhardened tail the AddressDerivationManager walks for receive[0]. The
+    /// BIP-32 derivation step is the account's persisted derivation index -- a
+    /// single value applied to every cosigner's xpub -- NOT the cosigner's
+    /// position in the xpub vector. Pins the redeem-script-slot match invariant
+    /// the `OpCheckMultiSig` verifier relies on at consensus time.
+    #[tokio::test]
+    async fn test_pskb_signer_for_multisig_cosigner_known_fixture() {
+        // Deterministic BIP-39 24-word phrases so the test is a true "known
+        // fixture": same mnemonics in, same xpubs derived, same signing pubkey
+        // expected at each cosigner position across runs.
+        let phrase_a = "caution guide valley easily latin already visual fancy fork car switch runway \
+                        vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
+        let phrase_b = "fiber boy desk trip pitch snake table awkward endorse car learn forest \
+                        solid ticket enemy pink gesture wealth iron chaos clock gather honey farm";
+        let mnemonics = [Mnemonic::new(phrase_a, Language::English).unwrap(), Mnemonic::new(phrase_b, Language::English).unwrap()];
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        // Build a single-input unsigned PSKT pointing at the multisig's receive address.
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xab; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let bundle = Bundle::from(pskt_inner);
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
+        let network_id = wallet.network_id().unwrap();
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        // The shared BIP-32 derivation step the multisig persisted at create-time and
+        // reuses on every cosigner's xpub during address derivation.
+        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
+
+        // Sign with each local cosigner and verify the inserted pubkey matches the
+        // redeem-script slot the verifier walks to at the cosigner's position.
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            let prv_key_data =
+                prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data loaded");
+
+            // Resolve THIS cosigner's position in the persisted xpub vector -- that is the
+            // redeem-script slot whose pubkey this cosigner's derived signing key must
+            // match. Iterating the vector tolerates non-sorted orderings (a wallet
+            // persisted under a code path that did not normalize xpub prefixes stores the
+            // vector in mixed-prefix sort order whose entries reorder under re-encoding).
+            let this_xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+            let this_xpub_string = this_xpub.to_string(Some(KeyPrefix::XPUB));
+            let cosigner_position = xpub_keys
+                .iter()
+                .position(|k| k.to_string(Some(KeyPrefix::XPUB)) == this_xpub_string)
+                .expect("cosigner xpub present in account xpub set");
+
+            let signed_bundle = pskb_signer_for_multisig_cosigner(
+                &bundle,
+                account.clone(),
+                &prv_key_data,
+                None,
+                multisig_derivation_index,
+                network_id,
+            )
+            .await
+            .unwrap();
+
+            // The signed bundle's single input has exactly one partial_sigs entry: this cosigner's.
+            let signed_inputs = &signed_bundle.as_ref()[0].inputs;
+            assert_eq!(signed_inputs.len(), 1, "signed bundle preserves input count");
+            assert_eq!(signed_inputs[0].partial_sigs.len(), 1, "primitive inserts exactly one signature per input");
+            let inserted_pub_key = signed_inputs[0].partial_sigs.keys().next().copied().unwrap();
+
+            // BIP-32 derivation determinism: walking the cosigner's own xpub at
+            // `xpub_keys[cosigner_position]` through the same unhardened tail
+            // `multisig_derivation_index / receive / 0` that the AddressDerivationManager
+            // uses produces the pubkey at the cosigner's redeem-script slot. The signing
+            // key the primitive derives from this cosigner's xprv MUST match.
+            let base_xpub = xpub_keys[cosigner_position].clone();
+            let cosigner_branch = base_xpub.derive_child(ChildNumber::new(multisig_derivation_index, false).unwrap()).unwrap();
+            let receive_branch = cosigner_branch.derive_child(ChildNumber::new(0, false).unwrap()).unwrap();
+            let expected_pub_key = *receive_branch.derive_child(ChildNumber::new(0, false).unwrap()).unwrap().public_key();
+
+            assert_eq!(
+                inserted_pub_key, expected_pub_key,
+                "per-cosigner derived pubkey at position {cosigner_position} matches the redeem-script slot",
+            );
+        }
+    }
+
+    /// K-of-N multi-cosigner signing flow produces exactly K signatures per
+    /// input. Tests the `(N=2, K=2)` cell directly through
+    /// `pskb_signer_for_multisig_cosigner` + accumulate-via-`Input::add` (the
+    /// same shape `build_multisig_signed_bundle` uses); the on-chain TXID
+    /// dimension is the Validator's gate on the testnet substrate.
+    #[tokio::test]
+    async fn multisig_send_local_k_of_n_2_of_2() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xcd; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
+        let network_id = wallet.network_id().unwrap();
+        let xpub_keys_strings: Vec<String> = account.xpub_keys().unwrap().iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
+
+        // Per-cosigner signing with per-input K-cap break-out gate (same shape as `build_multisig_signed_bundle`).
+        let k: usize = 2;
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k));
+            if all_full {
+                break;
+            }
+            let prv_key_data = prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data");
+            let this_xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+            let this_xpub_string = this_xpub.to_string(Some(KeyPrefix::XPUB));
+            assert!(xpub_keys_strings.iter().any(|s| s == &this_xpub_string), "cosigner xpub present in multisig set");
+            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                &accumulator,
+                account.clone(),
+                &prv_key_data,
+                None,
+                multisig_derivation_index,
+                network_id,
+            )
+            .await
+            .unwrap();
+            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
+                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+                }
+            }
+        }
+
+        assert_eq!(accumulator.0.len(), 1, "single PSKT in bundle");
+        assert_eq!(accumulator.0[0].inputs.len(), 1, "single input per PSKT");
+        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k, "exactly K=2 signatures per input post-multi-cosigner sign");
+    }
+
+    /// Round-trips a K-of-N multisig with `locals` local cosigner seeds and
+    /// `externals` external xpubs (derived from in-session mnemonics) through
+    /// sign / finalize / extract on a synthetic PSKT. The extractor invokes the
+    /// consensus `TxScriptEngine` on every input, so passing this helper proves
+    /// the assembled signature script verifies under the multisig redeem-script's
+    /// `OpCheckMultiSig` at consensus rules -- the load-bearing property
+    /// `multisig_send_local_k_of_n_2_of_2` does not pin (it asserts only
+    /// `partial_sigs.len() == K` and never finalizes). The per-cell wrappers
+    /// below close the structural REPL-vs-integration coverage gap across the
+    /// full validation matrix and negatively-key against per-cosigner-position
+    /// BIP-32 derivation: a signer that derives each cosigner's signing key off
+    /// the cosigner's positional index rather than the multisig account's
+    /// persisted derivation index produces signing keys whose pubkey does not
+    /// match the redeem-script slot the cosigner occupies, returning `EvalFalse`
+    /// at extract time.
+    async fn run_multisig_send_extract_for_cell(locals: usize, externals: usize, k: u16) {
+        let n_total = locals + externals;
+        assert!(n_total >= k as usize, "(N={n_total}, K={k}) violates K <= N");
+        let mnemonics = make_local_mnemonics(n_total).await;
+        let local_mnemonics: Vec<Mnemonic> = mnemonics[..locals].to_vec();
+        let external_mnemonics: &[Mnemonic] = &mnemonics[locals..];
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = local_mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let mut external_xpubs: Vec<String> = Vec::with_capacity(externals);
+        for em in external_mnemonics.iter() {
+            external_xpubs.push(xpub_from_mnemonic_phrase(em.phrase()).await);
+        }
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, external_xpubs).await.unwrap();
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
+        let network_id = wallet.network_id().unwrap();
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        assert_eq!(xpub_keys.len(), n_total, "multisig has N cosigner xpubs");
+        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
+
+        // Build the receive[0] redeem-script externally by walking each cosigner xpub
+        // through the same unhardened tail (`multisig_derivation_index / receive / 0`)
+        // the `AddressDerivationManager` uses for the multisig's receive[0]. The synthetic
+        // UTXO's `script_pub_key` is the P2SH commitment to that redeem-script; consensus
+        // verifies the assembled signature script against it at `extract_tx`.
+        let mut receive_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+        for xpub in xpub_keys.iter() {
+            let derived = xpub
+                .clone()
+                .derive_child(ChildNumber::new(multisig_derivation_index, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap();
+            receive_pubkeys.push(*derived.public_key());
+        }
+        let redeem_script = multisig_redeem_script(receive_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)
+            .expect("redeem script");
+        let script_public_key = pay_to_script_hash_script(redeem_script.as_slice());
+
+        // Sanity-check: the externally-derived script_public_key matches the multisig's
+        // actual receive[0] address. Asserts the address-derivation pipeline reads the
+        // multisig at the persisted derivation index, the same value driving signing below.
+        let receive_address = account.receive_address().unwrap();
+        let receive_script = pay_to_address_script(&receive_address);
+        assert_eq!(
+            script_public_key, receive_script,
+            "(N={n_total}, K={k}) externally-derived redeem-script's P2SH must match the multisig's receive[0] address",
+        );
+
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xee; 32]),
+                index: 0,
+            })
+            .sig_op_count(n_total as u8)
+            .redeem_script(redeem_script)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        let k_usize = k as usize;
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k_usize));
+            if all_full {
+                break;
+            }
+            let prv_key_data =
+                prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data loaded");
+            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                &accumulator,
+                account.clone(),
+                &prv_key_data,
+                None,
+                multisig_derivation_index,
+                network_id,
+            )
+            .await
+            .unwrap();
+            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
+                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+                }
+            }
+        }
+
+        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k_usize, "(N={n_total}, K={k}) exactly K signatures accumulated",);
+
+        // Finalize, then extract -- the extractor runs `TxScriptEngine::execute()` per
+        // input. With per-cosigner-position derivation `extract_tx` would return
+        // Err(EvalFalse) because at least one signing key's pubkey would not match the
+        // redeem-script slot the cosigner occupies. With every cosigner deriving at the
+        // shared multisig derivation index, signatures verify, and `extract_tx` returns Ok.
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
+            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let params = Params::from(network_id);
+        let extract_result = extractor.extract_tx(&params);
+        assert!(
+            extract_result.is_ok(),
+            "(N={n_total}, K={k}) extract_tx must succeed under consensus script verify; got {extract_result:?}",
+        );
+    }
+
+    // Per-cell wrappers exercising the lead-named multisig validation matrix. Each cell
+    // closes the same structural REPL-vs-integration coverage gap on a different
+    // (locals, externals, K) topology; mixed-source cells (externals > 0) pin the
+    // create-with-external-xpub path the substrate-class topology exercises.
+    //
+    // The (1,1) cell is intentionally excluded: at `N = 1`, address derivation in
+    // `create_address` takes the single-key P2PK branch and emits a
+    // pay-to-pubkey address rather than a P2SH multisig. The helper exercises the
+    // `OpCheckMultiSig` consensus-script path, which the (1,1) cell does not reach;
+    // covering it requires a different harness shape on the P2PK send path and falls
+    // outside the OpCheckMultiSig-slot defect class the call-site derivation-index closes.
+
+    /// (N=2, K=2) cell, all-local cosigners.
+    #[tokio::test]
+    async fn multisig_send_extract_2_of_2() {
+        run_multisig_send_extract_for_cell(2, 0, 2).await;
+    }
+
+    /// (N=3, K=2) cell, 2 local + 1 external xpub.
+    #[tokio::test]
+    async fn multisig_send_extract_2_of_3_mixed_external() {
+        run_multisig_send_extract_for_cell(2, 1, 2).await;
+    }
+
+    /// (N=4, K=2) cell, 2 local + 2 external xpubs.
+    #[tokio::test]
+    async fn multisig_send_extract_2_of_4_mixed_external() {
+        run_multisig_send_extract_for_cell(2, 2, 2).await;
+    }
+
+    /// (N=5, K=3) cell, 3 local + 2 external xpubs.
+    #[tokio::test]
+    async fn multisig_send_extract_3_of_5_mixed_external() {
+        run_multisig_send_extract_for_cell(3, 2, 3).await;
+    }
+
+    /// (N=6, K=3) cell, 3 local + 3 external xpubs.
+    #[tokio::test]
+    async fn multisig_send_extract_3_of_6_mixed_external() {
+        run_multisig_send_extract_for_cell(3, 3, 3).await;
+    }
+
+    /// Drives an 8-of-15 multisig (8 local seeds + 7 external xpubs) end-to-end
+    /// through the same production PSKT-construction path the smaller cells use.
+    /// N=15 is the largest Schnorr P2SH cosigner count whose canonical redeem
+    /// script fits the consensus `MAX_SCRIPT_ELEMENT_SIZE` PUSHDATA cap (the
+    /// `MAX_PUB_KEYS_PER_MUTLTISIG = 20` stack-pubkey cap is looser than the
+    /// element-size cap, so the effective Schnorr P2SH limit binds at N=15).
+    /// This cell pushes Finalizer reorder over the largest currently-shippable
+    /// xpub set.
+    #[tokio::test]
+    async fn multisig_send_extract_8_of_15_max_p2sh_element_size() {
+        run_multisig_send_extract_for_cell(8, 7, 8).await;
+    }
+
+    /// Wallet rejects a multisig with cosigner count above the consensus
+    /// maximum at account-creation time rather than letting consensus reject
+    /// the spend later. Constructing a 222-cosigner account must fail with
+    /// `MultisigPubKeyCountExceedsConsensus`; 222 is well above
+    /// `kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG` and triggers the guard
+    /// inside `normalize_and_merge_xpubs`. The xpubs are cloned from a single
+    /// derivation because the guard fires on count alone, not on uniqueness.
+    #[tokio::test]
+    async fn multisig_create_rejects_pub_key_count_above_consensus_max() {
+        let xpub =
+            xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
+        let generated_xpubs: Vec<String> = vec![xpub; 222];
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 111)
+            .expect_err("222-cosigner multisig must be rejected before redeem-script construction");
+        match err {
+            Error::MultisigPubKeyCountExceedsConsensus { count, max } => {
+                assert_eq!(count, 222, "rejection names the supplied N");
+                assert_eq!(max, kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize, "rejection names the consensus max");
+            }
+            other => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+        }
+    }
+
+    /// Wallet rejects a multisig whose signature threshold exceeds the
+    /// cosigner count (K > N is mathematically unreachable). 45-of-14 must
+    /// fail with `MultisigInvalidThreshold`.
+    #[tokio::test]
+    async fn multisig_create_rejects_threshold_above_cosigner_count() {
+        let xpub =
+            xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
+        let generated_xpubs: Vec<String> = vec![xpub; 14];
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 45)
+            .expect_err("45-of-14 must be rejected before redeem-script construction");
+        match err {
+            Error::MultisigInvalidThreshold { k, n } => {
+                assert_eq!(k, 45, "rejection names the supplied K");
+                assert_eq!(n, 14, "rejection names the supplied N");
+            }
+            other => panic!("expected MultisigInvalidThreshold, got {other:?}"),
+        }
+    }
+
+    /// Wallet rejects every cosigner count whose Schnorr P2SH redeem script
+    /// exceeds the consensus `MAX_SCRIPT_ELEMENT_SIZE` PUSHDATA cap. The
+    /// canonical script length is `K_bytes + 33*N + N_bytes + 1` where K and
+    /// N use the small-int opcode (1 byte) for values 1..=16 and the
+    /// one-byte PUSHDATA form (2 bytes) for 17..=20. Every cosigner count in
+    /// {16, 17, 18, 19, 20} stays inside `MAX_PUB_KEYS_PER_MUTLTISIG` but
+    /// exceeds the 520-byte PUSHDATA cap. The wallet must refuse at
+    /// creation time rather than letting `ScriptBuilder::add_data` panic
+    /// later during script_sig assembly.
+    #[tokio::test]
+    async fn multisig_create_rejects_redeem_script_above_element_size_at_each_boundary_n() {
+        let xpub =
+            xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
+        // Predicted sizes for K=1: N=16 -> 1+528+1+1=531; N=17 -> 1+561+2+1=565;
+        // N=18 -> 1+594+2+1=598; N=19 -> 1+627+2+1=631; N=20 -> 1+660+2+1=664.
+        let cells: &[(usize, usize)] = &[(16, 531), (17, 565), (18, 598), (19, 631), (20, 664)];
+        for &(n, expected_size) in cells {
+            let generated_xpubs: Vec<String> = vec![xpub.clone(); n];
+            let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 1)
+                .expect_err("Schnorr multisig at boundary N must reject (redeem script exceeds element-size cap)");
+            match err {
+                Error::MultisigRedeemScriptExceedsElementSize { size, max } => {
+                    assert_eq!(size, expected_size, "N={n}: rejection names the predicted redeem-script size");
+                    assert_eq!(max, kaspa_txscript::MAX_SCRIPT_ELEMENT_SIZE, "N={n}: rejection names the consensus element-size cap");
+                }
+                other => panic!("N={n}: expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+            }
+        }
+    }
+
+    /// Wallet rejects a multisig whose cosigner set contains duplicate xpubs.
+    /// Two cosigners sharing an xpub would collapse onto the same redeem-script
+    /// slot, letting a single signer satisfy K of those slots and breaking the
+    /// K-of-N threshold guarantee. Detection runs after sort so duplicates are
+    /// adjacent.
+    #[tokio::test]
+    async fn multisig_create_rejects_duplicate_xpubs() {
+        let xpub =
+            xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
+        // Two identical xpubs, K=2 over N=2, well inside the count and element-size guards.
+        let generated_xpubs: Vec<String> = vec![xpub.clone(); 2];
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 2)
+            .expect_err("duplicate-xpub multisig must be rejected at creation time");
+        match err {
+            Error::MultisigDuplicateXpub { xpub: dup } => {
+                assert_eq!(dup, xpub, "rejection names the duplicate xpub");
+            }
+            other => panic!("expected MultisigDuplicateXpub, got {other:?}"),
+        }
+    }
+
+    /// Cross-check `predicted_schnorr_redeem_script_size` against the byte
+    /// length the canonical builder `kaspa_txscript::multisig_redeem_script`
+    /// emits for the same (K, N). If the helper drifts from the canonical
+    /// encoding the on-disk wallet would accept parameters that fail later
+    /// at extract, undoing the consensus guard.
+    #[tokio::test]
+    async fn predicted_schnorr_redeem_script_size_matches_canonical_builder() {
+        use kaspa_txscript::multisig_redeem_script;
+        // Cells span the small-int boundary (K, N <= 16) and the PUSHDATA
+        // boundary (17..=20). Pubkey bytes are synthetic: the canonical
+        // builder treats them as opaque 32-byte pushdatas.
+        let cells: &[(u16, usize)] =
+            &[(1, 1), (2, 2), (1, 16), (16, 16), (1, 17), (13, 17), (1, 20), (20, 20), (3, 5), (8, 15), (15, 15)];
+        for &(k, n) in cells {
+            let pubkeys: Vec<[u8; 32]> = (0u8..n as u8).map(|i| [i; 32]).collect();
+            let actual = multisig_redeem_script(pubkeys.iter().copied(), k as usize).expect("canonical redeem script");
+            let predicted = predicted_schnorr_redeem_script_size(k, n);
+            assert_eq!(actual.len(), predicted, "predicted size must match canonical builder output for {k}-of-{n}");
+        }
+    }
+
+    /// Drives a 2-of-3 multisig (2 local seeds + 1 external xpub) end-to-end through
+    /// the production PSKT-construction path: `Generator` -> `PSKTGenerator` ->
+    /// `bundle_from_pskt_generator` -> `convert.rs::Inner::try_from`. The conversion
+    /// path constructs PSKT inputs with `redeem_script: None` (it has no Account-aware
+    /// branch); without `redeem_script`, the Finalizer's `Some` branch is never
+    /// reached, the `None` branch emits a `script_sig` with no trailing redeem-script
+    /// push, and consensus-script-verify fails the P2SH BLAKE2B check at extract,
+    /// returning `Err(EvalFalse)`.
+    ///
+    /// The 5 parametrized cells in the matrix above bypass this code path by constructing
+    /// PSKTs via `InputBuilder::default().redeem_script(...).build()` directly -- they
+    /// exercise the Finalizer's `Some` branch in isolation but skip the
+    /// production conversion. This test closes the structural coverage gap by going
+    /// through the production conversion path. Without per-input `redeem_script`
+    /// population the extract returns `Err(EvalFalse)`; with the redeem_script
+    /// population in `build_multisig_signed_bundle` running between
+    /// `bundle_from_pskt_generator` and the per-cosigner sign loop, the
+    /// Finalizer's `Some` branch assembles a consensus-clean P2SH-multisig
+    /// `script_sig`, and `extract_tx` returns `Ok`.
+    #[tokio::test]
+    async fn multisig_send_extract_via_pskt_generator_2_of_3_mixed_external() {
+        use crate::account::variants::multisig::build_multisig_signed_bundle;
+        use crate::tx::{Fees, GeneratorSettings, PaymentDestination, PaymentOutputs};
+        use crate::utils::kaspa_to_sompi;
+        use crate::utxo::UtxoEntryReference;
+
+        let mnemonics = make_local_mnemonics(3).await;
+        let local_a = mnemonics[0].clone();
+        let local_b = mnemonics[1].clone();
+        let external_xpub = xpub_from_mnemonic_phrase(mnemonics[2].phrase()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(local_a, None), (local_b, None)];
+        let account =
+            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub]).await.unwrap();
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids: Vec<PrvKeyDataId> = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").as_ref().clone();
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let xpub_keys_strings: Vec<String> = xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let network_id = wallet.network_id().unwrap();
+
+        // Synthetic UTXO at the multisig's receive[0] address; `simulated_with_address`
+        // sets `script_public_key = pay_to_address_script(&receive_address)`, the same
+        // P2SH script the multisig commits to.
+        let receive_address = account.receive_address().unwrap();
+        let amount: u64 = kaspa_to_sompi(10.0);
+        let utxo_entry = UtxoEntryReference::simulated_with_address(amount, &receive_address);
+
+        // Destination address (a fixed testnet payment target). The Generator selects the
+        // single available UTXO as input and produces a payment-plus-change transaction.
+        let destination_address =
+            Address::try_from("kaspatest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er").unwrap();
+        let payment_outputs: PaymentOutputs = (&[(destination_address, kaspa_to_sompi(1.0))] as &[(Address, u64)]).into();
+        let final_destination: PaymentDestination = payment_outputs.into();
+
+        // GeneratorSettings is built directly (mirrors `make_generator` in
+        // `tx/generator/test.rs`) so the test does not depend on a populated UtxoContext.
+        // sig_op_count = N (multisig); minimum_signatures = K; change_address routes back
+        // to the multisig's receive[0]. The single UTXO is delivered via the iterator.
+        let utxo_iter: Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static> = Box::new(std::iter::once(utxo_entry));
+        let settings = GeneratorSettings {
+            network_id,
+            multiplexer: None,
+            sig_op_count: xpub_keys.len() as u8,
+            minimum_signatures: 2,
+            change_address: receive_address.clone(),
+            utxo_iterator: utxo_iter,
+            source_utxo_context: None,
+            priority_utxo_entries: None,
+            destination_utxo_context: None,
+            fee_rate: None,
+            final_transaction_priority_fee: Fees::SenderPays(kaspa_to_sompi(0.001)),
+            final_transaction_destination: final_destination,
+            final_transaction_payload: None,
+        };
+
+        let abortable = Abortable::default();
+        let (bundle, _summary) = build_multisig_signed_bundle(
+            account.clone(),
+            xpub_keys_strings,
+            prv_key_data_ids,
+            2,
+            settings,
+            wallet_secret,
+            None,
+            &abortable,
+            None,
+        )
+        .await
+        .expect("build_multisig_signed_bundle: signed bundle through production conversion path");
+
+        assert!(!bundle.0.is_empty(), "bundle has at least one PSKT");
+        for pskt_inner in bundle.0.iter() {
+            for input in pskt_inner.inputs.iter() {
+                assert!(
+                    input.redeem_script.is_some(),
+                    "every input populates redeem_script via the population block in build_multisig_signed_bundle",
+                );
+                assert_eq!(input.partial_sigs.len(), 2, "exactly K=2 signatures per input");
+            }
+        }
+
+        // Finalize and extract every PSKT in the bundle. The extractor invokes
+        // `TxScriptEngine::execute()` per input. Without per-input `redeem_script`
+        // population the conversion-path bundle has `redeem_script: None`, the
+        // Finalizer's `None` branch emits a malformed `script_sig`, and `extract_tx`
+        // returns `Err(EvalFalse)`. With `redeem_script` populated every input carries
+        // it, the Finalizer's `Some` branch assembles a consensus-clean
+        // P2SH-multisig `script_sig`, and `extract_tx` returns `Ok`.
+        let params = Params::from(network_id);
+        for pskt_inner in bundle.0.into_iter() {
+            let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> = PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(pskt_inner);
+            let finalizer_pskt = signer_pskt.finalizer();
+            let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+            let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+            let extract_result = extractor.extract_tx(&params);
+            assert!(extract_result.is_ok(), "extract_tx must succeed via the production PSKT-conversion path; got {extract_result:?}",);
+        }
+    }
+
+    /// Pins the wallet-level encryption query against multi-id accounts.
+    /// The trait-default single-key accessor `Account::prv_key_data_id` is
+    /// intentionally unimplemented on multisig (a multisig has 0..N local
+    /// keys, not exactly one), so the encryption query MUST iterate the
+    /// `AssocPrvKeyDataIds` set rather than dereferencing the single-key
+    /// surface. Asserts `is_account_key_encrypted` returns `Some(false)`
+    /// for a multisig imported with unencrypted local cosigner keys.
+    #[tokio::test]
+    async fn multisig_account_encryption_query_returns_unencrypted() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        let result = wallet.is_account_key_encrypted(&account).await.expect("multi-id account encryption query succeeds");
+        assert_eq!(result, Some(false), "unencrypted local cosigner keys yield Some(false)");
+    }
+
+    /// A 1-of-1 multisig account (1 cosigner xpub, 1 local mnemonic, Schnorr)
+    /// derives a P2PK receive address. Per `Address` in
+    /// `libkaspawallet/keypair.go` (1-of-1 branch returns `p2pkAddress`), the
+    /// Go-wallet derives P2PK at single-cosigner count; rusty-kaspa matches
+    /// via `derivation::create_address` `keys.len() <= 1` branch. The P2PK
+    /// address shape is the precondition for the single-signature
+    /// send-routing branch in `MultiSig::send` / `sweep` /
+    /// `pskb_from_send_generator`; a derived `Version::ScriptHash` would put
+    /// the routing fix on the wrong branch and trip `OpCheckSig` at consensus
+    /// extract.
+    #[tokio::test]
+    async fn multisig_one_of_one_derives_p2pk_schnorr() {
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let account = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], vec![], None, 1)
+            .await
+            .unwrap();
+
+        let address = account.receive_address().unwrap();
+        assert_eq!(
+            address.version,
+            kaspa_addresses::Version::PubKey,
+            "1-of-1 Schnorr multisig must derive a P2PK address; got {:?}",
+            address.version
+        );
+    }
+
+    /// A 1-of-1 multisig account with `ecdsa=true` derives a P2PK-ECDSA
+    /// receive address. `create_account_multisig` hardcodes `ecdsa=false`, so
+    /// the ECDSA-variant account is built via `MultiSig::try_new` directly.
+    /// Verifies that the single-cosigner P2PK branch in
+    /// `derivation::create_address` propagates the `ecdsa` flag to
+    /// `PubkeyDerivationManager::create_address`, producing the
+    /// `Version::PubKeyECDSA` address shape Go-wallet derives for an ECDSA
+    /// 1-of-1 keypair wallet.
+    #[tokio::test]
+    async fn multisig_one_of_one_derives_p2pk_ecdsa() {
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let xpub_key = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+
+        let account =
+            MultiSig::try_new(&wallet, None, Arc::new(vec![xpub_key]), Some(Arc::new(vec![prv_key_data.id])), Some(0), 1, true)
+                .await
+                .unwrap();
+
+        let address = account.receive_address().unwrap();
+        assert_eq!(
+            address.version,
+            kaspa_addresses::Version::PubKeyECDSA,
+            "1-of-1 ECDSA multisig must derive a P2PK-ECDSA address; got {:?}",
+            address.version
+        );
+    }
+}
