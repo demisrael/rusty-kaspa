@@ -500,6 +500,93 @@ impl Account for MultiSig {
         .await?;
         Ok(bundle)
     }
+
+    /// Apply local-cosigner signatures to an inbound PSKT bundle.
+    ///
+    /// Two divergences from the trait-default single-signature path are
+    /// required to make multisig spending actually work:
+    ///
+    /// 1. **`input.redeem_script` MUST be populated on every PSKT input
+    ///    before the per-cosigner signer is invoked.** The PSKT-conversion
+    ///    helper builds inputs with `redeem_script: None`; without it the
+    ///    Finalizer's `None` branch emits an empty `script_sig` and the
+    ///    consensus-side P2SH script-hash check rejects the extracted
+    ///    transaction. The shared helper applies the population step
+    ///    idempotently (an upstream cosigner's contribution is preserved).
+    /// 2. **Per-cosigner key derivation uses the multisig path**
+    ///    `m/45'/111111'/account_index'/<cosigner_index>/<address_type>/<address_index>`,
+    ///    not the BIP-32 single-sig path. Routing through
+    ///    `pskb_signer_for_multisig_cosigner` enforces this; the
+    ///    trait-default path routes through `pskb_signer_for_address` whose
+    ///    derivation is single-sig and produces signing keys whose pubkeys
+    ///    do not match any redeem-script slot.
+    ///
+    /// The override loops the local cosigner set: each iteration loads
+    /// the corresponding private key data, signs every PSKT input whose
+    /// redeem-script slot the cosigner can satisfy, and merges the
+    /// per-cosigner partial signatures into the accumulator. The per-input
+    /// `K`-cap break-out gate caps the bundle at exactly K signatures so
+    /// the resulting `script_sig` does not trip `CleanStack` at consensus.
+    async fn pskb_sign(
+        self: Arc<Self>,
+        bundle: &Bundle,
+        wallet_secret: Secret,
+        payment_secret: Option<Secret>,
+        _sign_for_address: Option<&Address>,
+    ) -> Result<Bundle, Error> {
+        let prv_key_data_ids: Vec<PrvKeyDataId> = match self.prv_key_data_ids.as_ref() {
+            Some(ids) if !ids.is_empty() => ids.as_ref().clone(),
+            _ => return Err(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures }),
+        };
+
+        let k = self.minimum_signatures;
+        let network_id = self.wallet().clone().network_id()?;
+        let prv_key_data_store = self.wallet().store().as_prv_key_data_store()?;
+        let multisig_derivation_index = self.cosigner_index() as u32;
+
+        let account_dyn = self.clone().as_dyn_arc();
+        let mut accumulator = Bundle(bundle.0.clone());
+        populate_multisig_redeem_scripts(account_dyn.clone(), &mut accumulator, k).await?;
+
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            let already_fully_signed =
+                accumulator.iter().all(|pskt_inner| pskt_inner.inputs.iter().all(|input| input.partial_sigs.len() >= k as usize));
+            if already_fully_signed {
+                break;
+            }
+
+            let prv_key_data = prv_key_data_store
+                .load_key_data(&wallet_secret, prv_key_data_id)
+                .await?
+                .ok_or(Error::PrivateKeyNotFound(*prv_key_data_id))?;
+
+            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                &accumulator,
+                account_dyn.clone(),
+                &prv_key_data,
+                payment_secret.as_ref(),
+                multisig_derivation_index,
+                network_id,
+            )
+            .await?;
+
+            if accumulator.0.len() != per_cosigner_bundle.0.len() {
+                return Err(Error::custom("multisig signed bundle PSKT count mismatch with accumulator"));
+            }
+            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
+                if accumulator.0[pskt_idx].inputs.len() != signed_pskt_inner.inputs.len() {
+                    return Err(Error::custom("multisig signed bundle PSKT input count mismatch with accumulator"));
+                }
+                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                    accumulator.0[pskt_idx].inputs[input_idx] =
+                        (accum_input + signed_input).map_err(|e| Error::custom(e.to_string()))?;
+                }
+            }
+        }
+
+        Ok(accumulator)
+    }
 }
 
 /// Build a fully-signed PSKB across the operator's local cosigner set.
@@ -553,56 +640,12 @@ pub(crate) async fn build_multisig_signed_bundle(
     let pskt_generator = PSKTGenerator::new(generator.clone(), placeholder_signer, account.wallet().address_prefix()?);
     let mut accumulator = bundle_from_pskt_generator(pskt_generator).await?;
 
-    // Populate `redeem_script` on every PSKT input. The PSKT-conversion path
-    // (`wallet/pskt/src/convert.rs::Inner::try_from`) builds inputs without populating
-    // this field; the Finalizer's `Some(redeem_script)` branch is what assembles
-    // a P2SH-multisig `script_sig` of the shape `OpData65 || sig_1 || sighash_type
-    // || ... || OpData65 || sig_K || sighash_type || PUSHDATA(redeem_script)`.
-    // Without `redeem_script`, the Finalizer's `None` branch emits sigs with no trailing
-    // redeem-script push; consensus-script-verify then fails P2SH BLAKE2B match and
-    // returns `EvalFalse` at extract.
-    //
-    // The redeem_script per input is `multisig_redeem_script(slot_pubkeys, K)` where
-    // `slot_pubkeys[i] = xpub_keys[i].derive_child(cosigner_index).derive_child(address_type)
-    // .derive_child(address_index).public_key()` -- the same reduction the
-    // `AddressDerivationManager` walks when assembling the receive/change address. The
-    // `(address_type, address_index)` pair is recovered from the input's UTXO address
-    // via the same `addresses_indexes` lookup `pskb_signer_for_multisig_cosigner` uses
-    // for per-cosigner key resolution.
-    {
-        let derivation_capable = account.clone().as_derivation_capable()?;
-        let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?.clone();
-        for pskt_inner in accumulator.0.iter_mut() {
-            for input in pskt_inner.inputs.iter_mut() {
-                if input.redeem_script.is_some() {
-                    continue;
-                }
-                let utxo_entry = input.utxo_entry.as_ref().ok_or_else(|| Error::custom("input missing utxo_entry"))?;
-                let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
-                let address_ref = &address;
-                let (receive_idxs, change_idxs) = derivation_capable.derivation().addresses_indexes(&[address_ref])?;
-                let (address_type, address_index) = if let Some((_, idx)) = receive_idxs.first() {
-                    (AddressType::Receive, *idx)
-                } else if let Some((_, idx)) = change_idxs.first() {
-                    (AddressType::Change, *idx)
-                } else {
-                    return Err(Error::custom(format!("address {address} not in derivation manager")));
-                };
-                let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
-                for xpub in xpub_keys.iter() {
-                    let derived = xpub
-                        .clone()
-                        .derive_child(ChildNumber::new(multisig_derivation_index, false)?)?
-                        .derive_child(ChildNumber::new(address_type.index(), false)?)?
-                        .derive_child(ChildNumber::new(address_index, false)?)?;
-                    slot_pubkeys.push(*derived.public_key());
-                }
-                let redeem_script =
-                    multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)?;
-                input.redeem_script = Some(redeem_script);
-            }
-        }
-    }
+    // Populate `redeem_script` on every PSKT input via the shared helper.
+    // The PSKT-conversion path (`wallet/pskt/src/convert.rs::Inner::try_from`)
+    // builds inputs without populating this field; without it the Finalizer's
+    // `None` branch emits an empty `script_sig` and consensus rejects the
+    // extracted transaction with a P2SH-hash mismatch.
+    populate_multisig_redeem_scripts(account.clone(), &mut accumulator, k).await?;
 
     for prv_key_data_id in prv_key_data_ids.iter() {
         let already_fully_signed =
@@ -653,6 +696,66 @@ pub(crate) async fn build_multisig_signed_bundle(
     }
 
     Ok((accumulator, generator.summary()))
+}
+
+/// Populate `input.redeem_script` on every PSKT input of every PSKT in
+/// the bundle that does not already carry one.
+///
+/// The PSKT-conversion path (`wallet/pskt/src/convert.rs::Inner::try_from`)
+/// builds inputs with `redeem_script: None`; the Finalizer's
+/// `Some(redeem_script)` branch is what assembles a P2SH-multisig
+/// `script_sig` of the shape
+/// `OpData65 || sig_1 || sighash_type || ... || OpData65 || sig_K || sighash_type || PUSHDATA(redeem_script)`.
+/// Without `redeem_script` the Finalizer's `None` branch emits signatures
+/// with no trailing redeem-script push, the assembled `script_sig` fails
+/// the consensus-side P2SH script-hash check at extract, and the transaction
+/// is rejected with `EvalFalse`.
+///
+/// The redeem-script per input is `multisig_redeem_script(slot_pubkeys, k)`
+/// where each slot pubkey is derived from the corresponding cosigner xpub at
+/// `derive_child(account.cosigner_index()).derive_child(address_type).derive_child(address_index)`.
+/// The `(address_type, address_index)` pair is recovered from the input's UTXO
+/// address via the derivation manager's `addresses_indexes` lookup. The shared
+/// helper is reused by both the operator-Send path (`build_multisig_signed_bundle`)
+/// and the REPL `pskb sign` path (`MultiSig::pskb_sign`); idempotency on
+/// pre-populated inputs makes the call safe in multi-party PSKT exchange
+/// chains where an upstream cosigner has already attached the redeem-script.
+pub(crate) async fn populate_multisig_redeem_scripts(account: Arc<dyn Account>, bundle: &mut Bundle, k: u16) -> Result<()> {
+    let derivation_capable = account.clone().as_derivation_capable()?;
+    let multisig_derivation_index = derivation_capable.cosigner_index();
+    let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?.clone();
+    let network_id = account.wallet().clone().network_id()?;
+    for pskt_inner in bundle.0.iter_mut() {
+        for input in pskt_inner.inputs.iter_mut() {
+            if input.redeem_script.is_some() {
+                continue;
+            }
+            let utxo_entry = input.utxo_entry.as_ref().ok_or_else(|| Error::custom("input missing utxo_entry"))?;
+            let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
+            let address_ref = &address;
+            let (receive_idxs, change_idxs) = derivation_capable.derivation().addresses_indexes(&[address_ref])?;
+            let (address_type, address_index) = if let Some((_, idx)) = receive_idxs.first() {
+                (AddressType::Receive, *idx)
+            } else if let Some((_, idx)) = change_idxs.first() {
+                (AddressType::Change, *idx)
+            } else {
+                return Err(Error::custom(format!("address {address} not in derivation manager")));
+            };
+            let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+            for xpub in xpub_keys.iter() {
+                let derived = xpub
+                    .clone()
+                    .derive_child(ChildNumber::new(multisig_derivation_index, false)?)?
+                    .derive_child(ChildNumber::new(address_type.index(), false)?)?
+                    .derive_child(ChildNumber::new(address_index, false)?)?;
+                slot_pubkeys.push(*derived.public_key());
+            }
+            let redeem_script =
+                multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)?;
+            input.redeem_script = Some(redeem_script);
+        }
+    }
+    Ok(())
 }
 
 impl DerivationCapableAccount for MultiSig {

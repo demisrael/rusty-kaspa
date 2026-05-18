@@ -2151,6 +2151,97 @@ mod multisig_tests {
         }
     }
 
+    /// A multisig account's address-watch surface enumerates every
+    /// cosigner-prefix family in `[0, N)`. Each cosigner-prefix family carries
+    /// a distinct `(receive_address_manager, change_address_manager)` pair
+    /// driven by a different BIP-32 child step at the cosigner-index slot, so
+    /// the per-family first-receive addresses are pairwise distinct. The
+    /// local family aliases the wallet's `receive_address_manager` exactly,
+    /// so every caller that already held an `Arc` to it continues to
+    /// operate against the same backing `AddressManager`.
+    #[tokio::test]
+    async fn multisig_sync_layer_enumerates_all_cosigner_prefix_families() {
+        for &(n, k) in &[(3usize, 2u16), (4, 2), (5, 3), (6, 3)] {
+            let wallet = test_wallet().await;
+            let wallet_secret = Secret::new(vec![]);
+
+            // One local seed; the remaining `n - 1` xpubs join as external.
+            let local_mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+            let prv_key_data =
+                storage::PrvKeyData::try_new_from_mnemonic(local_mnemonic.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+            prv_key_data_store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+            wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+            // `n - 1` external KTUB-prefixed xpubs derived from random
+            // mnemonics; matches the cosigner-onboarding shape where peers
+            // exchange xpubs only.
+            let mut external_xpubs = Vec::with_capacity(n - 1);
+            let external_mnemonics = make_local_mnemonics(n - 1).await;
+            for m in external_mnemonics.iter() {
+                let raw_xpub = {
+                    let kd = storage::PrvKeyData::try_new_from_mnemonic(m.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+                    let xpub = kd.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+                    xpub.to_string(Some(KeyPrefix::XPUB))
+                };
+                let mut k_xpub = kaspa_bip32::ExtendedKey::from_str(&raw_xpub).unwrap();
+                k_xpub.prefix = KeyPrefix::KTUB;
+                external_xpubs.push(k_xpub.to_string());
+            }
+
+            let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
+            let account = wallet.create_account_multisig(&wallet_secret, create_args, external_xpubs.clone(), None, k).await.unwrap();
+
+            // Cast to a `DerivationCapableAccount` so we can reach the
+            // `AddressDerivationManager` and its newly exposed families.
+            let derivation_capable = account.clone().as_derivation_capable().unwrap();
+            let derivation = derivation_capable.derivation();
+            let families = derivation.address_manager_families();
+
+            assert_eq!(families.len(), n, "({n},{k}) cell: expected N={n} cosigner-prefix families, got {}", families.len());
+
+            for (i, family) in families.iter().enumerate() {
+                assert_eq!(family.cosigner_index, i as u32, "({n},{k}) family {i}: cosigner_index slot must equal vector position");
+            }
+
+            // Every family produces a distinct first-receive address: the
+            // BIP-32 child step at the cosigner_index slot differs per family,
+            // so the per-xpub derived child pubkeys differ, the redeem-script
+            // bytes differ, and the BLAKE2B P2SH hash differs.
+            let mut receive_addresses = Vec::with_capacity(n);
+            for family in families.iter() {
+                receive_addresses.push(family.receive.current_address().unwrap());
+            }
+            for i in 0..n {
+                for j in (i + 1)..n {
+                    assert_ne!(
+                        receive_addresses[i], receive_addresses[j],
+                        "({n},{k}): family {i} and family {j} must derive distinct P2SH receive addresses"
+                    );
+                }
+            }
+
+            // Local-family aliasing invariant: the family at the local
+            // `cosigner_index` aliases the trait-exposed
+            // `receive_address_manager` / `change_address_manager` Arcs, so
+            // every caller against `derivation.receive_address_manager()`
+            // continues to operate against the same backing AddressManager.
+            let multisig = account.downcast_arc::<MultiSig>().unwrap();
+            let local_cosigner_index = multisig.cosigner_index() as usize;
+            let local_family = &families[local_cosigner_index];
+            let local_receive = derivation.receive_address_manager();
+            let local_change = derivation.change_address_manager();
+            assert!(
+                Arc::ptr_eq(&local_family.receive, &local_receive),
+                "({n},{k}): local-family receive AddressManager must alias the trait-exposed receive_address_manager"
+            );
+            assert!(
+                Arc::ptr_eq(&local_family.change, &local_change),
+                "({n},{k}): local-family change AddressManager must alias the trait-exposed change_address_manager"
+            );
+        }
+    }
+
     /// `create_account_multisig` and `import_multisig_with_mnemonic` produce
     /// byte-equal P2SH first-receive addresses when given equivalent inputs
     /// (same mnemonics + same external xpub + same `minimum_signatures`).
@@ -2347,6 +2438,106 @@ mod multisig_tests {
                 "per-cosigner derived pubkey at position {cosigner_position} matches the redeem-script slot",
             );
         }
+    }
+
+    /// `MultiSig::pskb_sign` populates `input.redeem_script` on every PSKT
+    /// input before per-cosigner signing.
+    ///
+    /// The trait-default `Account::pskb_sign` routes through the generic
+    /// `pskb_signer_for_address` helper which has no concept of multisig and
+    /// leaves `input.redeem_script` empty; the Finalizer's `None` branch
+    /// then emits a `script_sig` whose P2SH-hash mismatch is rejected at
+    /// consensus extract. The override fixes this by populating
+    /// `input.redeem_script` via the shared helper and routing through
+    /// `pskb_signer_for_multisig_cosigner` for the per-cosigner signature
+    /// chain.
+    ///
+    /// Idempotency cell: a second `pskb_sign` invocation on an already
+    /// populated bundle leaves `redeem_script` unchanged (the helper's
+    /// `.is_some()` skip-guard), so the multi-party PSKT exchange chain does
+    /// not let a downstream cosigner overwrite an upstream cosigner's
+    /// redeem-script contribution.
+    #[tokio::test]
+    async fn multisig_pskb_sign_populates_redeem_script() {
+        // The same `(2, 2)` known-fixture mnemonics
+        // `test_pskb_signer_for_multisig_cosigner_known_fixture` uses, so the
+        // expected slot pubkeys and redeem-script bytes are reproducible from
+        // the same canonical derivation walk. `\`-continuation collapses the
+        // following line's leading whitespace per Rust string-literal rules.
+        let phrase_a = "caution guide valley easily latin already visual fancy fork car switch runway \
+                        vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
+        let phrase_b = "fiber boy desk trip pitch snake table awkward endorse car learn forest \
+                        solid ticket enemy pink gesture wealth iron chaos clock gather honey farm";
+        let mnemonics = [Mnemonic::new(phrase_a, Language::English).unwrap(), Mnemonic::new(phrase_b, Language::English).unwrap()];
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        // Build a single-input unsigned PSKT pointing at the multisig's receive address.
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xab; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let bundle = Bundle::from(pskt_inner);
+
+        // The fresh bundle has no redeem-script on its input -- the
+        // PSKT-conversion path builds inputs with `redeem_script: None`.
+        assert!(
+            bundle.as_ref()[0].inputs[0].redeem_script.is_none(),
+            "pre-condition: PSKT-conversion path leaves redeem_script unpopulated",
+        );
+
+        // The override populates `redeem_script` AND adds the per-cosigner
+        // signatures for the wallet's local seeds (2 local seeds in this
+        // fixture, so the returned bundle is fully-signed).
+        let signed_bundle = account.clone().pskb_sign(&bundle, wallet_secret.clone(), None, None).await.unwrap();
+        let signed_input = &signed_bundle.as_ref()[0].inputs[0];
+        let populated_redeem_script = signed_input.redeem_script.as_ref().expect("MultiSig::pskb_sign populated redeem_script").clone();
+
+        // Byte-identity against the canonical builder: the slot pubkeys are
+        // each cosigner's xpub derived through
+        // `multisig_derivation_index / receive / 0` -- the same reduction the
+        // operator-Send path applies at `build_multisig_signed_bundle`. The
+        // helper's emission must match byte-for-byte or the parent's
+        // `multisig_send_extract_*` extract-test family would diverge.
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
+        let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+        for xpub in xpub_keys.iter() {
+            let derived = xpub
+                .clone()
+                .derive_child(ChildNumber::new(multisig_derivation_index, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap();
+            slot_pubkeys.push(*derived.public_key());
+        }
+        let expected_redeem_script =
+            multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2).unwrap();
+        assert_eq!(populated_redeem_script, expected_redeem_script, "populated redeem_script byte-equals multisig_redeem_script(K=2)");
+
+        // Idempotency: a second invocation on the already-populated bundle
+        // preserves the redeem-script (no overwrite). This is the multi-party
+        // PSKT exchange invariant -- a downstream cosigner receiving the
+        // bundle does not overwrite the upstream cosigner's redeem-script
+        // contribution.
+        let twice_signed = account.clone().pskb_sign(&signed_bundle, wallet_secret.clone(), None, None).await.unwrap();
+        let twice_signed_redeem = twice_signed.as_ref()[0].inputs[0].redeem_script.as_ref().expect("idempotent populate").clone();
+        assert_eq!(twice_signed_redeem, populated_redeem_script, "second pskb_sign preserves the existing redeem_script byte-for-byte");
     }
 
     /// K-of-N multi-cosigner signing flow produces exactly K signatures per
