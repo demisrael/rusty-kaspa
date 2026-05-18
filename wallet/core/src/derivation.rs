@@ -171,6 +171,21 @@ impl AddressManager {
     }
 }
 
+/// One cosigner-prefix family's address watch surface.
+///
+/// A multisig account's address-watch layer enumerates every cosigner-prefix
+/// family in `[0, N)` so the wallet sees UTXOs funded to peer cosigners'
+/// addresses, not only its own. Each family carries an independent pair of
+/// `AddressManager` instances tracking the family's receive and change
+/// derivation indexes. Non-multisig accounts expose a single family at
+/// `cosigner_index = 0` and behave identically to the single-pair shape.
+#[derive(Clone)]
+pub struct AddressManagerFamily {
+    pub cosigner_index: u32,
+    pub receive: Arc<AddressManager>,
+    pub change: Arc<AddressManager>,
+}
+
 pub struct AddressDerivationManager {
     pub account_kind: AccountKind,
     pub account_index: u64,
@@ -180,6 +195,13 @@ pub struct AddressDerivationManager {
     wallet: Arc<Wallet>,
     pub receive_address_manager: Arc<AddressManager>,
     pub change_address_manager: Arc<AddressManager>,
+    /// All cosigner-prefix families: length N for `MULTISIG_ACCOUNT_KIND`
+    /// accounts, length 1 for every other account kind. The entry whose
+    /// `cosigner_index` equals the local wallet's `cosigner_index` aliases
+    /// `receive_address_manager` / `change_address_manager` exactly, so
+    /// callers that only ever look at the local family continue to operate
+    /// against the same `Arc` they always have.
+    pub address_manager_families: Vec<AddressManagerFamily>,
 }
 
 impl AddressDerivationManager {
@@ -197,41 +219,92 @@ impl AddressDerivationManager {
             return Err("Invalid keys: keys are required for address derivation".to_string().into());
         }
 
-        let mut receive_pubkey_managers = vec![];
-        let mut change_pubkey_managers = vec![];
-        let mut derivators = vec![];
-        for xpub in keys.iter() {
-            let derivator: Arc<dyn WalletDerivationManagerTrait> = match account_kind.as_ref() {
-                LEGACY_ACCOUNT_KIND => Arc::new(WalletDerivationManagerV0::from_extended_public_key(xpub.clone(), cosigner_index)?),
-                MULTISIG_ACCOUNT_KIND => {
-                    let cosigner_index = cosigner_index.unwrap_or(0);
-                    Arc::new(WalletDerivationManager::from_extended_public_key(xpub.clone(), Some(cosigner_index))?)
-                }
-                _ => Arc::new(WalletDerivationManager::from_extended_public_key(xpub.clone(), cosigner_index)?),
-            };
+        // Enumerate every cosigner-prefix family in `[0, N)` for multisig
+        // accounts so the wallet's address-watch surface covers UTXOs funded
+        // to any cosigner's address family. Non-multisig account kinds emit
+        // a single family at the supplied `cosigner_index` and reduce to
+        // the single-pair shape.
+        let is_multisig = matches!(account_kind.as_ref(), MULTISIG_ACCOUNT_KIND);
+        let family_count = if is_multisig { keys.len() } else { 1 };
+        let local_cosigner_index = cosigner_index.unwrap_or(0);
 
-            receive_pubkey_managers.push(derivator.receive_pubkey_manager());
-            change_pubkey_managers.push(derivator.change_pubkey_manager());
-            derivators.push(derivator);
+        let mut address_manager_families: Vec<AddressManagerFamily> = Vec::with_capacity(family_count);
+        let mut local_receive_address_manager: Option<Arc<AddressManager>> = None;
+        let mut local_change_address_manager: Option<Arc<AddressManager>> = None;
+        let mut local_derivators: Option<Vec<Arc<dyn WalletDerivationManagerTrait>>> = None;
+
+        for prefix in 0..family_count {
+            // For multisig, every family iterates from 0 to N-1 and the
+            // BIP-32 child step at the cosigner_index slot is the family's
+            // own index. For non-multisig the supplied `cosigner_index`
+            // option is threaded through unchanged, preserving the `None`
+            // semantics that BIP32 / legacy callers rely on.
+            let prefix_cosigner_index: u32 = if is_multisig { prefix as u32 } else { local_cosigner_index };
+            let derivator_cosigner_index_opt: Option<u32> = if is_multisig { Some(prefix_cosigner_index) } else { cosigner_index };
+
+            let mut receive_pubkey_managers = vec![];
+            let mut change_pubkey_managers = vec![];
+            let mut derivators_for_family: Vec<Arc<dyn WalletDerivationManagerTrait>> = vec![];
+
+            for xpub in keys.iter() {
+                let derivator: Arc<dyn WalletDerivationManagerTrait> = match account_kind.as_ref() {
+                    LEGACY_ACCOUNT_KIND => {
+                        Arc::new(WalletDerivationManagerV0::from_extended_public_key(xpub.clone(), derivator_cosigner_index_opt)?)
+                    }
+                    MULTISIG_ACCOUNT_KIND => {
+                        Arc::new(WalletDerivationManager::from_extended_public_key(xpub.clone(), Some(prefix_cosigner_index))?)
+                    }
+                    _ => Arc::new(WalletDerivationManager::from_extended_public_key(xpub.clone(), derivator_cosigner_index_opt)?),
+                };
+
+                receive_pubkey_managers.push(derivator.receive_pubkey_manager());
+                change_pubkey_managers.push(derivator.change_pubkey_manager());
+                derivators_for_family.push(derivator);
+            }
+
+            let receive_address_manager = Arc::new(AddressManager::new(
+                wallet.clone(),
+                account_kind,
+                receive_pubkey_managers,
+                ecdsa,
+                address_derivation_indexes.receive(),
+                minimum_signatures as usize,
+            )?);
+
+            let change_address_manager = Arc::new(AddressManager::new(
+                wallet.clone(),
+                account_kind,
+                change_pubkey_managers,
+                ecdsa,
+                address_derivation_indexes.change(),
+                minimum_signatures as usize,
+            )?);
+
+            if !is_multisig || prefix_cosigner_index == local_cosigner_index {
+                local_receive_address_manager = Some(receive_address_manager.clone());
+                local_change_address_manager = Some(change_address_manager.clone());
+                local_derivators = Some(derivators_for_family);
+            }
+
+            address_manager_families.push(AddressManagerFamily {
+                cosigner_index: prefix_cosigner_index,
+                receive: receive_address_manager,
+                change: change_address_manager,
+            });
         }
 
-        let receive_address_manager = AddressManager::new(
-            wallet.clone(),
-            account_kind,
-            receive_pubkey_managers,
-            ecdsa,
-            address_derivation_indexes.receive(),
-            minimum_signatures as usize, //.unwrap_or(1) as usize,
-        )?;
-
-        let change_address_manager = AddressManager::new(
-            wallet.clone(),
-            account_kind,
-            change_pubkey_managers,
-            ecdsa,
-            address_derivation_indexes.change(),
-            minimum_signatures as usize, //.unwrap_or(1) as usize,
-        )?;
+        // The local family must always be present:
+        //   - non-multisig: family_count == 1 and the single pass sets the locals.
+        //   - multisig: `local_cosigner_index` is sourced from `MinimumCosignerIndex`,
+        //     which is the sorted-position of the local xpub in the all-xpubs
+        //     vector and so is bounded to `[0, N)` by construction; one loop pass
+        //     enters the local-aliasing branch above.
+        let receive_address_manager = local_receive_address_manager
+            .ok_or_else(|| Error::Custom("local cosigner family missing from enumeration".to_string()))?;
+        let change_address_manager =
+            local_change_address_manager.ok_or_else(|| Error::Custom("local cosigner family missing from enumeration".to_string()))?;
+        let derivators =
+            local_derivators.ok_or_else(|| Error::Custom("local cosigner family missing from enumeration".to_string()))?;
 
         let manager = Self {
             account_kind,
@@ -239,8 +312,9 @@ impl AddressDerivationManager {
             cosigner_index,
             derivators,
             wallet: wallet.clone(),
-            receive_address_manager: Arc::new(receive_address_manager),
-            change_address_manager: Arc::new(change_address_manager),
+            receive_address_manager,
+            change_address_manager,
+            address_manager_families,
         };
 
         Ok(manager.into())
@@ -260,17 +334,32 @@ impl AddressDerivationManager {
 
         let account_kind = AccountKind::from(LEGACY_ACCOUNT_KIND);
 
-        let receive_address_manager = AddressManager::new(
+        let receive_address_manager = Arc::new(AddressManager::new(
             wallet.clone(),
             account_kind,
             receive_pubkey_managers,
             false,
             address_derivation_indexes.receive(),
             1,
-        )?;
+        )?);
 
-        let change_address_manager =
-            AddressManager::new(wallet.clone(), account_kind, change_pubkey_managers, false, address_derivation_indexes.change(), 1)?;
+        let change_address_manager = Arc::new(AddressManager::new(
+            wallet.clone(),
+            account_kind,
+            change_pubkey_managers,
+            false,
+            address_derivation_indexes.change(),
+            1,
+        )?);
+
+        // Legacy is single-family (no peer-cosigner enumeration applies);
+        // the family vector has length 1 and aliases the local pair so the
+        // shared scan / lookup paths can iterate it without a special case.
+        let address_manager_families = vec![AddressManagerFamily {
+            cosigner_index: 0,
+            receive: receive_address_manager.clone(),
+            change: change_address_manager.clone(),
+        }];
 
         let manager = Self {
             account_kind,
@@ -278,8 +367,9 @@ impl AddressDerivationManager {
             cosigner_index: None,
             derivators: vec![derivator],
             wallet: wallet.clone(),
-            receive_address_manager: Arc::new(receive_address_manager),
-            change_address_manager: Arc::new(change_address_manager),
+            receive_address_manager,
+            change_address_manager,
+            address_manager_families,
         };
 
         Ok(manager.into())
@@ -291,6 +381,10 @@ impl AddressDerivationManager {
 
     pub fn change_address_manager(&self) -> Arc<AddressManager> {
         self.change_address_manager.clone()
+    }
+
+    pub fn address_manager_families(&self) -> &[AddressManagerFamily] {
+        &self.address_manager_families
     }
 
     pub async fn get_receive_range_with_keys(
@@ -408,6 +502,10 @@ impl AddressDerivationManagerTrait for AddressDerivationManager {
         self.change_address_manager.clone()
     }
 
+    fn address_manager_families(&self) -> Vec<AddressManagerFamily> {
+        self.address_manager_families.clone()
+    }
+
     #[allow(clippy::type_complexity)]
     fn addresses_indexes<'l>(&self, addresses: &[&'l Address]) -> Result<(Vec<(&'l Address, u32)>, Vec<(&'l Address, u32)>)> {
         self.get_addresses_indexes(addresses)
@@ -428,6 +526,20 @@ impl AddressDerivationManagerTrait for AddressDerivationManager {
 pub trait AddressDerivationManagerTrait: AnySync + Send + Sync + 'static {
     fn receive_address_manager(&self) -> Arc<AddressManager>;
     fn change_address_manager(&self) -> Arc<AddressManager>;
+    /// Every cosigner-prefix family the wallet's address-watch surface covers.
+    /// The default implementation returns a single family at `cosigner_index = 0`
+    /// wrapping the local receive / change pair, matching the single-pair
+    /// behavior of any trait impl that has not opted into multi-family
+    /// enumeration. The concrete `AddressDerivationManager` overrides this to
+    /// return the stored families vector (length N for multisig accounts;
+    /// length 1 otherwise).
+    fn address_manager_families(&self) -> Vec<AddressManagerFamily> {
+        vec![AddressManagerFamily {
+            cosigner_index: 0,
+            receive: self.receive_address_manager(),
+            change: self.change_address_manager(),
+        }]
+    }
     #[allow(clippy::type_complexity)]
     fn addresses_indexes<'l>(&self, addresses: &[&'l Address]) -> Result<(Vec<(&'l Address, u32)>, Vec<(&'l Address, u32)>)>;
     async fn get_range_with_keys(
