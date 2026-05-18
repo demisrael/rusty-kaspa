@@ -2504,7 +2504,8 @@ mod multisig_tests {
         // fixture, so the returned bundle is fully-signed).
         let signed_bundle = account.clone().pskb_sign(&bundle, wallet_secret.clone(), None, None).await.unwrap();
         let signed_input = &signed_bundle.as_ref()[0].inputs[0];
-        let populated_redeem_script = signed_input.redeem_script.as_ref().expect("MultiSig::pskb_sign populated redeem_script").clone();
+        let populated_redeem_script =
+            signed_input.redeem_script.as_ref().expect("MultiSig::pskb_sign populated redeem_script").clone();
 
         // Byte-identity against the canonical builder: the slot pubkeys are
         // each cosigner's xpub derived through
@@ -2537,7 +2538,10 @@ mod multisig_tests {
         // contribution.
         let twice_signed = account.clone().pskb_sign(&signed_bundle, wallet_secret.clone(), None, None).await.unwrap();
         let twice_signed_redeem = twice_signed.as_ref()[0].inputs[0].redeem_script.as_ref().expect("idempotent populate").clone();
-        assert_eq!(twice_signed_redeem, populated_redeem_script, "second pskb_sign preserves the existing redeem_script byte-for-byte");
+        assert_eq!(
+            twice_signed_redeem, populated_redeem_script,
+            "second pskb_sign preserves the existing redeem_script byte-for-byte"
+        );
     }
 
     /// K-of-N multi-cosigner signing flow produces exactly K signatures per
@@ -3429,6 +3433,353 @@ mod multisig_tests {
             kaspa_addresses::Version::PubKey,
             "1-of-1 Schnorr multisig must derive a P2PK address; got {:?}",
             address.version
+        );
+    }
+
+    /// `populate_multisig_redeem_scripts` writes a `bip32_derivations` entry
+    /// per PSKT input keyed by the local cosigner's slot pubkey, with a
+    /// `KeySource.derivation_path` recording the funded address's actual
+    /// cosigner-prefix family path
+    /// (`m/45'/111111'/account_index'/<funded_cosigner_index>/<address_type>/<address_index>`).
+    /// At sign time the signer reads the recorded path to derive each
+    /// cosigner's xprv at the funded family's leaf, regardless of which
+    /// family the local wallet itself sits at.
+    #[tokio::test]
+    async fn multisig_pskt_per_input_derivation_path_attribution() {
+        // Operator-Send 2-of-2 (all-local) so the funded family equals the
+        // local family at the LOCAL receive address. The attribution path's
+        // load-bearing invariant is the structural shape, not which family
+        // index lands in the path slot; the cross-family path slot is
+        // exercised by the round-trip test below against a peer-family
+        // synthetic UTXO.
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xde; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut bundle = Bundle::from(pskt_inner);
+
+        // Pre-condition: PSKT construction leaves bip32_derivations empty.
+        assert!(
+            bundle.as_ref()[0].inputs[0].bip32_derivations.is_empty(),
+            "pre-condition: PSKT-conversion path leaves bip32_derivations empty",
+        );
+
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut bundle, 2).await.unwrap();
+
+        let populated = &bundle.as_ref()[0].inputs[0].bip32_derivations;
+        assert_eq!(populated.len(), 1, "populate_multisig_redeem_scripts writes exactly one bip32_derivations entry per input");
+
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        let local_cosigner_index = derivation_capable.cosigner_index();
+        let account_index = derivation_capable.account_index();
+        let funded_family_index = derivation_capable.derivation().address_family_index(&receive_address).unwrap();
+        assert_eq!(
+            funded_family_index.0, local_cosigner_index,
+            "operator-Send: funded family index equals local cosigner_index (both = MinimumCosignerIndex)"
+        );
+
+        // The entry key is the local cosigner's slot pubkey at the funded
+        // family's path; recompute it externally and assert byte-equality.
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let local_xpub = xpub_keys[local_cosigner_index as usize].clone();
+        let local_slot_pubkey = *local_xpub
+            .derive_child(ChildNumber::new(funded_family_index.0, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(funded_family_index.1.index(), false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(funded_family_index.2, false).unwrap())
+            .unwrap()
+            .public_key();
+        let (recorded_pubkey, recorded_key_source) = populated.iter().next().unwrap();
+        assert_eq!(*recorded_pubkey, local_slot_pubkey, "bip32_derivations key equals the local cosigner's slot pubkey");
+
+        let key_source = recorded_key_source.as_ref().expect("KeySource attribution is present");
+        let expected_fingerprint = local_xpub.fingerprint();
+        assert_eq!(key_source.key_fingerprint, expected_fingerprint, "key_fingerprint matches the local xpub fingerprint");
+
+        let expected_path: kaspa_bip32::DerivationPath = format!(
+            "m/45'/111111'/{account_index}'/{}/{}/{}",
+            funded_family_index.0,
+            funded_family_index.1.index(),
+            funded_family_index.2
+        )
+        .parse()
+        .unwrap();
+        assert_eq!(key_source.derivation_path, expected_path, "derivation_path encodes the funded family's leaf");
+    }
+
+    /// Two-of-three cosigner-split round-trip against a peer-cosigner-prefix
+    /// family address. The local wallet holds all three seeds (operator-Send
+    /// shape) so the test can drive every cosigner's signature in-process,
+    /// but funds a *non-local* family's receive[0] (`cosigner_index != local
+    /// MinimumCosignerIndex`) to force the cross-family code path. The
+    /// signer derives each cosigner's xprv at the per-input
+    /// `bip32_derivations.derivation_path` (the funded family's leaf), and
+    /// the resulting K-of-N script-sig must extract under
+    /// `TxScriptEngine`. Without the family-aware lookup and per-input
+    /// derivation, the redeem-script's slot pubkeys would be derived at the
+    /// local cosigner_index path and the script would `EvalFalse` at
+    /// consensus extract.
+    #[tokio::test]
+    async fn multisig_pskb_sign_cosigner_split_two_of_three_round_trip() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let k: u16 = 2;
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, vec![]).await.unwrap();
+
+        // Pick a peer-family index distinct from the local cosigner_index so
+        // the test exercises the cross-family path. With three xpubs sorted
+        // lexicographically, the local MinimumCosignerIndex is one of {0,1,2};
+        // every other index in [0,3) is a peer family.
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        let derivation = derivation_capable.derivation();
+        let families = derivation.address_manager_families();
+        assert_eq!(families.len(), 3, "2-of-3 multisig exposes three cosigner-prefix families");
+        let local_cosigner_index = derivation_capable.cosigner_index();
+        let peer_family = families.iter().find(|f| f.cosigner_index != local_cosigner_index).expect("at least one peer family");
+        let peer_receive_address = peer_family.receive.current_address().unwrap();
+        assert_ne!(peer_receive_address, account.receive_address().unwrap(), "peer family's receive address differs from local");
+
+        // Synthetic UTXO at the peer family's receive[0]. The funded-address
+        // P2SH script_public_key commits to a redeem-script the helper
+        // builds from the peer family's path.
+        let script_public_key = pay_to_address_script(&peer_receive_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xfe; 32]),
+                index: 0,
+            })
+            .sig_op_count(3)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        // Populate redeem_script + bip32_derivations using the peer family's
+        // derivation path -- the field the per-cosigner signer below
+        // consumes for per-input xprv derivation.
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut accumulator, k).await.unwrap();
+
+        // Sign with each local cosigner; the K-cap break-out gate exits
+        // after K=2 partial signatures land on the input.
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
+        let network_id = wallet.network_id().unwrap();
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+        let k_usize = k as usize;
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k_usize));
+            if all_full {
+                break;
+            }
+            let prv_key_data = prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data");
+            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                &accumulator,
+                account.clone(),
+                &prv_key_data,
+                None,
+                local_cosigner_index,
+                network_id,
+            )
+            .await
+            .unwrap();
+            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
+                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+                }
+            }
+        }
+        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k_usize, "exactly K=2 partial signatures landed on the input");
+
+        // Finalize + extract: the extractor runs `TxScriptEngine::execute()`
+        // per input against the peer-family redeem-script. Per-cosigner
+        // signing keys derived at the local cosigner_index path would
+        // `EvalFalse` here; the per-input attribution makes the script
+        // verify.
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
+            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let params = Params::from(network_id);
+        let extract_result = extractor.extract_tx(&params);
+        assert!(
+            extract_result.is_ok(),
+            "cosigner-split 2-of-3 cross-family extract_tx must succeed under consensus script verify; got {extract_result:?}",
+        );
+    }
+
+    /// Three independent wallets sharing the same 2-of-3 multisig xpub set
+    /// each expose all three cosigner-prefix families through their
+    /// `address_manager_families`. The family-aware lookup
+    /// `address_family_index` finds any cosigner's receive address in any
+    /// wallet's watch surface, including peer cosigners' family addresses
+    /// the wallet does not own a private key for. This is the structural
+    /// proof of cross-wallet UTXO visibility: a UTXO funded to Alice's
+    /// address is reachable by Bob's wallet and Charlie's wallet even
+    /// though only Alice's seed produces a signing key at Alice's family
+    /// path.
+    #[tokio::test]
+    async fn multisig_cross_wallet_utxo_visibility_post_d1_sync() {
+        // Three random 24-word mnemonics, one per cosigner. Each is a
+        // standalone wallet with that single seed local + the other two
+        // mnemonics' xpubs as external. The resulting wallets share the
+        // same three-xpub multisig set with distinct local seeds, mirroring
+        // a real cosigner-split topology.
+        let mnemonics = make_local_mnemonics(3).await;
+        let mut external_xpubs_per_cosigner: Vec<Vec<String>> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let mut peers = Vec::with_capacity(2);
+            for (j, peer_mnemonic) in mnemonics.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                peers.push(external_xpub_for_testnet(peer_mnemonic.phrase()).await);
+            }
+            external_xpubs_per_cosigner.push(peers);
+        }
+
+        let mut wallets_and_accounts: Vec<(Arc<Wallet>, Arc<dyn Account>)> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let wallet = test_wallet().await;
+            let wallet_secret = Secret::new(vec![]);
+            let prv_key_data =
+                storage::PrvKeyData::try_new_from_mnemonic(mnemonics[i].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let store = wallet.store().as_prv_key_data_store().unwrap();
+            store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+            wallet.inner.store.commit(&wallet_secret).await.unwrap();
+            let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
+            let account = wallet
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, 2)
+                .await
+                .unwrap();
+            wallets_and_accounts.push((wallet, account));
+        }
+
+        // Each `AddressManager` lazily populates its `address_to_index_map`
+        // on first address production. Trigger generation across every
+        // cosigner-prefix family per wallet so the family-aware lookup has
+        // a populated index map for peer families, matching what the
+        // production sync layer drives off the UTXO-watch stream.
+        for (_, account) in wallets_and_accounts.iter() {
+            let derivation = account.clone().as_derivation_capable().unwrap().derivation();
+            for family in derivation.address_manager_families() {
+                let _ = family.receive.current_address().unwrap();
+            }
+        }
+
+        // Cross-binding invariant: the three wallets share the same sorted
+        // xpub set; the per-wallet receive addresses correspond to each
+        // wallet's MinimumCosignerIndex family. Collect every wallet's
+        // own family receive address, then assert every other wallet finds
+        // it through `address_family_index`.
+        let mut own_family_addresses: Vec<(Address, u32)> = Vec::with_capacity(3);
+        for (_, account) in wallets_and_accounts.iter() {
+            let derivation_capable = account.clone().as_derivation_capable().unwrap();
+            let local_idx = derivation_capable.cosigner_index();
+            let receive = account.receive_address().unwrap();
+            own_family_addresses.push((receive, local_idx));
+        }
+
+        // The local cosigner_index values must form a permutation of [0,3)
+        // (each wallet's MinimumCosignerIndex equals its own xpub's
+        // sorted-position; distinct seeds map to distinct positions).
+        let mut sorted_local_indices: Vec<u32> = own_family_addresses.iter().map(|(_, idx)| *idx).collect();
+        sorted_local_indices.sort_unstable();
+        assert_eq!(sorted_local_indices, vec![0, 1, 2], "three cosigners occupy distinct sorted positions [0,3)");
+
+        for (peer_idx, (address, expected_cosigner_index)) in own_family_addresses.iter().enumerate() {
+            for (visitor_idx, (_, account)) in wallets_and_accounts.iter().enumerate() {
+                let derivation = account.clone().as_derivation_capable().unwrap().derivation();
+                let result = derivation
+                    .address_family_index(address)
+                    .unwrap_or_else(|_| panic!("wallet {visitor_idx} missing family-aware visibility on wallet {peer_idx}'s address"));
+                assert_eq!(
+                    result.0, *expected_cosigner_index,
+                    "wallet {visitor_idx} sees wallet {peer_idx}'s address at the expected cosigner_index family",
+                );
+            }
+        }
+    }
+
+    /// Operator-Send byte-identity gate. A multisig account whose local
+    /// cosigner set is all of the N seeds (no externals) places
+    /// `MinimumCosignerIndex` at the smallest sorted position of the local
+    /// xpubs, which is also 0 for the all-local set. The derivation path
+    /// applies that same index step to every cosigner's xpub when
+    /// assembling the redeem-script, producing a byte-identical P2SH
+    /// address. Pins the derivation-rule NO-CHANGE invariant against an
+    /// independently-computed canonical xpub-walk reference.
+    #[tokio::test]
+    async fn multisig_operator_send_canonical_byte_identity() {
+        // Deterministic 24-word phrases reproducible across runs.
+        let phrase_a = "caution guide valley easily latin already visual fancy fork car switch runway \
+                        vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
+        let phrase_b = "fiber boy desk trip pitch snake table awkward endorse car learn forest \
+                        solid ticket enemy pink gesture wealth iron chaos clock gather honey farm";
+        let mnemonics = [Mnemonic::new(phrase_a, Language::English).unwrap(), Mnemonic::new(phrase_b, Language::English).unwrap()];
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+
+        // Operator-Send invariant: with all seeds local the smallest
+        // sorted-position across local xpubs equals 0.
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        let local_cosigner_index = derivation_capable.cosigner_index();
+        assert_eq!(local_cosigner_index, 0, "operator-Send (all seeds local) sets MinimumCosignerIndex to 0 by construction");
+
+        // Independently rebuild the receive[0] script_public_key from the
+        // canonical xpub-walk using the derivation rule
+        // (`derive_child(0).derive_child(receive=0).derive_child(0)` on
+        // each cosigner xpub). Any divergence at the derivation layer
+        // would surface here as an address mismatch against the canonical
+        // externally-built P2SH script.
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+        for xpub in xpub_keys.iter() {
+            let derived = xpub
+                .clone()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(0, false).unwrap())
+                .unwrap();
+            slot_pubkeys.push(*derived.public_key());
+        }
+        let redeem_script = multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2).unwrap();
+        let expected_script = pay_to_script_hash_script(redeem_script.as_slice());
+
+        let receive_address = account.receive_address().unwrap();
+        let actual_script = pay_to_address_script(&receive_address);
+        assert_eq!(
+            expected_script, actual_script,
+            "operator-Send receive[0] script_public_key must match the canonical xpub-walk's P2SH commitment byte-for-byte",
         );
     }
 

@@ -8,9 +8,10 @@ use crate::account::{Fees, GenerationNotifier, PaymentDestination};
 use crate::derivation::{AddressDerivationManager, AddressDerivationManagerTrait};
 use crate::imports::*;
 use crate::tx::{Generator, GeneratorSettings, GeneratorSummary, Signer};
-use kaspa_bip32::{AddressType, ChildNumber, Prefix as KeyPrefix};
+use kaspa_bip32::{ChildNumber, DerivationPath, Prefix as KeyPrefix};
 use kaspa_txscript::{extract_script_pub_key_address, multisig_redeem_script};
 use kaspa_wallet_pskt::bundle::Bundle;
+use kaspa_wallet_pskt::prelude::KeySource;
 
 pub const MULTISIG_ACCOUNT_KIND: &str = "kaspa-multisig-standard";
 
@@ -542,7 +543,7 @@ impl Account for MultiSig {
         let k = self.minimum_signatures;
         let network_id = self.wallet().clone().network_id()?;
         let prv_key_data_store = self.wallet().store().as_prv_key_data_store()?;
-        let multisig_derivation_index = self.cosigner_index() as u32;
+        let multisig_derivation_index = self.cosigner_index();
 
         let account_dyn = self.clone().as_dyn_arc();
         let mut accumulator = Bundle(bundle.0.clone());
@@ -698,13 +699,13 @@ pub(crate) async fn build_multisig_signed_bundle(
     Ok((accumulator, generator.summary()))
 }
 
-/// Populate `input.redeem_script` on every PSKT input of every PSKT in
-/// the bundle that does not already carry one.
+/// Populate `input.redeem_script` and `input.bip32_derivations` on every
+/// PSKT input of every PSKT in the bundle.
 ///
-/// The PSKT-conversion path (`wallet/pskt/src/convert.rs::Inner::try_from`)
-/// builds inputs with `redeem_script: None`; the Finalizer's
-/// `Some(redeem_script)` branch is what assembles a P2SH-multisig
-/// `script_sig` of the shape
+/// **Redeem script.** The PSKT-conversion path
+/// (`wallet/pskt/src/convert.rs::Inner::try_from`) builds inputs with
+/// `redeem_script: None`; the Finalizer's `Some(redeem_script)` branch is
+/// what assembles a P2SH-multisig `script_sig` of the shape
 /// `OpData65 || sig_1 || sighash_type || ... || OpData65 || sig_K || sighash_type || PUSHDATA(redeem_script)`.
 /// Without `redeem_script` the Finalizer's `None` branch emits signatures
 /// with no trailing redeem-script push, the assembled `script_sig` fails
@@ -713,46 +714,85 @@ pub(crate) async fn build_multisig_signed_bundle(
 ///
 /// The redeem-script per input is `multisig_redeem_script(slot_pubkeys, k)`
 /// where each slot pubkey is derived from the corresponding cosigner xpub at
-/// `derive_child(account.cosigner_index()).derive_child(address_type).derive_child(address_index)`.
-/// The `(address_type, address_index)` pair is recovered from the input's UTXO
-/// address via the derivation manager's `addresses_indexes` lookup. The shared
-/// helper is reused by both the operator-Send path (`build_multisig_signed_bundle`)
-/// and the REPL `pskb sign` path (`MultiSig::pskb_sign`); idempotency on
-/// pre-populated inputs makes the call safe in multi-party PSKT exchange
-/// chains where an upstream cosigner has already attached the redeem-script.
+/// `derive_child(funded_cosigner_index).derive_child(address_type).derive_child(address_index)`.
+/// **The funded cosigner_index is the address's own family**, not the local
+/// wallet's; recovered from the family-aware `address_family_index` lookup
+/// over every cosigner-prefix family the wallet watches. Every xpub in the
+/// emitted script is derived through the same `path` argument, and the path
+/// is the funded UTXO's address path. Each cosigner-prefix family thus has
+/// a distinct P2SH script-hash; spending a UTXO in family Y produces a
+/// redeem-script keyed to Y's derivation chain.
+///
+/// **bip32 derivations.** The helper additionally records the funded address's
+/// derivation path (`m/45'/111111'/account_index'/<funded_cosigner_index>/<address_type>/<address_index>`)
+/// on the PSKT input via `bip32_derivations`, keyed by the local cosigner's
+/// slot pubkey at that path. At sign time, every cosigner reads the recorded
+/// path, derives their own xprv at the same path, produces the cosigner's
+/// slot pubkey, and signs the matching redeem-script slot. The recorded
+/// path attribution makes K-of-N spending of any cosigner-prefix family
+/// possible without requiring each cosigner to re-derive the family from
+/// the UTXO address locally.
+///
+/// The shared helper is reused by both the operator-Send path
+/// (`build_multisig_signed_bundle`) and the REPL `pskb sign` path
+/// (`MultiSig::pskb_sign`); idempotency on pre-populated inputs makes the
+/// call safe in multi-party PSKT exchange chains where an upstream cosigner
+/// has already attached the redeem-script and derivation attribution.
 pub(crate) async fn populate_multisig_redeem_scripts(account: Arc<dyn Account>, bundle: &mut Bundle, k: u16) -> Result<()> {
     let derivation_capable = account.clone().as_derivation_capable()?;
-    let multisig_derivation_index = derivation_capable.cosigner_index();
+    let derivation = derivation_capable.derivation();
+    let local_cosigner_index = derivation_capable.cosigner_index();
+    let account_index = derivation_capable.account_index();
     let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?.clone();
     let network_id = account.wallet().clone().network_id()?;
+    let local_xpub = xpub_keys
+        .get(local_cosigner_index as usize)
+        .ok_or_else(|| Error::custom("multisig account local cosigner_index out of xpub range"))?
+        .clone();
+    let local_key_fingerprint = local_xpub.fingerprint();
+
     for pskt_inner in bundle.0.iter_mut() {
         for input in pskt_inner.inputs.iter_mut() {
-            if input.redeem_script.is_some() {
+            let needs_redeem_script = input.redeem_script.is_none();
+            let needs_bip32_derivations = input.bip32_derivations.is_empty();
+            if !needs_redeem_script && !needs_bip32_derivations {
                 continue;
             }
+
             let utxo_entry = input.utxo_entry.as_ref().ok_or_else(|| Error::custom("input missing utxo_entry"))?;
             let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
-            let address_ref = &address;
-            let (receive_idxs, change_idxs) = derivation_capable.derivation().addresses_indexes(&[address_ref])?;
-            let (address_type, address_index) = if let Some((_, idx)) = receive_idxs.first() {
-                (AddressType::Receive, *idx)
-            } else if let Some((_, idx)) = change_idxs.first() {
-                (AddressType::Change, *idx)
-            } else {
-                return Err(Error::custom(format!("address {address} not in derivation manager")));
-            };
-            let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
-            for xpub in xpub_keys.iter() {
-                let derived = xpub
+            let (funded_cosigner_index, address_type, address_index) = derivation.address_family_index(&address)?;
+
+            if needs_redeem_script {
+                let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
+                for xpub in xpub_keys.iter() {
+                    let derived = xpub
+                        .clone()
+                        .derive_child(ChildNumber::new(funded_cosigner_index, false)?)?
+                        .derive_child(ChildNumber::new(address_type.index(), false)?)?
+                        .derive_child(ChildNumber::new(address_index, false)?)?;
+                    slot_pubkeys.push(*derived.public_key());
+                }
+                let redeem_script =
+                    multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)?;
+                input.redeem_script = Some(redeem_script);
+            }
+
+            if needs_bip32_derivations {
+                let local_derived = local_xpub
                     .clone()
-                    .derive_child(ChildNumber::new(multisig_derivation_index, false)?)?
+                    .derive_child(ChildNumber::new(funded_cosigner_index, false)?)?
                     .derive_child(ChildNumber::new(address_type.index(), false)?)?
                     .derive_child(ChildNumber::new(address_index, false)?)?;
-                slot_pubkeys.push(*derived.public_key());
+                let local_slot_pubkey = *local_derived.public_key();
+                let derivation_path: DerivationPath =
+                    format!("m/45'/111111'/{account_index}'/{funded_cosigner_index}/{}/{address_index}", address_type.index())
+                        .parse()
+                        .map_err(|e: kaspa_bip32::Error| Error::custom(format!("multisig derivation path parse failed: {e}")))?;
+                input
+                    .bip32_derivations
+                    .insert(local_slot_pubkey, Some(KeySource { key_fingerprint: local_key_fingerprint, derivation_path }));
             }
-            let redeem_script =
-                multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)?;
-            input.redeem_script = Some(redeem_script);
         }
     }
     Ok(())
