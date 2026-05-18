@@ -349,6 +349,19 @@ impl Account for MultiSig {
             .ok_or(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures })?
             .as_ref()
             .clone();
+        // Broadcast path: a partial bundle is rejected at consensus
+        // `OpCheckMultiSig` extract. Reject `L < K` at the wallet layer so
+        // the operator sees the same `MultisigInsufficientCosignerMaterial`
+        // diagnostic the K-of-N PSKB exchange flow would have produced. The
+        // cosigner-split topology (`L = 1, K >= 2`) routes through
+        // `pskb_from_send_generator` instead, which returns a partial
+        // bundle for downstream `pskb_sign` rounds before broadcast.
+        if prv_key_data_ids.len() < self.minimum_signatures as usize {
+            return Err(Error::MultisigInsufficientCosignerMaterial {
+                local: prv_key_data_ids.len(),
+                required: self.minimum_signatures,
+            });
+        }
         let settings =
             GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, fee_rate, priority_fee_sompi, payload)?;
 
@@ -419,6 +432,16 @@ impl Account for MultiSig {
             .ok_or(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures })?
             .as_ref()
             .clone();
+        // Broadcast path: same L < K reject as `send`. A cosigner-split
+        // wallet sweeping its UTXOs cannot produce a K-quorum on its own
+        // and must route through `pskb_from_send_generator` + downstream
+        // `pskb_sign` exchange instead.
+        if prv_key_data_ids.len() < self.minimum_signatures as usize {
+            return Err(Error::MultisigInsufficientCosignerMaterial {
+                local: prv_key_data_ids.len(),
+                required: self.minimum_signatures,
+            });
+        }
         let settings = GeneratorSettings::try_new_with_account(
             self.clone().as_dyn_arc(),
             PaymentDestination::Change,
@@ -590,7 +613,7 @@ impl Account for MultiSig {
     }
 }
 
-/// Build a fully-signed PSKB across the operator's local cosigner set.
+/// Build a PSKB across the operator's local cosigner set.
 ///
 /// Algorithm: build the empty PSKT bundle once via the standard PSKBSigner
 /// machinery (the placeholder signer is held but never invoked during stream
@@ -600,6 +623,17 @@ impl Account for MultiSig {
 /// per-input K-cap break-out gate caps the bundle at exactly K signatures
 /// per input; `OpCheckMultiSig` pops K, and any L-K leftover signatures
 /// trip the `CleanStack` consensus check.
+///
+/// The bundle returned has `min(L, K)` partial signatures per input where
+/// `L = prv_key_data_ids.len()`. A wallet holding all K cosigner seeds
+/// locally (operator-Send topology) produces a fully-signed bundle ready
+/// for broadcast. A wallet holding `1 <= L < K` seeds (cosigner-split
+/// topology) produces a partial bundle that must complete the K-quorum
+/// through downstream `pskb_sign` rounds before broadcast. Callers that
+/// directly broadcast the returned bundle (e.g., `MultiSig::send` /
+/// `MultiSig::sweep`) MUST reject `L < K` themselves before invoking this
+/// helper, since a partial bundle is rejected at the consensus
+/// `OpCheckMultiSig` extract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_multisig_signed_bundle(
     account: Arc<dyn Account>,
@@ -614,18 +648,22 @@ pub(crate) async fn build_multisig_signed_bundle(
 ) -> Result<(Bundle, GeneratorSummary)> {
     let k = minimum_signatures;
     let l = prv_key_data_ids.len();
-    if prv_key_data_ids.is_empty() || l < k as usize {
+    if prv_key_data_ids.is_empty() {
         return Err(Error::MultisigInsufficientCosignerMaterial { local: l, required: k });
     }
 
     let network_id = account.wallet().clone().network_id()?;
     let prv_key_data_store = account.wallet().store().as_prv_key_data_store()?;
 
-    // BIP-32 derivation step shared across every cosigner in this multisig account; the
-    // same value drives the redeem-script's pubkey list at `AddressDerivationManager::new`.
-    // Per-cosigner sign-time derivation must reuse it; a per-cosigner positional value
-    // would derive each non-anchor cosigner's signing key off a slot that does not match
-    // the redeem-script's pubkey at the cosigner's index.
+    // The local wallet's cosigner_index. Threaded through to
+    // `pskb_signer_for_multisig_cosigner` as the `default_cosigner_index`
+    // fallback for inputs whose `bip32_derivations` is empty (e.g.,
+    // pre-rev-6 PSKTs or primitive tests). The primary signing path
+    // consumes the per-input `KeySource.derivation_path` populated by
+    // `populate_multisig_redeem_scripts` below, which encodes the funded
+    // cosigner-prefix family's leaf path -- the same path Go-wallet's
+    // `libkaspawallet/sign.go` derives each cosigner's xprv at to
+    // produce the slot pubkey matching the redeem-script.
     let multisig_derivation_index = account.clone().as_derivation_capable()?.cosigner_index();
 
     // PSKTGenerator requires a PSKBSigner by construction but does not invoke
