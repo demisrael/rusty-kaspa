@@ -456,6 +456,29 @@ impl AddressDerivationManager {
         Ok((receive_indexes, change_indexes))
     }
 
+    /// Locate the cosigner-prefix family an address belongs to and recover its
+    /// derivation triple `(cosigner_index, address_type, address_index)`.
+    ///
+    /// Walks every entry in `address_manager_families` (length N for multisig,
+    /// length 1 otherwise) and probes the family's receive and change
+    /// `address_to_index_map` for a hit. The recovered cosigner_index is the
+    /// family's own (the BIP-32 child step at the cosigner-index slot of the
+    /// derivation path that produced the address), not the local wallet's.
+    /// Callers use the triple to attribute a UTXO's derivation path on the
+    /// PSKT input so a K-of-N quorum can sign for a UTXO funded to any
+    /// cosigner-prefix family in the watch set.
+    pub fn get_address_family_index(&self, address: &Address) -> Result<(u32, AddressType, u32)> {
+        for family in self.address_manager_families.iter() {
+            if let Some(index) = family.receive.inner().address_to_index_map.get(address) {
+                return Ok((family.cosigner_index, AddressType::Receive, *index));
+            }
+            if let Some(index) = family.change.inner().address_to_index_map.get(address) {
+                return Ok((family.cosigner_index, AddressType::Change, *index));
+            }
+        }
+        Err(Error::Custom(format!("Address ({address}) not in any cosigner-prefix family.")))
+    }
+
     pub fn receive_indexes_by_addresses(&self, addresses: &Vec<Address>) -> Result<Vec<u32>> {
         self.indexes_by_addresses(addresses, &self.receive_address_manager)
     }
@@ -513,6 +536,10 @@ impl AddressDerivationManagerTrait for AddressDerivationManager {
         self.get_addresses_indexes(addresses)
     }
 
+    fn address_family_index(&self, address: &Address) -> Result<(u32, AddressType, u32)> {
+        self.get_address_family_index(address)
+    }
+
     async fn get_range_with_keys(
         &self,
         change_address: bool,
@@ -544,6 +571,23 @@ pub trait AddressDerivationManagerTrait: AnySync + Send + Sync + 'static {
     }
     #[allow(clippy::type_complexity)]
     fn addresses_indexes<'l>(&self, addresses: &[&'l Address]) -> Result<(Vec<(&'l Address, u32)>, Vec<(&'l Address, u32)>)>;
+    /// Family-aware address lookup: returns `(cosigner_index, address_type, address_index)`
+    /// for the cosigner-prefix family that owns the address, or an error if the
+    /// address is in no family. The default implementation falls back to the
+    /// local family only and is suitable for trait impls that have not opted
+    /// into multi-family enumeration; the concrete `AddressDerivationManager`
+    /// overrides to search every family.
+    fn address_family_index(&self, address: &Address) -> Result<(u32, AddressType, u32)> {
+        let receive_manager = self.receive_address_manager();
+        if let Some(index) = receive_manager.inner().address_to_index_map.get(address) {
+            return Ok((0, AddressType::Receive, *index));
+        }
+        let change_manager = self.change_address_manager();
+        if let Some(index) = change_manager.inner().address_to_index_map.get(address) {
+            return Ok((0, AddressType::Change, *index));
+        }
+        Err(Error::Custom(format!("Address ({address}) not in any cosigner-prefix family.")))
+    }
     async fn get_range_with_keys(
         &self,
         change_address: bool,

@@ -365,38 +365,43 @@ fn parse_redeem_script_pubkeys(redeem_script: &[u8]) -> Result<Vec<Vec<u8>>, Err
 
 /// Per-cosigner Schnorr signing primitive for multi-signature accounts.
 ///
-/// Derives this cosigner's per-input secret keys at the explicit
-/// `cosigner_index` argument, bypassing the `Account::create_address_private_keys`
-/// chain whose `DerivationCapableAccount::cosigner_index()` accessor returns
-/// the trait-default `0` for any variant that has not overridden it.
+/// **Per-input path attribution.** For every input that carries a non-empty
+/// `bip32_derivations` map, the helper derives this cosigner's signing key
+/// from the recorded `KeySource.derivation_path`. The same input may sit at
+/// any cosigner-prefix family on chain; the input-level path is the only
+/// load-bearing handle to which family is being spent. This mirrors
+/// Go-wallet's per-input `PartiallySignedInput.DerivationPath` consumption
+/// in `libkaspawallet/sign.go`: each cosigner derives their local xprv at
+/// the per-input path, produces a pubkey, and signs the matching
+/// redeem-script slot -- regardless of which cosigner's family was funded.
 ///
-/// `cosigner_index` is the **shared BIP-32 derivation step** the multisig
-/// account persisted at create-time and reuses on every cosigner's xpub when
-/// the `AddressDerivationManager` assembles the redeem-script's pubkey list.
-/// The same value MUST be supplied here for every cosigner -- it is not the
-/// cosigner's position in the xpub set. The derived signing key's pubkey
-/// equals
-/// `xpub_keys[caller_position].derive_child(cosigner_index).derive_child(address_type).derive_child(address_index).public_key()`
-/// by BIP-32 derivation determinism, matching the redeem-script slot the
-/// `OpCheckMultiSig` verifier walks to at consensus time.
+/// **Backward-compatible fallback.** If an input's `bip32_derivations` map
+/// is empty (e.g., a synthetic PSKT primitive test fixture or a pre-rev-6
+/// PSKT that predates per-input attribution), the helper falls back to the
+/// `default_cosigner_index` argument applied as a single child step on this
+/// cosigner's xprv at the `(address_type, address_index)` recovered from
+/// the input's UTXO address via the family-aware lookup. Callers in the
+/// rev-6 chain (`MultiSig::pskb_sign` and `build_multisig_signed_bundle`)
+/// always pre-populate `bip32_derivations` via
+/// `populate_multisig_redeem_scripts`, so the fallback only exercises the
+/// primitive test path.
 ///
 /// The returned bundle clones every PSKT from `bundle` and populates each
-/// input's `partial_sigs` with this cosigner's Schnorr signature keyed by the
-/// derived pubkey.
+/// input's `partial_sigs` with this cosigner's Schnorr signature keyed by
+/// the derived pubkey.
 pub async fn pskb_signer_for_multisig_cosigner(
     bundle: &Bundle,
     account: Arc<dyn Account>,
     prv_key_data: &PrvKeyData,
     payment_secret: Option<&Secret>,
-    cosigner_index: u32,
+    default_cosigner_index: u32,
     network_id: NetworkId,
 ) -> Result<Bundle, Error> {
-    use crate::account::variants::multisig::MULTISIG_ACCOUNT_KIND;
-
     let payload = prv_key_data.payload.decrypt(payment_secret)?;
     let xkey = payload.get_xprv(payment_secret)?;
 
     let derivation_capable = account.clone().as_derivation_capable()?;
+    let derivation = derivation_capable.derivation();
     let account_index = derivation_capable.account_index();
 
     let mut signed_bundle = Bundle::new();
@@ -404,44 +409,68 @@ pub async fn pskb_signer_for_multisig_cosigner(
     for pskt_inner in bundle.iter().cloned() {
         let pskt: PSKT<Signer> = PSKT::from(pskt_inner.clone());
 
-        let addresses: Vec<Address> = pskt_inner
-            .inputs
-            .iter()
-            .filter_map(|input| input.utxo_entry.as_ref())
-            .filter_map(|utxo_entry| extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into()).ok())
-            .collect();
-        let address_refs: Vec<&Address> = addresses.iter().collect();
-
-        let (receive, change) = derivation_capable.derivation().addresses_indexes(&address_refs)?;
-
-        let private_keys = crate::account::create_private_keys(
-            &MULTISIG_ACCOUNT_KIND.into(),
-            cosigner_index,
-            account_index,
-            &xkey,
-            &receive,
-            &change,
-        )?;
-
-        let mut keys_by_address: AHashMap<Address, secp256k1::SecretKey> = AHashMap::new();
-        for (addr_ref, sk) in private_keys {
-            keys_by_address.insert(addr_ref.clone(), sk);
-        }
-
+        // Resolve per-input signing key once per PSKT. The vector index matches
+        // the input position so the signing closure (which only receives the
+        // input index) can look up the pre-derived keypair without re-running
+        // the per-input derivation walk inside the signing critical section.
+        // Each entry also carries the pre-existing `bip32_derivations`
+        // KeySource for the signing pubkey (when the input was originated
+        // with per-input derivation attribution); the signing closure echoes
+        // it back via `SignInputOk.key_source` so `pass_signature_sync`'s
+        // `bip32_derivations.insert(pub_key, key_source)` step is idempotent
+        // across the multi-cosigner accumulate loop. Without the echo, an
+        // operator-Send signer running once per local seed overwrites the
+        // pre-populated KeySource with `None`, and the per-cosigner bundles
+        // fail to combine on `bip32_derivations` conflict at accumulate.
+        type InputKey = (secp256k1::SecretKey, secp256k1::PublicKey, Option<kaspa_wallet_pskt::prelude::KeySource>);
+        let mut input_keys: Vec<InputKey> = Vec::with_capacity(pskt_inner.inputs.len());
         for (input_idx, input) in pskt_inner.inputs.iter().enumerate() {
-            let address = addresses.get(input_idx).ok_or_else(|| Error::custom(format!("No address found for input {input_idx}")))?;
-            let secret_key = keys_by_address
-                .get(address)
-                .ok_or_else(|| Error::custom(format!("Secret key not found for input address {address}")))?;
+            let derivation_path_opt: Option<kaspa_bip32::DerivationPath> =
+                input.bip32_derivations.values().find_map(|key_source| key_source.as_ref().map(|ks| ks.derivation_path.clone()));
+
+            let secret_key = if let Some(path) = derivation_path_opt {
+                // Per-input path: walk this cosigner's xprv to the recorded
+                // funded-family leaf and use the resulting scalar.
+                let mut current = xkey.clone();
+                for child in path.as_ref() {
+                    current = current.derive_child(*child)?;
+                }
+                *current.private_key()
+            } else {
+                // Fallback: build the receive/change vectors from the input's
+                // UTXO address and derive a single key using the
+                // default_cosigner_index. Preserves the cycle-1 primitive
+                // test path.
+                use crate::account::variants::multisig::MULTISIG_ACCOUNT_KIND;
+                let utxo_entry =
+                    input.utxo_entry.as_ref().ok_or_else(|| Error::custom(format!("No utxo_entry for input {input_idx}")))?;
+                let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
+                let (receive, change) = derivation.addresses_indexes(&[&address])?;
+                let private_keys = crate::account::create_private_keys(
+                    &MULTISIG_ACCOUNT_KIND.into(),
+                    default_cosigner_index,
+                    account_index,
+                    &xkey,
+                    &receive,
+                    &change,
+                )?;
+                private_keys
+                    .into_iter()
+                    .next()
+                    .map(|(_, sk)| sk)
+                    .ok_or_else(|| Error::custom(format!("No private key derived for input {input_idx}")))?
+            };
+
             let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())?;
             let pub_key = keypair.public_key();
             if input.partial_sigs.contains_key(&pub_key) {
-                return Err(Error::MultisigDuplicateCosignerSignature { cosigner_index, pub_key });
+                return Err(Error::MultisigDuplicateCosignerSignature { cosigner_index: default_cosigner_index, pub_key });
             }
+            let existing_key_source = input.bip32_derivations.get(&pub_key).cloned().flatten();
+            input_keys.push((secret_key, pub_key, existing_key_source));
         }
 
         let reused_values = SigHashReusedValuesUnsync::new();
-        let addresses_for_closure = addresses.clone();
 
         let signed_pskt = pskt
             .pass_signature_sync(|tx, sighash| -> Result<Vec<SignInputOk>, String> {
@@ -450,17 +479,14 @@ pub async fn pskb_signer_for_multisig_cosigner(
                     .iter()
                     .enumerate()
                     .map(|(input_idx, _input)| {
-                        let address =
-                            addresses_for_closure.get(input_idx).ok_or_else(|| format!("No address found for input {input_idx}"))?;
-                        let secret_key =
-                            keys_by_address.get(address).ok_or_else(|| format!("Secret key not found for input address {address}"))?;
+                        let (secret_key, pub_key, key_source) =
+                            input_keys.get(input_idx).ok_or_else(|| format!("No signing key prepared for input {input_idx}"))?;
                         let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())
                             .map_err(|e| e.to_string())?;
-                        let pub_key = keypair.public_key();
                         let hash = calc_schnorr_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
                         let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
                         let signature = keypair.sign_schnorr(msg);
-                        Ok(SignInputOk { signature: Signature::Schnorr(signature), pub_key, key_source: None })
+                        Ok(SignInputOk { signature: Signature::Schnorr(signature), pub_key: *pub_key, key_source: key_source.clone() })
                     })
                     .collect()
             })
