@@ -61,6 +61,12 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, account_name: Option<String>, mnem
     let (wallet_secret, _) = ctx.ask_wallet_secret(None).await?;
     let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
+    let account_index_answer = term.ask(false, "Enter the account index (press <enter> for auto-assign): ").await?;
+    let account_index: Option<u64> = match account_index_answer.trim() {
+        "" => None,
+        s => Some(s.parse()?),
+    };
+
     let prv_keys_len: usize = term.ask(false, "Enter the number of private keys to generate: ").await?.parse()?;
 
     let mut prv_key_data_args = Vec::with_capacity(prv_keys_len);
@@ -79,8 +85,9 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, account_name: Option<String>, mnem
         let xpub_key = term.ask(false, &format!("Enter extended public {i} key: ")).await?;
         xpub_keys.push(xpub_key.trim().to_owned());
     }
-    let account =
-        wallet.create_account_multisig(&wallet_secret, prv_key_data_args, xpub_keys, account_name, minimum_signatures).await?;
+    let account = wallet
+        .create_account_multisig(&wallet_secret, prv_key_data_args, xpub_keys, account_name, minimum_signatures, account_index)
+        .await?;
 
     tprintln!(ctx, "\naccount created: {}\n", account.get_list_string()?);
     wallet.select(Some(&account)).await?;
@@ -128,6 +135,12 @@ pub(crate) async fn multisig_watch(ctx: &Arc<KaspaCli>, name: Option<&str>) -> R
     let (wallet_secret, _) = ctx.ask_wallet_secret(None).await?;
     let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
+    let account_index_answer = term.ask(false, "Enter the account index (press <enter> for auto-assign): ").await?;
+    let account_index: Option<u64> = match account_index_answer.trim() {
+        "" => None,
+        s => Some(s.parse()?),
+    };
+
     let prv_key_data_args = Vec::with_capacity(0);
 
     let answer = term.ask(false, "Enter the number of extended public keys: ").await?.trim().to_string(); //.parse()?;
@@ -138,8 +151,9 @@ pub(crate) async fn multisig_watch(ctx: &Arc<KaspaCli>, name: Option<&str>) -> R
         let xpub_key = term.ask(false, &format!("Enter extended public {i} key: ")).await?;
         xpub_keys.push(xpub_key.trim().to_owned());
     }
-    let account =
-        wallet.create_account_multisig(&wallet_secret, prv_key_data_args, xpub_keys, account_name, minimum_signatures).await?;
+    let account = wallet
+        .create_account_multisig(&wallet_secret, prv_key_data_args, xpub_keys, account_name, minimum_signatures, account_index)
+        .await?;
 
     tprintln!(ctx, "\naccount created: {}\n", account.get_list_string()?);
     wallet.select(Some(&account)).await?;

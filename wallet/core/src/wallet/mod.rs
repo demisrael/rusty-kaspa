@@ -700,7 +700,8 @@ impl Wallet {
                 self.create_account_legacy(wallet_secret, prv_key_data_id, account_name).await?
             }
             AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures } => {
-                self.create_account_multisig(wallet_secret, prv_key_data_args, additional_xpub_keys, name, minimum_signatures).await?
+                self.create_account_multisig(wallet_secret, prv_key_data_args, additional_xpub_keys, name, minimum_signatures, None)
+                    .await?
             }
             AccountCreateArgs::Bip32Watch { account_args } => self.create_account_bip32_watch(wallet_secret, account_args).await?,
             AccountCreateArgs::Keypair { prv_key_data_id, account_name, ecdsa } => {
@@ -716,6 +717,26 @@ impl Wallet {
         Ok(account)
     }
 
+    /// Compute the next-available hardened `account_index` for a new multisig
+    /// account in this wallet. Returns `max(existing_multisig.account_index) + 1`,
+    /// or `0` if no multisig account exists yet. The default-zero case yields
+    /// the canonical derivation at `m/45'/111111'/0'` for the common
+    /// single-multisig-account-per-wallet path.
+    async fn next_multisig_account_index(self: &Arc<Wallet>) -> Result<u64> {
+        let account_store = self.inner.store.clone().as_account_store()?;
+        let mut iter = account_store.iter(None).await?;
+        let mut highest: Option<u64> = None;
+        while let Some(entry) = iter.try_next().await? {
+            let (storage, _metadata) = entry;
+            if storage.kind != MULTISIG_ACCOUNT_KIND {
+                continue;
+            }
+            let payload = multisig::Payload::try_load(&storage)?;
+            highest = Some(highest.map_or(payload.account_index, |h| h.max(payload.account_index)));
+        }
+        Ok(highest.map_or(0, |h| h + 1))
+    }
+
     pub async fn create_account_multisig(
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
@@ -723,7 +744,12 @@ impl Wallet {
         xpub_keys: Vec<String>,
         account_name: Option<String>,
         minimum_signatures: u16,
+        account_index: Option<u64>,
     ) -> Result<Arc<dyn Account>> {
+        let account_index = match account_index {
+            Some(n) => n,
+            None => self.next_multisig_account_index().await?,
+        };
         let account_store = self.inner.store.clone().as_account_store()?;
         let wallet_network = self.network_id()?.network_type();
 
@@ -742,7 +768,7 @@ impl Wallet {
                 .load_key_data(wallet_secret, &prv_key_data_id)
                 .await?
                 .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
-            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
+            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index).await?; // todo it can be done concurrently
             generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
             prv_key_data_ids.push(prv_key_data_id);
         }
@@ -780,6 +806,7 @@ impl Wallet {
                 min_cosigner_index,
                 minimum_signatures,
                 false,
+                account_index,
             )
             .await?,
         );
@@ -1670,6 +1697,7 @@ impl Wallet {
         minimum_signatures: u16,
         additional_xpub_keys: Vec<String>,
     ) -> Result<Arc<dyn Account>> {
+        let account_index = self.next_multisig_account_index().await?;
         let mut generated_xpubs = Vec::with_capacity(mnemonics_secrets.len());
         let mut prv_key_data_ids = Vec::with_capacity(mnemonics_secrets.len());
         let prv_key_data_store = self.store().as_prv_key_data_store()?;
@@ -1680,7 +1708,7 @@ impl Wallet {
             if prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_some() {
                 return Err(Error::PrivateKeyAlreadyExists(prv_key_data.id));
             }
-            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
+            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index).await?; // todo it can be done concurrently
             generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
             prv_key_data_ids.push(prv_key_data.id);
             prv_key_data_store.store(wallet_secret, prv_key_data).await?;
@@ -1709,6 +1737,7 @@ impl Wallet {
                 min_cosigner_index,
                 minimum_signatures,
                 false,
+                account_index,
             )
             .await?,
         );
@@ -2190,7 +2219,8 @@ mod multisig_tests {
             }
 
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
-            let account = wallet.create_account_multisig(&wallet_secret, create_args, external_xpubs.clone(), None, k).await.unwrap();
+            let account =
+                wallet.create_account_multisig(&wallet_secret, create_args, external_xpubs.clone(), None, k, None).await.unwrap();
 
             // Cast to a `DerivationCapableAccount` so we can reach the
             // `AddressDerivationManager` and its newly exposed families.
@@ -2276,7 +2306,7 @@ mod multisig_tests {
         create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
         let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
         let create_account = create_wallet
-            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2)
+            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, None)
             .await
             .unwrap();
         let create_address = create_account.receive_address().unwrap();
@@ -3163,7 +3193,7 @@ mod multisig_tests {
             .await;
             let valid_ktub =
                 external_xpub_for_testnet("legal winner thank year wave sausage worth useful legal winner thank yellow").await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![canonical, valid_ktub], None, 2).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![canonical, valid_ktub], None, 2, None).await;
             match result {
                 Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
                     assert_eq!(supplied_prefix, KeyPrefix::XPUB, "rejection names the supplied prefix");
@@ -3182,7 +3212,7 @@ mod multisig_tests {
                 "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
             )
             .await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![ext.clone(), ext], None, 2).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![ext.clone(), ext], None, 2, None).await;
             match result {
                 Err(Error::MultisigDuplicateXpub { xpub }) => {
                     assert!(xpub.starts_with("xpub"), "duplicate reported in canonical XPUB form, got: {xpub}");
@@ -3198,7 +3228,7 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(2).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 0).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 0, None).await;
             match result {
                 Err(Error::MultisigInvalidThreshold { k, n }) => {
                     assert_eq!(k, 0, "rejection names the supplied K");
@@ -3214,7 +3244,7 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(2).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 3).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 3, None).await;
             match result {
                 Err(Error::MultisigInvalidThreshold { k, n }) => {
                     assert_eq!(k, 3, "rejection names the supplied K");
@@ -3232,7 +3262,7 @@ mod multisig_tests {
             const OVER_CAP_TOTAL: usize = CONSENSUS_CAP + 1;
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(OVER_CAP_TOTAL).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 2).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 2, None).await;
             match result {
                 Err(Error::MultisigPubKeyCountExceedsConsensus { count, max }) => {
                     assert_eq!(count, OVER_CAP_TOTAL, "rejection names the cosigner count");
@@ -3249,7 +3279,7 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(16).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 1).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 1, None).await;
             match result {
                 Err(Error::MultisigRedeemScriptExceedsElementSize { size, max }) => {
                     assert_eq!(size, 531, "N=16 K=1: rejection names the predicted redeem-script size");
@@ -3418,7 +3448,7 @@ mod multisig_tests {
             vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
         let k: u16 = 2;
         let account = wallet
-            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], peer_xpubs, None, k)
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], peer_xpubs, None, k, None)
             .await
             .unwrap();
 
@@ -3530,7 +3560,7 @@ mod multisig_tests {
         wallet.inner.store.commit(&wallet_secret).await.unwrap();
 
         let account = wallet
-            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], vec![], None, 1)
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], vec![], None, 1, None)
             .await
             .unwrap();
 
@@ -3792,7 +3822,7 @@ mod multisig_tests {
             wallet.inner.store.commit(&wallet_secret).await.unwrap();
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
             let account = wallet
-                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, k)
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, k, None)
                 .await
                 .unwrap();
             wallets_and_accounts.push((wallet, account));
@@ -3957,7 +3987,7 @@ mod multisig_tests {
             vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
         let k: u16 = 2;
         let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
-        let account = wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs, None, k).await.unwrap();
+        let account = wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs, None, k, None).await.unwrap();
 
         // Decoy destination + minimum priority fee; the send call is
         // expected to fail at the wallet-side guard before reaching any
@@ -4024,7 +4054,7 @@ mod multisig_tests {
             wallet.inner.store.commit(&wallet_secret).await.unwrap();
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
             let account = wallet
-                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, 2)
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, 2, None)
                 .await
                 .unwrap();
             wallets_and_accounts.push((wallet, account));
@@ -4307,7 +4337,7 @@ mod multisig_tests {
         let xpub_key = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
 
         let account =
-            MultiSig::try_new(&wallet, None, Arc::new(vec![xpub_key]), Some(Arc::new(vec![prv_key_data.id])), Some(0), 1, true)
+            MultiSig::try_new(&wallet, None, Arc::new(vec![xpub_key]), Some(Arc::new(vec![prv_key_data.id])), Some(0), 1, true, 0)
                 .await
                 .unwrap();
 
@@ -4318,5 +4348,239 @@ mod multisig_tests {
             "1-of-1 ECDSA multisig must derive a P2PK-ECDSA address; got {:?}",
             address.version
         );
+    }
+
+    /// `Wallet::create_account_multisig` invoked with `account_index=None`
+    /// auto-assigns the next-available hardened index. The first multisig
+    /// account in a wallet lands at index `0` (the canonical
+    /// single-multisig-account-per-wallet path). A subsequent multisig
+    /// account in the same wallet auto-assigns to `1` (monotone
+    /// next-available); `Some(n)` overrides the auto-assign and uses `n`
+    /// verbatim.
+    #[tokio::test]
+    async fn multisig_account_index_auto_assign_monotonic() {
+        async fn create_with_auto_assign(wallet: &Arc<Wallet>, wallet_secret: &Secret) -> Arc<dyn Account> {
+            let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+            let mut prv_key_data_args: Vec<PrvKeyDataArgs> = Vec::with_capacity(2);
+            for mnemonic in make_local_mnemonics(2).await {
+                let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+                let id = prv_key_data.id;
+                prv_key_data_store.store(wallet_secret, prv_key_data).await.unwrap();
+                prv_key_data_args.push(PrvKeyDataArgs::new(id, None));
+            }
+            wallet.inner.store.commit(wallet_secret).await.unwrap();
+            wallet.create_account_multisig(wallet_secret, prv_key_data_args, vec![], None, 2, None).await.unwrap()
+        }
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let account_a = create_with_auto_assign(&wallet, &wallet_secret).await;
+        assert_eq!(
+            account_a.clone().as_derivation_capable().unwrap().account_index(),
+            0,
+            "first multisig account auto-assigns to account_index=0",
+        );
+
+        let account_b = create_with_auto_assign(&wallet, &wallet_secret).await;
+        assert_eq!(
+            account_b.clone().as_derivation_capable().unwrap().account_index(),
+            1,
+            "second multisig account auto-assigns to account_index=1 (monotone next-available)",
+        );
+    }
+
+    /// A `Payload` byte sequence written by the pre-fix code path (four
+    /// fields, no trailing `account_index`) MUST deserialize under the
+    /// post-fix `BorshDeserialize` impl with `account_index` defaulted to
+    /// `0`. This is the wallet-file backward-compatibility contract for
+    /// existing kaspa-cli wallets with a multisig account.
+    #[tokio::test]
+    async fn multisig_payload_pre_fix_wallet_file_loads_with_default_account_index() {
+        use crate::account::variants::multisig::Payload;
+
+        let xpub_keys: ExtendedPublicKeys = vec![
+            kaspa_bip32::ExtendedPublicKey::<secp256k1::PublicKey>::from_str(
+                &xpub_from_mnemonic_phrase(
+                    "abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon abandon about",
+                )
+                .await,
+            )
+            .unwrap(),
+        ]
+        .into();
+        let post_fix = Payload::new(xpub_keys.clone(), Some(0), 1, false, 42);
+        let full = borsh::to_vec(&post_fix).unwrap();
+
+        // Strip the trailing `account_index: u64` (8 bytes) to reproduce
+        // the on-wire shape a pre-fix wallet file carries (four fields,
+        // no `account_index` suffix). Read via `deserialize_reader` on a
+        // `Cursor` so the additive-suffix EOF default fires cleanly; the
+        // higher-level `try_from_slice` also asserts the slice was fully
+        // consumed, which is satisfied here because our impl reads to EOF.
+        let pre_fix_bytes = &full[..full.len() - 8];
+        let mut cursor = std::io::Cursor::new(pre_fix_bytes);
+        let loaded = <Payload as borsh::BorshDeserialize>::deserialize_reader(&mut cursor).unwrap();
+        assert_eq!(loaded.account_index, 0, "pre-fix payload deserialization defaults account_index to 0");
+        assert_eq!(loaded.cosigner_index, Some(0));
+        assert_eq!(loaded.minimum_signatures, 1);
+        assert!(!loaded.ecdsa);
+        assert_eq!(loaded.xpub_keys.len(), 1);
+    }
+
+    /// Two multisig accounts in the same wallet at distinct hardened
+    /// `account_index` values produce distinct on-chain addresses AND
+    /// distinct parent xpubs at `m/45'/111111'/<account_index>'`. The
+    /// hardened step at the account_index slot is the BIP-32 isolation
+    /// boundary that prevents xpub-reuse across peer groups: knowledge
+    /// of one group's parent xpub does not yield the other group's
+    /// xpub or xprv because the hardened child step consumes the parent
+    /// xprv rather than the parent xpub.
+    #[tokio::test]
+    async fn multisig_multi_account_hardened_isolation() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let mnemonic_a = "caution guide valley easily latin already visual fancy fork car switch runway \
+                          vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
+        let mnemonic_b = "fiber boy desk trip pitch snake table awkward endorse car learn forest \
+                          solid ticket enemy pink gesture wealth iron chaos clock gather honey farm";
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+        let prv_key_data_a = PrvKeyData::try_new_from_mnemonic(
+            Mnemonic::new(mnemonic_a, Language::English).unwrap(),
+            None,
+            EncryptionKind::XChaCha20Poly1305,
+        )
+        .unwrap();
+        let prv_key_data_b = PrvKeyData::try_new_from_mnemonic(
+            Mnemonic::new(mnemonic_b, Language::English).unwrap(),
+            None,
+            EncryptionKind::XChaCha20Poly1305,
+        )
+        .unwrap();
+        let id_a = prv_key_data_a.id;
+        let id_b = prv_key_data_b.id;
+        prv_key_data_store.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
+        prv_key_data_store.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let create_args = vec![PrvKeyDataArgs::new(id_a, None), PrvKeyDataArgs::new(id_b, None)];
+        let account_0 = wallet.create_account_multisig(&wallet_secret, create_args.clone(), vec![], None, 2, None).await.unwrap();
+        let derivation_capable_0 = account_0.clone().as_derivation_capable().unwrap();
+        assert_eq!(derivation_capable_0.account_index(), 0, "first multisig account is at account_index=0");
+
+        let account_1 = wallet.create_account_multisig(&wallet_secret, create_args, vec![], None, 2, None).await.unwrap();
+        let derivation_capable_1 = account_1.clone().as_derivation_capable().unwrap();
+        assert_eq!(derivation_capable_1.account_index(), 1, "second multisig account auto-assigns to account_index=1");
+
+        let address_0 = account_0.receive_address().unwrap();
+        let address_1 = account_1.receive_address().unwrap();
+        assert_ne!(
+            address_0, address_1,
+            "two multisig accounts at distinct hardened account_index values MUST produce distinct receive addresses",
+        );
+
+        // Parent-step isolation at `m/45'/111111'/<account_index>'`: derive
+        // each seed's xpub at the two account_index values and assert the
+        // parent xpubs themselves diverge. This is the BIP-32 isolation
+        // property: knowledge of the xpub at account_index=0 does not yield
+        // the xpub at account_index=1 because the hardened step at
+        // `account_index'` consumes the parent xprv (not the parent xpub).
+        let parent_xpub_at_0 = prv_key_data_a.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let parent_xpub_at_1 = prv_key_data_a.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 1).await.unwrap();
+        assert_ne!(
+            parent_xpub_at_0.to_string(Some(KeyPrefix::XPUB)),
+            parent_xpub_at_1.to_string(Some(KeyPrefix::XPUB)),
+            "parent xpubs at m/45'/111111'/0' and m/45'/111111'/1' MUST diverge (hardened-step isolation)",
+        );
+    }
+
+    /// `Wallet::create_account_multisig(..., account_index=None)` for the
+    /// first multisig account in a wallet auto-assigns to `account_index=0`
+    /// and derives addresses byte-identical to the canonical reference
+    /// vector at `m/45'/111111'/0'`. This pins the default-account
+    /// derivation for the common single-multisig-account-per-wallet path.
+    /// The fixture vector reused here is the parametric byte-identity
+    /// substrate; the cell at `(N=3, K=2, account_index=0)` is the
+    /// load-bearing comparison surface.
+    #[tokio::test]
+    async fn multisig_account_index_default_zero_canonical_byte_identity() {
+        #[derive(serde::Deserialize)]
+        struct FixtureRow {
+            cosigner_index: u32,
+            #[allow(dead_code)]
+            receive_path: String,
+            #[allow(dead_code)]
+            receive_address: String,
+            receive_script_address_hex: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Fixture {
+            #[allow(dead_code)]
+            n: usize,
+            k: u16,
+            #[allow(dead_code)]
+            network: String,
+            mnemonics: Vec<String>,
+            #[allow(dead_code)]
+            xpubs: Vec<String>,
+            cosigners: Vec<FixtureRow>,
+        }
+
+        const FIXTURE_2_OF_3: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-2-of-3.json");
+        let fx: Fixture = serde_json::from_str(FIXTURE_2_OF_3).expect("fixture JSON parses");
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
+
+        // Materialize each fixture mnemonic as a stored PrvKeyData entry so
+        // the wallet-facing `create_account_multisig` API (the spec-named
+        // entry for AC-MA-7) can be driven directly via PrvKeyDataArgs. This
+        // exercises the explicit `account_index=None` (auto-assign) branch
+        // of the spec-named API rather than the `import_multisig_with_mnemonic`
+        // alias path.
+        let mut prv_key_data_args: Vec<PrvKeyDataArgs> = Vec::with_capacity(fx.mnemonics.len());
+        for phrase in fx.mnemonics.iter() {
+            let prv_key_data = PrvKeyData::try_new_from_mnemonic(
+                Mnemonic::new(phrase, Language::English).unwrap(),
+                None,
+                EncryptionKind::XChaCha20Poly1305,
+            )
+            .unwrap();
+            let prv_key_data_id = prv_key_data.id;
+            prv_key_data_store.store(&wallet_secret, prv_key_data).await.unwrap();
+            prv_key_data_args.push(PrvKeyDataArgs::new(prv_key_data_id, None));
+        }
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // Drive the spec-named create path with `account_index=None`
+        // (auto-assign on the first multisig account in this wallet) to
+        // confirm the auto-assign resolves to `0` and pins the canonical
+        // default-account byte-identity.
+        let account = wallet.create_account_multisig(&wallet_secret, prv_key_data_args, vec![], None, fx.k, None).await.unwrap();
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        assert_eq!(
+            derivation_capable.account_index(),
+            0,
+            "first multisig account auto-assign yields account_index=0 (canonical default-account path)",
+        );
+
+        let families = derivation_capable.derivation().address_manager_families();
+        for family in families.iter() {
+            let fixture_row = fx.cosigners.iter().find(|r| r.cosigner_index == family.cosigner_index).unwrap();
+            let kaspa_addr = family.receive.current_address().unwrap();
+            let kaspa_script = pay_to_address_script(&kaspa_addr);
+            let script_bytes = kaspa_script.script();
+            assert!(script_bytes.len() >= 32, "script too short for P2SH");
+            let kaspa_script_hash_bytes = &script_bytes[script_bytes.len() - 33..script_bytes.len() - 1];
+            let mut kaspa_script_hash_hex = vec![0u8; kaspa_script_hash_bytes.len() * 2];
+            faster_hex::hex_encode(kaspa_script_hash_bytes, &mut kaspa_script_hash_hex).unwrap();
+            let kaspa_script_hash_hex = String::from_utf8(kaspa_script_hash_hex).unwrap();
+            assert_eq!(
+                kaspa_script_hash_hex, fixture_row.receive_script_address_hex,
+                "family {} P2SH script-hash byte-identity at auto-assigned account_index=0 against the canonical fixture",
+                family.cosigner_index,
+            );
+        }
     }
 }
