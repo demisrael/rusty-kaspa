@@ -1,0 +1,59 @@
+{
+  "n": 6,
+  "k": 3,
+  "network": "kaspa-mainnet",
+  "mnemonics": [
+    "resist release punch current beach gospel arrive party shift want pitch learn two grid small cage adult century cause gap unknown type current trim",
+    "festival general grow head segment resource scan inflict salmon roof tell harvest sort vacant ball nose tell burst flight quick chest evoke program chaos",
+    "tiny sport leader video topic glad pole regret shock budget solve someone spawn rack useful illegal quality vote jump marine any impact begin cigar",
+    "bachelor toilet leisure resemble culture grape weird coyote very gadget stumble year snow color shield figure foot iron bounce grass merit love catalog sun",
+    "stadium ask pioneer vapor attitude leader maze chief twenty drop roof stadium comic abstract family fence turtle either wealth cage shoot film cactus bounce",
+    "foam observe dinosaur bag ozone walk kitten indoor tornado fiber law crumble tank surround miss slam bulb athlete pattern cement finger live today athlete"
+  ],
+  "xpubs": [
+    "kpub2JqBA3VHNR2FBTnVVwGL82fivo3CgnDfg5XzwfHwHtwWNyJ12LGMjCDXnjkaqCvykCBbyMGxPeJcBeCNpgZsEzZuLCmTQzuXEn3j9r5v3ys",
+    "kpub2JkMSiWkMPhpJVwrXMWChDGj9Hr43nXam7SdZYeDKeaC41QngDKtHEBSzfxnawPSbTXytALnRoJQb1nbxSqrvtft7V2g1qQJBhuEPoajtnd",
+    "kpub2JmnuitHPx5iaE6Xe9T79kYMJeLVmSdeHjzSPzszSBBYpiJT3feWYDUJYJMHRv4HnQ2XAjVQFa3LV1cwETxRpVQojJVSgzUNGJEPAjywsXC",
+    "kpub2KFS3U6wghT6dEw74aDkn4VqxRdyLyVMbWMRwkh7fwxjdzYKjnCyKu6xWfn9sicZSL3a7xMTNu65eNzqsuNNkzXqXzjUrMTa2FL8TX6SgG5",
+    "kpub2HmDM9USuWG4hi13NYY9ie6PJmP2iQzimGohpXRP3FGeg133fmaD5LJrjtZnWSYwxqjR6rvYK21itnHdY4gQ8R7vCP3xP1gsRMJXGeLWWFv",
+    "kpub2KCPjBBXL4aWU4TJ16meuo56XmoBtBU5LiBei9pDhN7PNJYApqKHwzDxSb96d4atmpuvquCqgZKei8NBHUMAeBSS3TQaCV2YZEVN525yoZ5"
+  ],
+  "cosigners": [
+    {
+      "cosigner_index": 3,
+      "receive_path": "m/3/0/0",
+      "receive_address": "kaspa:pq8cm6mr5cfast8uk3xr02ajrcja5f2qk9m3zhzgymfl342n5d7n5gjv64g0w",
+      "receive_script_address_hex": "0f8deb63a613d82cfcb44c37abb21e25da2540b177115c4826d3f8d553a37d3a"
+    },
+    {
+      "cosigner_index": 1,
+      "receive_path": "m/1/0/0",
+      "receive_address": "kaspa:prm9ezdsvd8pa2nlmt7a44ygdru7aj894eskdtt52lvenl3jsq3jqwky904er",
+      "receive_script_address_hex": "f65c89b0634e1eaa7fdafddad48868f9eec8e5ae6166ad7457d999fe32802320"
+    },
+    {
+      "cosigner_index": 2,
+      "receive_path": "m/2/0/0",
+      "receive_address": "kaspa:pru7h7pjjr3wtv28sjc7nevsqf8059kk2fxntk2a0r4z93s7smpqgyx6l5wea",
+      "receive_script_address_hex": "f9ebf83290e2e5b14784b1e9e590024efa16d6524d35d95d78ea22c61e86c204"
+    },
+    {
+      "cosigner_index": 5,
+      "receive_path": "m/5/0/0",
+      "receive_address": "kaspa:pr0m63ywjm2rmmakym270tc9pw7hqem0cnf07an5jk6jnj0uz2tes7l5htj25",
+      "receive_script_address_hex": "dfbd448e96d43defb626d5e7af050bbd70676fc4d2ff767495b529c9fc129798"
+    },
+    {
+      "cosigner_index": 0,
+      "receive_path": "m/0/0/0",
+      "receive_address": "kaspa:pqydra8depcxejpv5yzv6j94xexs3cdmfwqck3ga9d6x5sp7x90ss2rwcl9wa",
+      "receive_script_address_hex": "08d1f4edc8706cc82ca104cd48b5364d08e1bb4b818b451d2b746a403e315f08"
+    },
+    {
+      "cosigner_index": 4,
+      "receive_path": "m/4/0/0",
+      "receive_address": "kaspa:pz276stuzqjqdc5hy32y9z7zw7jlp60p7ryszsgwc7kyf2qwncg2z36ag3hd0",
+      "receive_script_address_hex": "95ed417c102406e2972454428bc277a5f0e9e1f0c901410ec7ac44a80e9e10a1"
+    }
+  ]
+}

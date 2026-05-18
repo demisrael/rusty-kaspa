@@ -1,0 +1,51 @@
+{
+  "n": 5,
+  "k": 3,
+  "network": "kaspa-mainnet",
+  "mnemonics": [
+    "like ritual agree tail broom credit number benefit mimic can major joy announce true attack game sad stamp forum want bullet scrub demand charge",
+    "skin purpose leopard water among sauce junk genre help material slight famous bike life they electric lawn barrel concert brother warrior rich verify rug",
+    "roof craft suspect yellow more deal twin flat daughter property notice degree tree market drip oppose secret animal explain coast season caught normal travel",
+    "push leg chest direct gas angry cactus improve satisfy vibrant view waste embody public erupt canyon trend usual what dragon exile dice lemon flush",
+    "mention middle limit reward floor direct buyer either crack panel foot south inner doctor rich spike pyramid diet size recipe wrap whisper need report"
+  ],
+  "xpubs": [
+    "kpub2K3pnG1HnKoS9UKDN4HPE4Wk2nnBoNA9L9SLhh7cfKiPLPYzMWQDMSmhaoTMq5RRkXiaA1zQHcPcLZenHNgQNBeojNoyYcSazACeCVeN5qK",
+    "kpub2K4zsXKVJbzzUDsLg44Sxp2n3S5wyQB395ZX781PVGtQy7iE4CHb41LTtcDD88RGysrfBo5KokiTSNfV36Uefjghw4WunkgGSecPUMnx2xZ",
+    "kpub2KGhp2CJjV5h41eJZ1o1YQ5oMWdQ2sdtZo8yeEYYH933Su7uS92RcbLi6ojUVsbvRhd88oDJ75x6kdJMrgF4Jw27hPkectS6DZNZEErei4V",
+    "kpub2JYeBgDLmH2vip4V65uKZsmc5YGj86poNghfJeBMHLqpEQb9tE2AMsEN5gPbNnghFyS39C2JheE5Dm2MxgwxNJrmTKKVwyWX5gP98jUWcBW",
+    "kpub2JWZr9fptA4WWV3jRR7yf7utyRzhqpBvhwSMGDgh4EaFdbp3LNRT39m8aJ6Bo26U727d1ybPxz5uSzdhLnZS4SMaSMnjHaZdVbtpCT5kXzb"
+  ],
+  "cosigners": [
+    {
+      "cosigner_index": 2,
+      "receive_path": "m/2/0/0",
+      "receive_address": "kaspa:ppr639zqq32wxgd280zw6s7uqc8ddm20fkrx0d0p5dafyx5jluhd2jfk63c9e",
+      "receive_script_address_hex": "47a894400454e321aa3bc4ed43dc060ed6ed4f4d8667b5e1a37a921a92ff2ed5"
+    },
+    {
+      "cosigner_index": 3,
+      "receive_path": "m/3/0/0",
+      "receive_address": "kaspa:ppt5qx7zzf0mqg9wx0c46v6rdewupfxq4ysfvklkd8gu59ttdce52pxy0daca",
+      "receive_script_address_hex": "57401bc2125fb020ae33f15d33436e5dc0a4c0a920965bf669d1ca156b6e3345"
+    },
+    {
+      "cosigner_index": 4,
+      "receive_path": "m/4/0/0",
+      "receive_address": "kaspa:pptvpu2rnj8892xfs6hjhxndywcez99ep00h5n8vytmx99stpeqvktvxkvp27",
+      "receive_script_address_hex": "56c0f1439c8e72a8c986af2b9a6d23b19114b90bdf7a4cec22f662960b0e40cb"
+    },
+    {
+      "cosigner_index": 1,
+      "receive_path": "m/1/0/0",
+      "receive_address": "kaspa:pp8mjhvawyljy9hcx6vdnvclkp2uldc2gt74tl0ln2qnxp62rpyt6u7cvph7u",
+      "receive_script_address_hex": "4fb95d9d713f2216f83698d9b31fb055cfb70a42fd55fdff9a8133074a1848bd"
+    },
+    {
+      "cosigner_index": 0,
+      "receive_path": "m/0/0/0",
+      "receive_address": "kaspa:pzgg6elu0q44wg24y4cze037ezsuxutkxnjjhxunlg2h54j0t9alxlnp2aldv",
+      "receive_script_address_hex": "908d67fc782b57215525702cbe3ec8a1c3717634e52b9b93fa157a564f597bf3"
+    }
+  ]
+}
