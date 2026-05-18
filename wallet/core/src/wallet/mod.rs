@@ -3383,6 +3383,113 @@ mod multisig_tests {
         }
     }
 
+    /// `build_multisig_signed_bundle` returns a partial bundle (`L < K`)
+    /// on a cosigner-split wallet, exercising the relaxed precondition
+    /// the REPL `pskb create` flow (`pskb_from_send_generator` ->
+    /// `build_multisig_signed_bundle`) routes through. The caller is
+    /// responsible for not broadcasting an under-signed bundle directly
+    /// (`MultiSig::send` / `MultiSig::sweep` reject `L < K` at the wallet
+    /// layer for that reason); the partial bundle is the canonical
+    /// cosigner-split spend-construction output the spec prescribes for
+    /// the N4.a "Alice constructs send PSKT" recipe.
+    ///
+    /// The synthetic `GeneratorSettings` mirrors `multisig_send_extract_via_pskt_generator_2_of_3_mixed_external`
+    /// so the test exercises the production PSKT-conversion path
+    /// (`bundle_from_pskt_generator` -> `populate_multisig_redeem_scripts`
+    /// -> per-cosigner sign loop) at `L = 1, K = 2` topology without
+    /// requiring RPC or a populated UtxoContext.
+    #[tokio::test]
+    async fn multisig_build_signed_bundle_cosigner_split_emits_partial() {
+        use crate::account::variants::multisig::build_multisig_signed_bundle;
+        use crate::tx::{Fees, GeneratorSettings, PaymentDestination, PaymentOutputs};
+        use crate::utils::kaspa_to_sompi;
+        use crate::utxo::UtxoEntryReference;
+
+        // One local seed, two external xpubs (L = 1, K = 2).
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer_xpubs: Vec<String> =
+            vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
+        let k: u16 = 2;
+        let account = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], peer_xpubs, None, k)
+            .await
+            .unwrap();
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let prv_key_data_ids: Vec<PrvKeyDataId> = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").as_ref().clone();
+        assert_eq!(prv_key_data_ids.len(), 1, "cosigner-split L=1 invariant: exactly one local prv_key_data id");
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let xpub_keys_strings: Vec<String> = xpub_keys.iter().map(|xk| xk.to_string(Some(KeyPrefix::XPUB))).collect();
+        let network_id = wallet.network_id().unwrap();
+
+        // Synthetic UTXO at the wallet's own family's first-receive
+        // address. The family-aware lookup finds this in the local
+        // family's address_to_index_map immediately (no peer-family
+        // address materialization is needed for this synthetic case).
+        let receive_address = account.receive_address().unwrap();
+        let amount: u64 = kaspa_to_sompi(10.0);
+        let utxo_entry = UtxoEntryReference::simulated_with_address(amount, &receive_address);
+        let destination_address =
+            Address::try_from("kaspatest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er").unwrap();
+        let payment_outputs: PaymentOutputs = (&[(destination_address, kaspa_to_sompi(1.0))] as &[(Address, u64)]).into();
+        let final_destination: PaymentDestination = payment_outputs.into();
+
+        let utxo_iter: Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static> = Box::new(std::iter::once(utxo_entry));
+        let settings = GeneratorSettings {
+            network_id,
+            multiplexer: None,
+            sig_op_count: xpub_keys.len() as u8,
+            minimum_signatures: k,
+            change_address: receive_address.clone(),
+            utxo_iterator: utxo_iter,
+            source_utxo_context: None,
+            priority_utxo_entries: None,
+            destination_utxo_context: None,
+            fee_rate: None,
+            final_transaction_priority_fee: Fees::SenderPays(kaspa_to_sompi(0.001)),
+            final_transaction_destination: final_destination,
+            final_transaction_payload: None,
+        };
+
+        let abortable = Abortable::default();
+        let (bundle, _summary) = build_multisig_signed_bundle(
+            account.clone(),
+            xpub_keys_strings,
+            prv_key_data_ids,
+            k,
+            settings,
+            wallet_secret,
+            None,
+            &abortable,
+            None,
+        )
+        .await
+        .expect("build_multisig_signed_bundle: L<K cosigner-split topology returns Ok with a partial bundle");
+
+        assert!(!bundle.0.is_empty(), "partial bundle has at least one PSKT");
+        for pskt_inner in bundle.0.iter() {
+            for input in pskt_inner.inputs.iter() {
+                assert!(input.redeem_script.is_some(), "every input has redeem_script populated by populate_multisig_redeem_scripts",);
+                assert!(
+                    !input.bip32_derivations.is_empty(),
+                    "every input has bip32_derivations populated with the funded family attribution",
+                );
+                assert_eq!(
+                    input.partial_sigs.len(),
+                    1,
+                    "L=1 cosigner-split: exactly one partial signature (the local cosigner's) per input",
+                );
+            }
+        }
+    }
+
     /// Pins the wallet-level encryption query against multi-id accounts.
     /// The trait-default single-key accessor `Account::prv_key_data_id` is
     /// intentionally unimplemented on multisig (a multisig has 0..N local
@@ -3631,6 +3738,249 @@ mod multisig_tests {
             extract_result.is_ok(),
             "cosigner-split 2-of-3 cross-family extract_tx must succeed under consensus script verify; got {extract_result:?}",
         );
+    }
+
+    /// Production-topology cosigner-split round-trip: three independent
+    /// wallets each holding exactly ONE local seed (`L = 1`, `K = 2`,
+    /// `N = 3`). The flow mirrors the operator-facing kaspa-cli REPL
+    /// `pskb create` -> `pskb sign` -> finalize / extract exchange that
+    /// the testnet-10 E2E recipe `cross_cosigner_e2e_two_of_three_alice_bob_tom_testnet10`
+    /// drives. Alice's wallet (`L = 1`) produces a partial
+    /// PSKT through the signer primitive at her family's funded address;
+    /// Bob's wallet (also `L = 1`) extends the partial bundle with his
+    /// signature, closing the `K = 2` quorum. The finalized K-of-N
+    /// script-sig extracts under `TxScriptEngine`.
+    ///
+    /// Pins the V-HIGH-1 fix at the cosigner-split topology depth: every
+    /// signing wallet has `L < K` (one local seed, two-of-three threshold)
+    /// by construction. The relaxed
+    /// `build_multisig_signed_bundle` guard allows this topology to flow
+    /// through `pskb_from_send_generator` on testnet; here, the synthetic
+    /// PSKT bundle is built directly and walked through
+    /// `pskb_signer_for_multisig_cosigner` per cosigner so the test does
+    /// not require a live Generator or UtxoContext.
+    #[tokio::test]
+    async fn multisig_pskb_sign_cosigner_split_l_equals_1_round_trip() {
+        // Three independent cosigners, each with their own seed.
+        let mnemonics = make_local_mnemonics(3).await;
+        let k: u16 = 2;
+        let wallet_secret = Secret::new(vec![]);
+
+        // Each cosigner derives their own ktub-prefixed xpub for peer
+        // exchange. The cosigner-split topology has each wallet hold ONE
+        // local seed and two external xpubs (the peers' xpubs).
+        let mut external_xpubs_per_cosigner: Vec<Vec<String>> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let mut peers = Vec::with_capacity(2);
+            for (j, peer_mnemonic) in mnemonics.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                peers.push(external_xpub_for_testnet(peer_mnemonic.phrase()).await);
+            }
+            external_xpubs_per_cosigner.push(peers);
+        }
+
+        // Build three independent wallets, each with L=1 + two external xpubs.
+        let mut wallets_and_accounts: Vec<(Arc<Wallet>, Arc<dyn Account>)> = Vec::with_capacity(3);
+        for i in 0..3 {
+            let wallet = test_wallet().await;
+            let prv_key_data =
+                storage::PrvKeyData::try_new_from_mnemonic(mnemonics[i].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let store = wallet.store().as_prv_key_data_store().unwrap();
+            store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+            wallet.inner.store.commit(&wallet_secret).await.unwrap();
+            let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
+            let account = wallet
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, k)
+                .await
+                .unwrap();
+            wallets_and_accounts.push((wallet, account));
+        }
+
+        // Pre-condition assertion: each wallet has L=1 local prv_key_data_id
+        // (`< K = 2`); pre-fix this topology was structurally rejected.
+        for (i, (_, account)) in wallets_and_accounts.iter().enumerate() {
+            let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+            let local_prv_ids = multisig.prv_key_data_ids().as_ref().map(|ids| ids.len()).expect("each wallet has local prv_key_data");
+            assert_eq!(local_prv_ids, 1, "wallet {i} has exactly one local cosigner seed (cosigner-split L=1 invariant)");
+        }
+
+        // Trigger family-address materialization on every wallet's
+        // address manager so each wallet's family-aware lookup has a
+        // populated index map.
+        for (_, account) in wallets_and_accounts.iter() {
+            let derivation = account.clone().as_derivation_capable().unwrap().derivation();
+            for family in derivation.address_manager_families() {
+                let _ = family.receive.current_address().unwrap();
+            }
+        }
+
+        // Pick cosigner 0 as the originator (Alice's wallet). The funded
+        // address is Alice's own family receive[0].
+        let (alice_wallet, alice_account) = (wallets_and_accounts[0].0.clone(), wallets_and_accounts[0].1.clone());
+        let alice_address = alice_account.receive_address().unwrap();
+        let alice_local_cosigner_index = alice_account.clone().as_derivation_capable().unwrap().cosigner_index();
+
+        // Synthetic UTXO at Alice's family receive address.
+        let script_public_key = pay_to_address_script(&alice_address);
+        let utxo =
+            kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xa1; 32]),
+                index: 0,
+            })
+            .sig_op_count(3)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        // Alice populates redeem_script + bip32_derivations from her wallet
+        // (her family-aware lookup recovers her own family from her local
+        // address_to_index_map). The family-aware sync surface lets either
+        // her wallet or Bob's wallet equivalently populate the bundle.
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(alice_account.clone(), &mut accumulator, k)
+            .await
+            .unwrap();
+
+        // Alice signs (`L = 1`, K-cap break-out gate exits after one
+        // signature lands).
+        let network_id = alice_wallet.network_id().unwrap();
+        let alice_multisig: Arc<MultiSig> = alice_account.clone().downcast_arc().expect("alice account is multisig");
+        let alice_prv_id = alice_multisig.prv_key_data_ids().as_ref().expect("alice local ids").as_ref()[0];
+        let alice_prv = alice_wallet
+            .store()
+            .as_prv_key_data_store()
+            .unwrap()
+            .load_key_data(&wallet_secret, &alice_prv_id)
+            .await
+            .unwrap()
+            .expect("alice prv_key_data");
+        let alice_signed = pskb_signer_for_multisig_cosigner(
+            &accumulator,
+            alice_account.clone(),
+            &alice_prv,
+            None,
+            alice_local_cosigner_index,
+            network_id,
+        )
+        .await
+        .unwrap();
+        for (pskt_idx, signed_pskt_inner) in alice_signed.0.into_iter().enumerate() {
+            for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+            }
+        }
+        assert_eq!(
+            accumulator.0[0].inputs[0].partial_sigs.len(),
+            1,
+            "Alice's wallet (L=1) emits exactly one partial signature -- the cosigner-split partial-bundle invariant",
+        );
+
+        // Bob (`L = 1`) extends the partial bundle. He routes through his
+        // own wallet's `pskb_signer_for_multisig_cosigner`, deriving at
+        // the funded path recovered from the bundle's
+        // `bip32_derivations` -- which carries Alice's family path, the
+        // same path Bob must derive his slot pubkey at to match the
+        // redeem-script's slot for him.
+        let (bob_wallet, bob_account) = (wallets_and_accounts[1].0.clone(), wallets_and_accounts[1].1.clone());
+        let bob_local_cosigner_index = bob_account.clone().as_derivation_capable().unwrap().cosigner_index();
+        let bob_multisig: Arc<MultiSig> = bob_account.clone().downcast_arc().expect("bob account is multisig");
+        let bob_prv_id = bob_multisig.prv_key_data_ids().as_ref().expect("bob local ids").as_ref()[0];
+        let bob_prv = bob_wallet
+            .store()
+            .as_prv_key_data_store()
+            .unwrap()
+            .load_key_data(&wallet_secret, &bob_prv_id)
+            .await
+            .unwrap()
+            .expect("bob prv_key_data");
+        let bob_signed =
+            pskb_signer_for_multisig_cosigner(&accumulator, bob_account.clone(), &bob_prv, None, bob_local_cosigner_index, network_id)
+                .await
+                .unwrap();
+        for (pskt_idx, signed_pskt_inner) in bob_signed.0.into_iter().enumerate() {
+            for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+            }
+        }
+        assert_eq!(
+            accumulator.0[0].inputs[0].partial_sigs.len(),
+            k as usize,
+            "Bob's signature closes the K=2 quorum on the partial bundle",
+        );
+
+        // Finalize + extract -- `TxScriptEngine::execute()` verifies the
+        // assembled K-of-N script-sig against Alice's family's P2SH
+        // commitment under consensus rules.
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
+            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let params = Params::from(network_id);
+        let extract_result = extractor.extract_tx(&params);
+        assert!(
+            extract_result.is_ok(),
+            "L=1 cosigner-split (Alice+Bob) extract_tx must succeed under consensus script verify; got {extract_result:?}",
+        );
+    }
+
+    /// A cosigner-split wallet (`L = 1`, `K = 2`) cannot broadcast a spend
+    /// on its own through `MultiSig::send` -- the broadcast path would
+    /// build a partial bundle (one local signature) and the consensus
+    /// `OpCheckMultiSig` extract would fail on the under-signed
+    /// `script_sig`. The wallet layer pre-rejects with
+    /// `MultisigInsufficientCosignerMaterial { local: L, required: K }`
+    /// so the caller sees a structured wallet-side error rather than a
+    /// consensus-time rejection on broadcast. The PSKB exchange path
+    /// (`pskb_from_send_generator`) remains the right entry for
+    /// cosigner-split spends -- it returns a partial bundle for
+    /// downstream `pskb_sign` rounds.
+    #[tokio::test]
+    async fn multisig_send_rejects_cosigner_split_with_l_less_than_k() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer_xpubs: Vec<String> =
+            vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
+        let k: u16 = 2;
+        let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
+        let account = wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs, None, k).await.unwrap();
+
+        // Decoy destination + minimum priority fee; the send call is
+        // expected to fail at the wallet-side guard before reaching any
+        // RPC or generator surface.
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        let local_l = multisig.prv_key_data_ids().as_ref().expect("local ids").len();
+        assert_eq!(local_l, 1, "cosigner-split wallet has exactly L=1 local seed by construction");
+
+        let destination_address = account.receive_address().unwrap();
+        let payment_outputs = crate::tx::PaymentOutputs::from((destination_address, 1_000_000_u64));
+        let abortable = Abortable::default();
+        let send_result = multisig
+            .clone()
+            .send(payment_outputs.into(), None, crate::tx::Fees::None, None, wallet_secret.clone(), None, &abortable, None)
+            .await;
+
+        match send_result {
+            Err(Error::MultisigInsufficientCosignerMaterial { local, required }) => {
+                assert_eq!(local, 1, "rejection diagnostic names the actual L");
+                assert_eq!(required, k, "rejection diagnostic names the actual K");
+            }
+            other => panic!("expected MultisigInsufficientCosignerMaterial(L=1, K=2), got {other:?}"),
+        }
     }
 
     /// Three independent wallets sharing the same 2-of-3 multisig xpub set
