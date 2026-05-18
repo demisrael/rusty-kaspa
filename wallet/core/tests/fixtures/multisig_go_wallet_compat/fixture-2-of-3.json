@@ -1,0 +1,36 @@
+{
+  "n": 3,
+  "k": 2,
+  "network": "kaspa-mainnet",
+  "go_wallet_head": "4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2",
+  "mnemonics": [
+    "shed culture net traffic swarm off funny slush grocery extend ladder act father grow urge science arrange loop tennis fit approve human inhale process",
+    "ignore upgrade feature balcony shallow nest vote hurt trust oval oven tongue call ship law youth mountain carry snack tribe resemble gloom travel chat",
+    "assist leg naive odor snake topple curve case aisle exhibit flower cricket design quit hundred wrestle isolate dinosaur want valley praise item speak uphold"
+  ],
+  "xpubs": [
+    "kpub2J82mm9cgJdjXDx28XfGirxiRxaGd7pzTiGL79YZEXZ7bU1S4LMbvDVrxv53tVtQSVAtge5bGTMXbGkwEqRrscA1YNGhiUfXhQtttkxf31E",
+    "kpub2Jt1TriE8ZKwXqrWGy5BPnv8ioeJUbBx6Ab8aqLLPHUURZqfqEi2i28P3f1Vkmqn9Y2MwRnoUujVQy1FGMo6RkegWigjVGq6oNgZj89ov4h",
+    "kpub2KBWYEfPcYu3h1BANFmGKHrUzW1QS9RzNeyvRrYzgKWsuUb1wGqrznjZwpZr1GQMokakgU7EgV5ptMdptP7eUez8bfN7YnjPpBfAL42j98N"
+  ],
+  "cosigners": [
+    {
+      "cosigner_index": 0,
+      "receive_path": "m/0/0/0",
+      "receive_address": "kaspa:pp497vc4a9f243g27yw093aepmhewn7ashefl82vgldjx60yft0hzp88xsq8w",
+      "receive_script_address_hex": "6a5f3315e952aac50af11cf2c7b90eef974fdd85f29f9d4c47db2369e44adf71"
+    },
+    {
+      "cosigner_index": 1,
+      "receive_path": "m/1/0/0",
+      "receive_address": "kaspa:pp58w53yxxyrd86mew5dvnxse7wfazkjs3m7wys9qlgq7xtrzcgyut89p0wcn",
+      "receive_script_address_hex": "687752243188369f5bcba8d64cd0cf9c9e8ad28477e7120507d00f196316104e"
+    },
+    {
+      "cosigner_index": 2,
+      "receive_path": "m/2/0/0",
+      "receive_address": "kaspa:pz24t2c8gx67pw9flhlqeakgxrv32fydeysl8899t4ds8mp4zfq8xqsjc9h2h",
+      "receive_script_address_hex": "9555ab0741b5e0b8a9fdfe0cf6c830d915248dc921f39ca55d5b03ec35124073"
+    }
+  ]
+}

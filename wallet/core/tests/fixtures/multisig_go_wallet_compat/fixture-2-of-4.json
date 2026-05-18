@@ -1,0 +1,44 @@
+{
+  "n": 4,
+  "k": 2,
+  "network": "kaspa-mainnet",
+  "go_wallet_head": "4bb5bf25d3f2279ec2a61c3b4f7bb083b5f522b2",
+  "mnemonics": [
+    "slab despair review trust music history illegal velvet reward suggest couple type tongue youth reward moon security angry satoshi sure brief one shove net",
+    "erode owner various panic pole interest scrub smoke submit mammal blame hidden slide ticket better poem plunge blade breeze there antique shadow anxiety average",
+    "benefit spray era record boat depend person illness truly credit orange fabric skull present essay ginger artist dial sketch dignity same pond indicate slot",
+    "virus gauge someone mercy exhaust shove gesture educate mention measure estate save bamboo consider empty digital behind desk program drink tell dose mutual strike"
+  ],
+  "xpubs": [
+    "kpub2JUAx6eAeS3Ap4SRqBYfW3nWz4fxAJATDFBGoVG1XoDqZU6e5bVJE4fw6BRTw6ZQhTfpsSyT1CNwUsn8zjrW3Cvbn9Z5YQesM9zUPBEBMNW",
+    "kpub2JVtso43auTfELKFbRpGSfAazUJwLjfEyc7yPvtQav6zmRnEJrdMniGokMLSin5XZFCRsigFEGnm1PBPW5fQ8fDwtfFqT5aqTHAxCEDGcoY",
+    "kpub2JGEz1YfU4T3WVetyPXhDvHmzCFC7zWm4g2Bt5eVtd1NxFfAPGGLrAvyipVQCTkqzw7hezvkMfYk4ZvEz5dsvf7JMFVykzXUpLZVi6sGfMN",
+    "kpub2J3Ep46Zj3GRqf9bPTpiAAoovfriJ5XVzka6CmHGnHyxMDGiiZrFokjN3iVE78KyEpWDKE7JfYE9Pxsa8G7tQZqUjL8vQoAtqAMMXLa64Mj"
+  ],
+  "cosigners": [
+    {
+      "cosigner_index": 2,
+      "receive_path": "m/2/0/0",
+      "receive_address": "kaspa:pqkptva46pflc7ftjcra439p8nvuupqdrkgq92g4r0cay60ev873v0nku95tz",
+      "receive_script_address_hex": "2c15b3b5d053fc792b9607dac4a13cd9ce040d1d9002a9151bf1d269f961fd16"
+    },
+    {
+      "cosigner_index": 3,
+      "receive_path": "m/3/0/0",
+      "receive_address": "kaspa:prdyes0cr4ll980pdlh767zdt2lytm6zxm6qhv4et37e8n7h65daxp6azp4k9",
+      "receive_script_address_hex": "da4cc1f81d7ff29de16fefed784d5abe45ef4236f40bb2b95c7d93cfd7d51bd3"
+    },
+    {
+      "cosigner_index": 1,
+      "receive_path": "m/1/0/0",
+      "receive_address": "kaspa:pr8fsqjsxkv6png2g2x0u5m845wfq8csuhxrs6ga9jgk2696qtrmqu5mn0x3k",
+      "receive_script_address_hex": "ce9802503599a0cd0a428cfe5367ad1c901f10e5cc38691d2c916568ba02c7b0"
+    },
+    {
+      "cosigner_index": 0,
+      "receive_path": "m/0/0/0",
+      "receive_address": "kaspa:pztsfrh7f4fees8k2hhx3trahw5r3dk97ef8wk8vv3gpa455d44zq6t7ajta5",
+      "receive_script_address_hex": "97048efe4d539cc0f655ee68ac7dbba838b6c5f6527758ec64501ed6946d6a20"
+    }
+  ]
+}
