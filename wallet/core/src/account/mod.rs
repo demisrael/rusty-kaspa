@@ -216,12 +216,11 @@ pub trait Account: AnySync + Send + Sync + 'static {
 
                 // Enumerate every cosigner-prefix family's receive + change
                 // address managers. Non-multisig accounts expose a single
-                // family (length-1 vector) and the loop reduces to the
-                // pre-D1-SYNC scan of two AddressManagers. Multisig accounts
-                // expose N families so the wallet's UTXO scan covers every
-                // peer-cosigner-prefix address family on chain, not only the
-                // local family. Mirrors the Go-wallet daemon's
-                // `addressesToQuery` enumeration over `cosigner_index in [0, N)`.
+                // family (length-1 vector) and the loop reduces to a scan
+                // of two AddressManagers. Multisig accounts expose N
+                // families so the wallet's UTXO scan covers every
+                // peer-cosigner-prefix address family on chain, not only
+                // the local family.
                 let families = derivation.address_manager_families();
                 let mut scans: Vec<Scan> = Vec::with_capacity(families.len() * 2);
                 for family in families.iter() {

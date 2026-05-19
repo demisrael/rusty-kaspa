@@ -719,9 +719,9 @@ impl Wallet {
 
     /// Compute the next-available hardened `account_index` for a new multisig
     /// account in this wallet. Returns `max(existing_multisig.account_index) + 1`,
-    /// or `0` if no multisig account exists yet. The default-zero case preserves
-    /// Go-wallet byte-identity at `m/45'/111111'/0'` for the common single-
-    /// multisig-account-per-wallet path.
+    /// or `0` if no multisig account exists yet. The default-zero case yields
+    /// the canonical derivation at `m/45'/111111'/0'` for the common
+    /// single-multisig-account-per-wallet path.
     async fn next_multisig_account_index(self: &Arc<Wallet>) -> Result<u64> {
         let account_store = self.inner.store.clone().as_account_store()?;
         let mut iter = account_store.iter(None).await?;
@@ -2185,10 +2185,9 @@ mod multisig_tests {
     /// a distinct `(receive_address_manager, change_address_manager)` pair
     /// driven by a different BIP-32 child step at the cosigner-index slot, so
     /// the per-family first-receive addresses are pairwise distinct. The
-    /// local family aliases the wallet's `receive_address_manager` exactly
-    /// (preserving every pre-D1-SYNC caller against an `Arc` change).
-    /// Mirrors the Go-wallet daemon `addressesToQuery` enumeration over
-    /// `cosigner_index in [0, N)`.
+    /// local family aliases the wallet's `receive_address_manager` exactly,
+    /// so every caller that already held an `Arc` to it continues to
+    /// operate against the same backing `AddressManager`.
     #[tokio::test]
     async fn multisig_sync_layer_enumerates_all_cosigner_prefix_families() {
         for &(n, k) in &[(3usize, 2u16), (4, 2), (5, 3), (6, 3)] {
@@ -2254,9 +2253,9 @@ mod multisig_tests {
 
             // Local-family aliasing invariant: the family at the local
             // `cosigner_index` aliases the trait-exposed
-            // `receive_address_manager` / `change_address_manager` Arcs (so
-            // every pre-D1-SYNC caller against `derivation.receive_address_manager()`
-            // continues to operate against the same backing AddressManager).
+            // `receive_address_manager` / `change_address_manager` Arcs, so
+            // every caller against `derivation.receive_address_manager()`
+            // continues to operate against the same backing AddressManager.
             let multisig = account.downcast_arc::<MultiSig>().unwrap();
             let local_cosigner_index = multisig.cosigner_index() as usize;
             let local_family = &families[local_cosigner_index];
@@ -2481,7 +2480,7 @@ mod multisig_tests {
     /// consensus extract. The override fixes this by populating
     /// `input.redeem_script` via the shared helper and routing through
     /// `pskb_signer_for_multisig_cosigner` for the per-cosigner signature
-    /// chain. Test gates AC-D2-1 of the rev-7 spec.
+    /// chain.
     ///
     /// Idempotency cell: a second `pskb_sign` invocation on an already
     /// populated bundle leaves `redeem_script` unchanged (the helper's
@@ -3436,8 +3435,7 @@ mod multisig_tests {
         use crate::utils::kaspa_to_sompi;
         use crate::utxo::UtxoEntryReference;
 
-        // Cosigner-split topology: one local seed, two external xpubs.
-        // Alice's wallet has L=1, K=2.
+        // One local seed, two external xpubs (L = 1, K = 2).
         let mnemonics = make_local_mnemonics(3).await;
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
@@ -3462,8 +3460,8 @@ mod multisig_tests {
         let network_id = wallet.network_id().unwrap();
 
         // Synthetic UTXO at the wallet's own family's first-receive
-        // address. The post-D1-SYNC family-aware lookup finds this in the
-        // local family's address_to_index_map immediately (no peer-family
+        // address. The family-aware lookup finds this in the local
+        // family's address_to_index_map immediately (no peer-family
         // address materialization is needed for this synthetic case).
         let receive_address = account.receive_address().unwrap();
         let amount: u64 = kaspa_to_sompi(10.0);
@@ -3491,8 +3489,6 @@ mod multisig_tests {
         };
 
         let abortable = Abortable::default();
-        // Pre-fix this returned `Err(MultisigInsufficientCosignerMaterial { local: 1, required: 2 })`
-        // at the L<K guard; post-fix it returns Ok with a partial bundle.
         let (bundle, _summary) = build_multisig_signed_bundle(
             account.clone(),
             xpub_keys_strings,
@@ -3582,9 +3578,8 @@ mod multisig_tests {
     /// `KeySource.derivation_path` recording the funded address's actual
     /// cosigner-prefix family path
     /// (`m/45'/111111'/account_index'/<funded_cosigner_index>/<address_type>/<address_index>`).
-    /// This mirrors Go-wallet's per-input `PartiallySignedInput.DerivationPath`
-    /// attribution -- the sign-time signer reads the recorded path to derive
-    /// each cosigner's xprv at the funded family's leaf, regardless of which
+    /// At sign time the signer reads the recorded path to derive each
+    /// cosigner's xprv at the funded family's leaf, regardless of which
     /// family the local wallet itself sits at.
     #[tokio::test]
     async fn multisig_pskt_per_input_derivation_path_attribution() {
@@ -3669,24 +3664,16 @@ mod multisig_tests {
 
     /// Two-of-three cosigner-split round-trip against a peer-cosigner-prefix
     /// family address. The local wallet holds all three seeds (operator-Send
-    /// shape, `L = 3`) so the test can drive every cosigner's signature
-    /// in-process, but funds a *non-local* family's receive[0]
-    /// (`cosigner_index != local MinimumCosignerIndex`) to force the
-    /// cross-family code path. The signer derives each cosigner's xprv at
-    /// the per-input `bip32_derivations.derivation_path` (the funded
-    /// family's leaf), and the resulting K-of-N script-sig must extract
-    /// under `TxScriptEngine`. Without the family-aware lookup and
-    /// per-input derivation, the redeem-script's slot pubkeys would be
-    /// derived at the local cosigner_index path and the script would
-    /// `EvalFalse` at consensus extract.
-    ///
-    /// **Topology disclosure.** This test exercises the cross-family
-    /// signing primitive at `L = 3 = N` (every cosigner seed local). The
-    /// cosigner-split production topology has `L = 1` per wallet (each
-    /// cosigner holds exactly its own seed); the `L = 1` partial-bundle
-    /// flow through `pskb_from_send_generator` is exercised by the
-    /// sibling test
-    /// `multisig_pskb_sign_cosigner_split_l_equals_1_round_trip` below.
+    /// shape) so the test can drive every cosigner's signature in-process,
+    /// but funds a *non-local* family's receive[0] (`cosigner_index != local
+    /// MinimumCosignerIndex`) to force the cross-family code path. The
+    /// signer derives each cosigner's xprv at the per-input
+    /// `bip32_derivations.derivation_path` (the funded family's leaf), and
+    /// the resulting K-of-N script-sig must extract under
+    /// `TxScriptEngine`. Without the family-aware lookup and per-input
+    /// derivation, the redeem-script's slot pubkeys would be derived at the
+    /// local cosigner_index path and the script would `EvalFalse` at
+    /// consensus extract.
     #[tokio::test]
     async fn multisig_pskb_sign_cosigner_split_two_of_three_round_trip() {
         let mnemonics = make_local_mnemonics(3).await;
@@ -3710,8 +3697,8 @@ mod multisig_tests {
         assert_ne!(peer_receive_address, account.receive_address().unwrap(), "peer family's receive address differs from local");
 
         // Synthetic UTXO at the peer family's receive[0]. The funded-address
-        // P2SH script_public_key commits to a redeem-script the post-fix
-        // helper builds from the peer family's path.
+        // P2SH script_public_key commits to a redeem-script the helper
+        // builds from the peer family's path.
         let script_public_key = pay_to_address_script(&peer_receive_address);
         let utxo =
             kaspa_consensus_core::tx::UtxoEntry { amount: 100_000_000, script_public_key, block_daa_score: 1, is_coinbase: false };
@@ -3767,9 +3754,9 @@ mod multisig_tests {
 
         // Finalize + extract: the extractor runs `TxScriptEngine::execute()`
         // per input against the peer-family redeem-script. Per-cosigner
-        // signing keys derived at the local cosigner_index path (the
-        // pre-rev-6 behavior) would `EvalFalse` here; the per-input
-        // attribution makes the script verify.
+        // signing keys derived at the local cosigner_index path would
+        // `EvalFalse` here; the per-input attribution makes the script
+        // verify.
         let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
             PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
         let finalizer_pskt = signer_pskt.finalizer();
@@ -3842,7 +3829,7 @@ mod multisig_tests {
         }
 
         // Pre-condition assertion: each wallet has L=1 local prv_key_data_id
-        // (`< K = 2`); pre-fix this topology was structurally rejected.
+        // (`< K = 2`).
         for (i, (_, account)) in wallets_and_accounts.iter().enumerate() {
             let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
             let local_prv_ids = multisig.prv_key_data_ids().as_ref().map(|ids| ids.len()).expect("each wallet has local prv_key_data");
@@ -3884,7 +3871,7 @@ mod multisig_tests {
 
         // Alice populates redeem_script + bip32_derivations from her wallet
         // (her family-aware lookup recovers her own family from her local
-        // address_to_index_map). The post-D1-SYNC sync surface lets either
+        // address_to_index_map). The family-aware sync surface lets either
         // her wallet or Bob's wallet equivalently populate the bundle.
         crate::account::variants::multisig::populate_multisig_redeem_scripts(alice_account.clone(), &mut accumulator, k)
             .await
@@ -4032,10 +4019,10 @@ mod multisig_tests {
     /// `address_family_index` finds any cosigner's receive address in any
     /// wallet's watch surface, including peer cosigners' family addresses
     /// the wallet does not own a private key for. This is the structural
-    /// proof of cross-wallet UTXO visibility post-D1-SYNC: a UTXO funded to
-    /// Alice's address is reachable by Bob's wallet and Charlie's wallet
-    /// even though only Alice's seed produces a signing key at Alice's
-    /// family path.
+    /// proof of cross-wallet UTXO visibility: a UTXO funded to Alice's
+    /// address is reachable by Bob's wallet and Charlie's wallet even
+    /// though only Alice's seed produces a signing key at Alice's family
+    /// path.
     #[tokio::test]
     async fn multisig_cross_wallet_utxo_visibility_post_d1_sync() {
         // Three random 24-word mnemonics, one per cosigner. Each is a
@@ -4122,14 +4109,13 @@ mod multisig_tests {
     /// Operator-Send byte-identity gate. A multisig account whose local
     /// cosigner set is all of the N seeds (no externals) places
     /// `MinimumCosignerIndex` at the smallest sorted position of the local
-    /// xpubs, which is also 0 for the all-local set. The post-fix derivation
-    /// path applies that same index step to every cosigner's xpub when
-    /// assembling the redeem-script, producing the same P2SH address
-    /// pre-fix and post-fix. Pins the derivation-rule NO-CHANGE invariant on the
-    /// derivation rule against the pre-fix HEAD `ad08e0d6` reference
-    /// captured offline via cycle-1 derivation walk.
+    /// xpubs, which is also 0 for the all-local set. The derivation path
+    /// applies that same index step to every cosigner's xpub when
+    /// assembling the redeem-script, producing a byte-identical P2SH
+    /// address. Pins the derivation-rule NO-CHANGE invariant against an
+    /// independently-computed canonical xpub-walk reference.
     #[tokio::test]
-    async fn multisig_operator_send_byte_identical_pre_post_fix() {
+    async fn multisig_operator_send_canonical_byte_identity() {
         // Deterministic 24-word phrases reproducible across runs.
         let phrase_a = "caution guide valley easily latin already visual fancy fork car switch runway \
                         vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
@@ -4148,12 +4134,11 @@ mod multisig_tests {
         assert_eq!(local_cosigner_index, 0, "operator-Send (all seeds local) sets MinimumCosignerIndex to 0 by construction");
 
         // Independently rebuild the receive[0] script_public_key from the
-        // canonical xpub-walk using the post-fix derivation rule
+        // canonical xpub-walk using the derivation rule
         // (`derive_child(0).derive_child(receive=0).derive_child(0)` on
-        // each cosigner xpub). The post-fix rule is byte-identical to the
-        // pre-fix rule (NO CHANGE at the derivation layer); any divergence would surface
-        // here as an address mismatch against the canonical externally-built
-        // P2SH script.
+        // each cosigner xpub). Any divergence at the derivation layer
+        // would surface here as an address mismatch against the canonical
+        // externally-built P2SH script.
         let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
         let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
         for xpub in xpub_keys.iter() {
@@ -4178,32 +4163,32 @@ mod multisig_tests {
         );
     }
 
-    /// Go-wallet-mirror byte-identity gate (AC-Go-wallet-mirror-1) across
-    /// the parametric (N, K) coverage cells `{(2,3), (2,4), (3,5), (3,6)}`.
+    /// Parametric byte-identity gate across the (N, K) cells
+    /// `{(2,3), (2,4), (3,5), (3,6)}` -- the non-degenerate K < N
+    /// canonical-multisig coverage band.
     ///
-    /// Each JSON fixture under `tests/fixtures/multisig_go_wallet_compat/`
-    /// was generated offline by driving Go-wallet's
-    /// `libkaspawallet.Address` at HEAD `4bb5bf25` against per-cell-fresh
-    /// 24-word mnemonic sets; the fixture records, per cosigner, the
-    /// `MinimumCosignerIndex` and the resulting first-receive address,
-    /// alongside the network-agnostic `ScriptAddress` (BLAKE2B P2SH
-    /// script-hash) bytes.
+    /// Each JSON fixture under
+    /// `tests/fixtures/multisig_cosigner_prefix_family_vectors/`
+    /// records, per cosigner, the BIP-32 family path
+    /// (`m/<cosigner_index>/0/0`) and the expected first-receive
+    /// address alongside the network-agnostic P2SH script-hash
+    /// (BLAKE2B) bytes.
     ///
-    /// The kaspa-cli side rebuilds the same multisig account from the
-    /// fixture's mnemonics and asserts byte-equality on each cosigner's
+    /// The test rebuilds the multisig account from each cell's
+    /// mnemonics and asserts byte-equality on each cosigner-prefix
     /// family's first-receive `ScriptPublicKey` bytes against the
-    /// Go-wallet reference. The address-string form differs only by
-    /// network prefix (the fixture uses mainnet; the kaspa-cli test
+    /// fixture's canonical vector. The address-string form differs
+    /// only by network prefix (the fixture uses mainnet; the test
     /// wallet uses testnet-10), so the network-agnostic P2SH
-    /// script-hash is the load-bearing comparison surface; the address
-    /// prefix is asserted separately on the address string to keep the
-    /// network-encoding shape pinned.
+    /// script-hash is the load-bearing comparison surface; the
+    /// address prefix is asserted separately on the address string
+    /// to keep the network-encoding shape pinned.
     ///
-    /// Asserts: kaspa-cli post-fix derivation, sync-layer enumeration, and
-    /// family-aware address mapping all agree with Go-wallet's reference at
-    /// each cosigner-prefix family in `[0, N)`.
+    /// Asserts: the wallet's derivation, sync-layer enumeration, and
+    /// family-aware address mapping all agree with the canonical
+    /// reference vectors at each cosigner-prefix family in `[0, N)`.
     #[tokio::test]
-    async fn multisig_address_byte_identical_to_go_wallet_per_cosigner_prefix_family() {
+    async fn multisig_per_cosigner_prefix_family_address_byte_identity() {
         #[derive(serde::Deserialize)]
         struct FixtureRow {
             cosigner_index: u32,
@@ -4218,17 +4203,15 @@ mod multisig_tests {
             k: u16,
             #[allow(dead_code)]
             network: String,
-            #[allow(dead_code)]
-            go_wallet_head: String,
             mnemonics: Vec<String>,
             xpubs: Vec<String>,
             cosigners: Vec<FixtureRow>,
         }
 
-        const FIXTURE_2_OF_3: &str = include_str!("../../tests/fixtures/multisig_go_wallet_compat/fixture-2-of-3.json");
-        const FIXTURE_2_OF_4: &str = include_str!("../../tests/fixtures/multisig_go_wallet_compat/fixture-2-of-4.json");
-        const FIXTURE_3_OF_5: &str = include_str!("../../tests/fixtures/multisig_go_wallet_compat/fixture-3-of-5.json");
-        const FIXTURE_3_OF_6: &str = include_str!("../../tests/fixtures/multisig_go_wallet_compat/fixture-3-of-6.json");
+        const FIXTURE_2_OF_3: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-2-of-3.json");
+        const FIXTURE_2_OF_4: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-2-of-4.json");
+        const FIXTURE_3_OF_5: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-3-of-5.json");
+        const FIXTURE_3_OF_6: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-3-of-6.json");
 
         for raw in [FIXTURE_2_OF_3, FIXTURE_2_OF_4, FIXTURE_3_OF_5, FIXTURE_3_OF_6] {
             let fx: Fixture = serde_json::from_str(raw).expect("fixture JSON parses");
@@ -4267,9 +4250,9 @@ mod multisig_tests {
             fixture_xpub_canon.sort_unstable();
             let mut kaspa_canon = kaspa_xpubs.clone();
             kaspa_canon.sort_unstable();
-            assert_eq!(kaspa_canon, fixture_xpub_canon, "({},{}): canonical xpub sets agree with Go-wallet", fx.k, fx.n);
+            assert_eq!(kaspa_canon, fixture_xpub_canon, "({},{}): canonical xpub sets agree with the fixture", fx.k, fx.n);
 
-            // For each family per the post-D1-SYNC enumeration, recover
+            // For each family per the cosigner-prefix enumeration, recover
             // the family's first-receive address and assert byte-equality
             // against the matching cosigner row in the fixture.
             let derivation = account.clone().as_derivation_capable().unwrap().derivation();
@@ -4288,8 +4271,8 @@ mod multisig_tests {
 
                 // The script_public_key shape kaspa-cli emits for a P2SH
                 // address is `OpBlake2b 0x20 <32-byte hash> OpEqual`; the
-                // last 32 bytes are the BLAKE2B script-hash. The
-                // Go-wallet fixture records the same script-hash as
+                // last 32 bytes are the BLAKE2B script-hash. The fixture
+                // records the same script-hash as
                 // `receive_script_address_hex`.
                 let script_bytes = kaspa_script.script();
                 assert!(script_bytes.len() >= 32, "({},{}): script too short for P2SH", fx.k, fx.n);
@@ -4299,7 +4282,7 @@ mod multisig_tests {
                 let kaspa_script_hash_hex = String::from_utf8(kaspa_script_hash_hex).unwrap();
                 assert_eq!(
                     kaspa_script_hash_hex, fixture_row.receive_script_address_hex,
-                    "({},{}): family {} P2SH script-hash byte-identity vs Go-wallet HEAD 4bb5bf25",
+                    "({},{}): family {} P2SH script-hash byte-identity against the fixture",
                     fx.k, fx.n, family.cosigner_index,
                 );
 
@@ -4367,11 +4350,11 @@ mod multisig_tests {
 
     /// `Wallet::create_account_multisig` invoked with `account_index=None`
     /// auto-assigns the next-available hardened index. The first multisig
-    /// account in a wallet lands at index `0` (preserves Go-wallet byte-
-    /// identity at the common single-multisig-account-per-wallet path).
-    /// A subsequent multisig account in the same wallet auto-assigns to
-    /// `1` (monotone next-available); `Some(n)` overrides the auto-assign
-    /// and uses `n` verbatim.
+    /// account in a wallet lands at index `0` (the canonical
+    /// single-multisig-account-per-wallet path). A subsequent multisig
+    /// account in the same wallet auto-assigns to `1` (monotone
+    /// next-available); `Some(n)` overrides the auto-assign and uses `n`
+    /// verbatim.
     #[tokio::test]
     async fn multisig_account_index_auto_assign_monotonic() {
         async fn create_with_auto_assign(wallet: &Arc<Wallet>, wallet_secret: &Secret) -> Arc<dyn Account> {
@@ -4404,13 +4387,13 @@ mod multisig_tests {
         );
     }
 
-    /// A `Payload` byte sequence written by the pre-fix code path (four
-    /// fields, no trailing `account_index`) MUST deserialize under the
-    /// post-fix `BorshDeserialize` impl with `account_index` defaulted to
-    /// `0`. This is the wallet-file backward-compatibility contract for
-    /// existing kaspa-cli wallets with a multisig account.
+    /// A `Payload` byte sequence written before the `account_index` field
+    /// existed (four fields, no trailing `account_index`) MUST deserialize
+    /// under the current `BorshDeserialize` impl with `account_index`
+    /// defaulted to `0`. This is the wallet-file backward-compatibility
+    /// contract for existing kaspa-cli wallets with a multisig account.
     #[tokio::test]
-    async fn multisig_payload_pre_fix_wallet_file_loads_with_default_account_index() {
+    async fn multisig_payload_legacy_wallet_file_loads_with_default_account_index() {
         use crate::account::variants::multisig::Payload;
 
         let xpub_keys: ExtendedPublicKeys = vec![
@@ -4423,19 +4406,19 @@ mod multisig_tests {
             .unwrap(),
         ]
         .into();
-        let post_fix = Payload::new(xpub_keys.clone(), Some(0), 1, false, 42);
-        let full = borsh::to_vec(&post_fix).unwrap();
+        let current = Payload::new(xpub_keys.clone(), Some(0), 1, false, 42);
+        let full = borsh::to_vec(&current).unwrap();
 
         // Strip the trailing `account_index: u64` (8 bytes) to reproduce
-        // the on-wire shape a pre-fix wallet file carries (four fields,
+        // the on-wire shape a legacy wallet file carries (four fields,
         // no `account_index` suffix). Read via `deserialize_reader` on a
         // `Cursor` so the additive-suffix EOF default fires cleanly; the
         // higher-level `try_from_slice` also asserts the slice was fully
         // consumed, which is satisfied here because our impl reads to EOF.
-        let pre_fix_bytes = &full[..full.len() - 8];
-        let mut cursor = std::io::Cursor::new(pre_fix_bytes);
+        let legacy_bytes = &full[..full.len() - 8];
+        let mut cursor = std::io::Cursor::new(legacy_bytes);
         let loaded = <Payload as borsh::BorshDeserialize>::deserialize_reader(&mut cursor).unwrap();
-        assert_eq!(loaded.account_index, 0, "pre-fix payload deserialization defaults account_index to 0");
+        assert_eq!(loaded.account_index, 0, "legacy payload deserialization defaults account_index to 0");
         assert_eq!(loaded.cosigner_index, Some(0));
         assert_eq!(loaded.minimum_signatures, 1);
         assert!(!loaded.ecdsa);
@@ -4455,23 +4438,12 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
 
-        let mnemonic_a = "caution guide valley easily latin already visual fancy fork car switch runway \
-                          vicious polar surprise fence boil light nut invite fiction visa hamster coyote";
-        let mnemonic_b = "fiber boy desk trip pitch snake table awkward endorse car learn forest \
-                          solid ticket enemy pink gesture wealth iron chaos clock gather honey farm";
+        let mnemonics = make_local_mnemonics(2).await;
         let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-        let prv_key_data_a = PrvKeyData::try_new_from_mnemonic(
-            Mnemonic::new(mnemonic_a, Language::English).unwrap(),
-            None,
-            EncryptionKind::XChaCha20Poly1305,
-        )
-        .unwrap();
-        let prv_key_data_b = PrvKeyData::try_new_from_mnemonic(
-            Mnemonic::new(mnemonic_b, Language::English).unwrap(),
-            None,
-            EncryptionKind::XChaCha20Poly1305,
-        )
-        .unwrap();
+        let prv_key_data_a =
+            PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_b =
+            PrvKeyData::try_new_from_mnemonic(mnemonics[1].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
         let id_a = prv_key_data_a.id;
         let id_b = prv_key_data_b.id;
         prv_key_data_store.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
@@ -4511,15 +4483,14 @@ mod multisig_tests {
 
     /// `Wallet::create_account_multisig(..., account_index=None)` for the
     /// first multisig account in a wallet auto-assigns to `account_index=0`
-    /// and derives addresses byte-identical to the Go-wallet reference at
-    /// `defaultPath(isMultisig=true) = m/45'/111111'/0'`. This is the
-    /// Go-wallet cross-binary compatibility gate for the common single-
-    /// multisig-account-per-wallet path. The fixture vector reused here is
-    /// the existing AC-Go-wallet-mirror-1 substrate (Go-wallet HEAD
-    /// `4bb5bf25`); the cell at `(N=3, K=2, account_index=0)` is the
+    /// and derives addresses byte-identical to the canonical reference
+    /// vector at `m/45'/111111'/0'`. This pins the default-account
+    /// derivation for the common single-multisig-account-per-wallet path.
+    /// The fixture vector reused here is the parametric byte-identity
+    /// substrate; the cell at `(N=3, K=2, account_index=0)` is the
     /// load-bearing comparison surface.
     #[tokio::test]
-    async fn multisig_account_index_default_zero_preserves_go_wallet_compat() {
+    async fn multisig_account_index_default_zero_canonical_byte_identity() {
         #[derive(serde::Deserialize)]
         struct FixtureRow {
             cosigner_index: u32,
@@ -4536,15 +4507,13 @@ mod multisig_tests {
             k: u16,
             #[allow(dead_code)]
             network: String,
-            #[allow(dead_code)]
-            go_wallet_head: String,
             mnemonics: Vec<String>,
             #[allow(dead_code)]
             xpubs: Vec<String>,
             cosigners: Vec<FixtureRow>,
         }
 
-        const FIXTURE_2_OF_3: &str = include_str!("../../tests/fixtures/multisig_go_wallet_compat/fixture-2-of-3.json");
+        const FIXTURE_2_OF_3: &str = include_str!("../../tests/fixtures/multisig_cosigner_prefix_family_vectors/fixture-2-of-3.json");
         let fx: Fixture = serde_json::from_str(FIXTURE_2_OF_3).expect("fixture JSON parses");
 
         let wallet = test_wallet().await;
@@ -4552,11 +4521,10 @@ mod multisig_tests {
         let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
 
         // Materialize each fixture mnemonic as a stored PrvKeyData entry so
-        // the wallet-facing `create_account_multisig` API (the spec-named
-        // entry for AC-MA-7) can be driven directly via PrvKeyDataArgs. This
-        // exercises the explicit `account_index=None` (auto-assign) branch
-        // of the spec-named API rather than the `import_multisig_with_mnemonic`
-        // alias path.
+        // the wallet-facing `create_account_multisig` API can be driven
+        // directly via PrvKeyDataArgs. This exercises the explicit
+        // `account_index = None` (auto-assign) branch of that API rather
+        // than the `import_multisig_with_mnemonic` alias path.
         let mut prv_key_data_args: Vec<PrvKeyDataArgs> = Vec::with_capacity(fx.mnemonics.len());
         for phrase in fx.mnemonics.iter() {
             let prv_key_data = PrvKeyData::try_new_from_mnemonic(
@@ -4573,14 +4541,14 @@ mod multisig_tests {
 
         // Drive the spec-named create path with `account_index=None`
         // (auto-assign on the first multisig account in this wallet) to
-        // confirm the auto-assign resolves to `0` and preserves Go-wallet
-        // byte-identity.
+        // confirm the auto-assign resolves to `0` and pins the canonical
+        // default-account byte-identity.
         let account = wallet.create_account_multisig(&wallet_secret, prv_key_data_args, vec![], None, fx.k, None).await.unwrap();
         let derivation_capable = account.clone().as_derivation_capable().unwrap();
         assert_eq!(
             derivation_capable.account_index(),
             0,
-            "first multisig account auto-assign yields account_index=0 (Go-wallet defaultPath compat)",
+            "first multisig account auto-assign yields account_index=0 (canonical default-account path)",
         );
 
         let families = derivation_capable.derivation().address_manager_families();
@@ -4596,7 +4564,7 @@ mod multisig_tests {
             let kaspa_script_hash_hex = String::from_utf8(kaspa_script_hash_hex).unwrap();
             assert_eq!(
                 kaspa_script_hash_hex, fixture_row.receive_script_address_hex,
-                "family {} P2SH script-hash byte-identity at auto-assigned account_index=0 vs Go-wallet HEAD 4bb5bf25",
+                "family {} P2SH script-hash byte-identity at auto-assigned account_index=0 against the canonical fixture",
                 family.cosigner_index,
             );
         }

@@ -178,8 +178,7 @@ impl AddressManager {
 /// addresses, not only its own. Each family carries an independent pair of
 /// `AddressManager` instances tracking the family's receive and change
 /// derivation indexes. Non-multisig accounts expose a single family at
-/// `cosigner_index = 0` and behave identically to the pre-D1-SYNC single-pair
-/// shape.
+/// `cosigner_index = 0` and behave identically to the single-pair shape.
 #[derive(Clone)]
 pub struct AddressManagerFamily {
     pub cosigner_index: u32,
@@ -201,7 +200,7 @@ pub struct AddressDerivationManager {
     /// `cosigner_index` equals the local wallet's `cosigner_index` aliases
     /// `receive_address_manager` / `change_address_manager` exactly, so
     /// callers that only ever look at the local family continue to operate
-    /// against the same `Arc` they did pre-D1-SYNC.
+    /// against the same `Arc` they always have.
     pub address_manager_families: Vec<AddressManagerFamily>,
 }
 
@@ -222,10 +221,9 @@ impl AddressDerivationManager {
 
         // Enumerate every cosigner-prefix family in `[0, N)` for multisig
         // accounts so the wallet's address-watch surface covers UTXOs funded
-        // to any cosigner's address family (mirrors the Go-wallet daemon's
-        // triple-nested `addressesToQuery` enumeration). Non-multisig account
-        // kinds emit a single family at the supplied `cosigner_index` and
-        // reduce to the pre-D1-SYNC single-pair shape.
+        // to any cosigner's address family. Non-multisig account kinds emit
+        // a single family at the supplied `cosigner_index` and reduce to
+        // the single-pair shape.
         let is_multisig = matches!(account_kind.as_ref(), MULTISIG_ACCOUNT_KIND);
         let family_count = if is_multisig { keys.len() } else { 1 };
         let local_cosigner_index = cosigner_index.unwrap_or(0);
@@ -557,7 +555,7 @@ pub trait AddressDerivationManagerTrait: AnySync + Send + Sync + 'static {
     fn change_address_manager(&self) -> Arc<AddressManager>;
     /// Every cosigner-prefix family the wallet's address-watch surface covers.
     /// The default implementation returns a single family at `cosigner_index = 0`
-    /// wrapping the local receive / change pair, matching the pre-D1-SYNC
+    /// wrapping the local receive / change pair, matching the single-pair
     /// behavior of any trait impl that has not opted into multi-family
     /// enumeration. The concrete `AddressDerivationManager` overrides this to
     /// return the stored families vector (length N for multisig accounts;

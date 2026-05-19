@@ -94,14 +94,15 @@ impl BorshDeserialize for Payload {
         let minimum_signatures = BorshDeserialize::deserialize_reader(reader)?;
         let ecdsa = BorshDeserialize::deserialize_reader(reader)?;
         // Trailing `account_index` is an additive suffix on STORAGE_VERSION 0.
-        // Pre-fix payloads end after `ecdsa`; a clean EOF at this position
-        // (zero further bytes available) signals that the loaded wallet
-        // predates the field, in which case the implicit default `0`
-        // preserves the single-multisig-account-per-wallet path that yields
-        // Go-wallet byte-identity at `m/45'/111111'/0'`. A partial read
-        // (between 1 and 7 trailing bytes) is treated as corruption and
-        // propagates the underlying read error, so a truncated wallet file
-        // is not silently accepted as `account_index = 0`.
+        // Older payloads (written before the field existed) end after
+        // `ecdsa`; a clean EOF at this position (zero further bytes
+        // available) signals that the loaded wallet predates the field,
+        // in which case the implicit default `0` preserves the
+        // single-multisig-account-per-wallet derivation at
+        // `m/45'/111111'/0'`. A partial read (between 1 and 7 trailing
+        // bytes) is treated as corruption and propagates the underlying
+        // read error, so a truncated wallet file is not silently accepted
+        // as `account_index = 0`.
         let mut tail = [0u8; 8];
         let account_index = match reader.read(&mut tail[..1])? {
             0 => 0,
@@ -705,13 +706,13 @@ pub(crate) async fn build_multisig_signed_bundle(
 
     // The local wallet's cosigner_index. Threaded through to
     // `pskb_signer_for_multisig_cosigner` as the `default_cosigner_index`
-    // fallback for inputs whose `bip32_derivations` is empty (e.g.,
-    // pre-rev-6 PSKTs or primitive tests). The primary signing path
+    // fallback for inputs whose `bip32_derivations` is empty (a synthetic
+    // primitive test fixture, for example). The primary signing path
     // consumes the per-input `KeySource.derivation_path` populated by
     // `populate_multisig_redeem_scripts` below, which encodes the funded
-    // cosigner-prefix family's leaf path -- the same path Go-wallet's
-    // `libkaspawallet/sign.go` derives each cosigner's xprv at to
-    // produce the slot pubkey matching the redeem-script.
+    // cosigner-prefix family's leaf path -- the same path each cosigner
+    // derives its xprv at to produce the slot pubkey matching the
+    // redeem-script.
     let multisig_derivation_index = account.clone().as_derivation_capable()?.cosigner_index();
 
     // PSKTGenerator requires a PSKBSigner by construction but does not invoke
@@ -803,23 +804,21 @@ pub(crate) async fn build_multisig_signed_bundle(
 /// `derive_child(funded_cosigner_index).derive_child(address_type).derive_child(address_index)`.
 /// **The funded cosigner_index is the address's own family**, not the local
 /// wallet's; recovered from the family-aware `address_family_index` lookup
-/// over every cosigner-prefix family the wallet watches. This is the rule
-/// Go-wallet's `multiSigRedeemScript` follows: every xpub in the script is
-/// derived through the same `path` argument, and the path is the funded
-/// UTXO's address path. Each cosigner-prefix family thus has a distinct
-/// P2SH script-hash; spending a UTXO in family Y produces a redeem-script
-/// keyed to Y's derivation chain.
+/// over every cosigner-prefix family the wallet watches. Every xpub in the
+/// emitted script is derived through the same `path` argument, and the path
+/// is the funded UTXO's address path. Each cosigner-prefix family thus has
+/// a distinct P2SH script-hash; spending a UTXO in family Y produces a
+/// redeem-script keyed to Y's derivation chain.
 ///
 /// **bip32 derivations.** The helper additionally records the funded address's
 /// derivation path (`m/45'/111111'/account_index'/<funded_cosigner_index>/<address_type>/<address_index>`)
 /// on the PSKT input via `bip32_derivations`, keyed by the local cosigner's
-/// slot pubkey at that path. This is the kaspa-PSKT analog of Go-wallet's
-/// per-input `PartiallySignedInput.DerivationPath`: at sign time, every
-/// cosigner reads the recorded path, derives their own xprv at the same
-/// path, produces the cosigner's slot pubkey, and signs the matching
-/// redeem-script slot. The recorded path attribution makes K-of-N spending
-/// of any cosigner-prefix family possible without requiring each cosigner
-/// to re-derive the family from the UTXO address locally.
+/// slot pubkey at that path. At sign time, every cosigner reads the recorded
+/// path, derives their own xprv at the same path, produces the cosigner's
+/// slot pubkey, and signs the matching redeem-script slot. The recorded
+/// path attribution makes K-of-N spending of any cosigner-prefix family
+/// possible without requiring each cosigner to re-derive the family from
+/// the UTXO address locally.
 ///
 /// The shared helper is reused by both the operator-Send path
 /// (`build_multisig_signed_bundle`) and the REPL `pskb sign` path
@@ -891,10 +890,10 @@ impl DerivationCapableAccount for MultiSig {
         self.derivation.clone()
     }
 
-    /// (drop the account_index() = 0 hardcode; let each multisig account carry
-    /// its own hardened account_index). This makes multi-account-multisig
+    /// Drop the account_index() = 0 hardcode and let each multisig account
+    /// carry its own hardened account_index. This makes multi-account-multisig
     /// cryptographically meaningful rather than just storage-segregation, and
-    /// preserves Go-wallet byte-identity for the common single-multisig-account
+    /// preserves legacy byte-identity for the common single-multisig-account
     /// case (account_index = 0).
     fn account_index(&self) -> u64 {
         self.account_index

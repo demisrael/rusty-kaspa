@@ -369,19 +369,18 @@ fn parse_redeem_script_pubkeys(redeem_script: &[u8]) -> Result<Vec<Vec<u8>>, Err
 /// `bip32_derivations` map, the helper derives this cosigner's signing key
 /// from the recorded `KeySource.derivation_path`. The same input may sit at
 /// any cosigner-prefix family on chain; the input-level path is the only
-/// load-bearing handle to which family is being spent. This mirrors
-/// Go-wallet's per-input `PartiallySignedInput.DerivationPath` consumption
-/// in `libkaspawallet/sign.go`: each cosigner derives their local xprv at
-/// the per-input path, produces a pubkey, and signs the matching
-/// redeem-script slot -- regardless of which cosigner's family was funded.
+/// load-bearing handle to which family is being spent. Each cosigner derives
+/// their local xprv at the per-input path, produces a pubkey, and signs the
+/// matching redeem-script slot -- regardless of which cosigner's family was
+/// funded.
 ///
 /// **Backward-compatible fallback.** If an input's `bip32_derivations` map
-/// is empty (e.g., a synthetic PSKT primitive test fixture or a pre-rev-6
-/// PSKT that predates per-input attribution), the helper falls back to the
+/// is empty (e.g., a synthetic PSKT primitive test fixture or a PSKT that
+/// predates per-input attribution), the helper falls back to the
 /// `default_cosigner_index` argument applied as a single child step on this
 /// cosigner's xprv at the `(address_type, address_index)` recovered from
 /// the input's UTXO address via the family-aware lookup. Callers in the
-/// rev-6 chain (`MultiSig::pskb_sign` and `build_multisig_signed_bundle`)
+/// current chain (`MultiSig::pskb_sign` and `build_multisig_signed_bundle`)
 /// always pre-populate `bip32_derivations` via
 /// `populate_multisig_redeem_scripts`, so the fallback only exercises the
 /// primitive test path.
