@@ -64,3 +64,13 @@ do
         exit $status
     fi
 done
+
+# grandpa-wallet integration tests
+cargo nextest run -p kaspawallet
+status=$?
+if [ $status -ne 0 ]; then
+    echo
+    echo "--> kaspawallet nextest failed"
+    echo
+    exit $status
+fi

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "daemon",
     "cli",
+    "cmd/kaspawallet",
     "core",
     "wallet/macros",
     "wallet/core",
@@ -128,6 +129,7 @@ kaspa-wallet = { version = "1.1.0", path = "wallet/native" }
 kaspa-wallet-cli-wasm = { version = "1.1.0", path = "wallet/wasm" }
 kaspa-wallet-keys = { version = "1.1.0", path = "wallet/keys" }
 kaspa-wallet-pskt = { version = "1.1.0", path = "wallet/pskt" }
+kaspawallet = { version = "1.1.0", path = "cmd/kaspawallet" }
 kaspa-wallet-core = { version = "1.1.0", path = "wallet/core" }
 kaspa-wallet-macros = { version = "1.1.0", path = "wallet/macros" }
 kaspa-wasm = { version = "1.1.0", path = "wasm" }
@@ -172,6 +174,7 @@ derive_more = "0.99.17"
 # derive_more = { version = "1.0.0", features = ["full"] }
 dhat = "0.3.2"
 dirs = "5.0.1"
+fd-lock = "4.0.4"
 downcast = "0.11.0"
 downcast-rs = "1.2.0"
 duration-string = "0.4.0"
