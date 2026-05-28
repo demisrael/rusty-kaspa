@@ -154,6 +154,10 @@ impl Account for Bip32Watch {
         Some(&self.xpub_keys)
     }
 
+    fn ecdsa(&self) -> bool {
+        self.ecdsa
+    }
+
     fn prv_key_data_id(&self) -> Result<&PrvKeyDataId> {
         Err(Error::Bip32WatchAccount)
     }

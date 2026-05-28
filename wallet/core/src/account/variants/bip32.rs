@@ -173,6 +173,10 @@ impl Account for Bip32 {
     //     None
     // }
 
+    fn ecdsa(&self) -> bool {
+        self.ecdsa
+    }
+
     fn prv_key_data_id(&self) -> Result<&PrvKeyDataId> {
         Ok(&self.prv_key_data_id)
     }

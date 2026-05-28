@@ -699,9 +699,17 @@ impl Wallet {
             AccountCreateArgs::Legacy { prv_key_data_id, account_name } => {
                 self.create_account_legacy(wallet_secret, prv_key_data_id, account_name).await?
             }
-            AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures } => {
-                self.create_account_multisig(wallet_secret, prv_key_data_args, additional_xpub_keys, name, minimum_signatures, None)
-                    .await?
+            AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures, ecdsa } => {
+                self.create_account_multisig(
+                    wallet_secret,
+                    prv_key_data_args,
+                    additional_xpub_keys,
+                    name,
+                    minimum_signatures,
+                    ecdsa,
+                    None,
+                )
+                .await?
             }
             AccountCreateArgs::Bip32Watch { account_args } => self.create_account_bip32_watch(wallet_secret, account_args).await?,
             AccountCreateArgs::Keypair { prv_key_data_id, account_name, ecdsa } => {
@@ -744,6 +752,7 @@ impl Wallet {
         xpub_keys: Vec<String>,
         account_name: Option<String>,
         minimum_signatures: u16,
+        ecdsa: bool,
         account_index: Option<u64>,
     ) -> Result<Arc<dyn Account>> {
         let account_index = match account_index {
@@ -780,7 +789,13 @@ impl Wallet {
         // and the all-external-cosigner paths; otherwise the watch-only
         // path persists multisig accounts that the consensus engine would
         // reject at first spend.
-        let xpub_keys = normalize_and_merge_xpubs(xpub_keys, &generated_xpubs, minimum_signatures, wallet_network)?;
+        let xpub_keys = normalize_and_merge_xpubs(
+            xpub_keys,
+            &generated_xpubs,
+            minimum_signatures,
+            MultisigCurve::from_ecdsa_bool(ecdsa),
+            wallet_network,
+        )?;
 
         let (prv_key_data_ids_opt, min_cosigner_index) = if prv_key_data_ids.is_empty() {
             (None, None)
@@ -805,7 +820,7 @@ impl Wallet {
                 prv_key_data_ids_opt,
                 min_cosigner_index,
                 minimum_signatures,
-                false,
+                ecdsa,
                 account_index,
             )
             .await?,
@@ -838,7 +853,7 @@ impl Wallet {
             .await?
             .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
 
-        let AccountCreateArgsBip32 { account_name, account_index } = account_args;
+        let AccountCreateArgsBip32 { account_name, account_index, ecdsa } = account_args;
 
         let account_index = if let Some(account_index) = account_index {
             account_index
@@ -856,7 +871,7 @@ impl Wallet {
         let xpub_keys = Arc::new(vec![xpub_key]);
 
         let account: Arc<dyn Account> =
-            Arc::new(bip32::Bip32::try_new(self, account_name, prv_key_data.id, account_index, xpub_keys, false).await?);
+            Arc::new(bip32::Bip32::try_new(self, account_name, prv_key_data.id, account_index, xpub_keys, ecdsa).await?);
 
         if account_store.load_single(account.id()).await?.is_some() {
             return Err(Error::AccountAlreadyExists(*account.id()));
@@ -1478,7 +1493,8 @@ impl Wallet {
         pubkeys_from_mnemonics.sort_unstable();
         all_pub_keys.retain(|v| pubkeys_from_mnemonics.binary_search_by_key(v, |xpub| xpub.as_str()).is_err());
         let additional_pub_keys = all_pub_keys.into_iter().map(String::from).collect();
-        self.import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys).await
+        self.import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys, false)
+            .await
     }
 
     pub async fn import_kaspawallet_golang_multisig_v1<T: AsRef<[u8]>>(
@@ -1527,7 +1543,7 @@ impl Wallet {
         });
         let additional_pub_keys = all_pub_keys.into_iter().map(String::from).collect();
         let acc = self
-            .import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys)
+            .import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys, false)
             .await?;
         Ok(acc)
     }
@@ -1692,6 +1708,7 @@ impl Wallet {
         mnemonics_secrets: Vec<(Mnemonic, Option<Secret>)>,
         minimum_signatures: u16,
         additional_xpub_keys: Vec<String>,
+        ecdsa: bool,
     ) -> Result<Arc<dyn Account>> {
         let account_index = self.next_multisig_account_index().await?;
         let mut generated_xpubs = Vec::with_capacity(mnemonics_secrets.len());
@@ -1712,7 +1729,13 @@ impl Wallet {
 
         generated_xpubs.sort_unstable();
         let wallet_network = self.network_id()?.network_type();
-        let xpub_keys = normalize_and_merge_xpubs(additional_xpub_keys, &generated_xpubs, minimum_signatures, wallet_network)?;
+        let xpub_keys = normalize_and_merge_xpubs(
+            additional_xpub_keys,
+            &generated_xpubs,
+            minimum_signatures,
+            MultisigCurve::from_ecdsa_bool(ecdsa),
+            wallet_network,
+        )?;
 
         let min_cosigner_index =
             generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
@@ -1732,7 +1755,7 @@ impl Wallet {
                 Some(Arc::new(prv_key_data_ids)),
                 min_cosigner_index,
                 minimum_signatures,
-                false,
+                ecdsa,
                 account_index,
             )
             .await?,
@@ -1784,7 +1807,7 @@ impl Wallet {
             self.store().batch().await?;
             let prv_key_data_id = self.clone().create_prv_key_data(wallet_secret, prv_key_data_args).await?;
 
-            let account_create_args = AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None);
+            let account_create_args = AccountCreateArgs::new_bip32(prv_key_data_id, payment_secret.cloned(), None, None, false);
 
             let account = self.clone().create_account(wallet_secret, account_create_args, false, guard).await?;
 
@@ -1823,10 +1846,77 @@ impl Wallet {
 /// prefix-invariant, so re-encoding under `KeyPrefix::XPUB` preserves the
 /// parsed public key while making the lexicographic-sort order deterministic
 /// across both code paths that build a multisig account.
+/// Per-multisig-account signing curve. The on-disk `Payload.ecdsa: bool`
+/// at `wallet/core/src/account/variants/multisig.rs` is the storage
+/// counterpart; convert at the wallet-core API boundary via
+/// [`MultisigCurve::from_ecdsa_bool`] / [`MultisigCurve::as_ecdsa_bool`].
+/// Adding a future curve lands as one additional variant + one
+/// `pubkey_push_len` arm; the on-disk binary stays stable until a Borsh
+/// version bump migrates the `Payload.ecdsa` field to the enum.
+#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+pub enum MultisigCurve {
+    Schnorr,
+    Ecdsa,
+}
+
+impl MultisigCurve {
+    /// Per-cosigner redeem-script push bytes (PUSHDATA opcode + pubkey
+    /// material) sourced from `ScriptBuilder::canonical_data_size`, the
+    /// canonical-encoder's own size oracle for `add_data` output and the
+    /// symmetric counterpart of `canonical_i64_size`. Delegating to that
+    /// oracle keeps the predictor in lock-step with the canonical builder
+    /// across any future pubkey size that crosses the `OpData#` opcode
+    /// range -- the oracle picks the same 1-byte vs 2-byte opcode prefix
+    /// `add_data` would emit.
+    ///
+    /// For today's two curves the oracle resolves to:
+    /// - `Schnorr`: 32-byte x-only pubkey + 1-byte `OpData32` opcode = 33 bytes.
+    /// - `Ecdsa`: 33-byte compressed pubkey + 1-byte `OpData33` opcode = 34 bytes.
+    pub fn pubkey_push_len(self) -> usize {
+        match self {
+            Self::Schnorr => kaspa_txscript::script_builder::ScriptBuilder::canonical_data_size(
+                &[0u8; secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE],
+            ),
+            Self::Ecdsa => {
+                kaspa_txscript::script_builder::ScriptBuilder::canonical_data_size(&[0u8; secp256k1::constants::PUBLIC_KEY_SIZE])
+            }
+        }
+    }
+
+    /// Storage-format converter: the on-disk `Payload.ecdsa: bool` is the
+    /// current Borsh v0 stable field. A future curve requires a Borsh
+    /// version bump on `Payload`; until then, `Schnorr` maps to `false`
+    /// and `Ecdsa` maps to `true` losslessly.
+    pub fn from_ecdsa_bool(ecdsa: bool) -> Self {
+        if ecdsa { Self::Ecdsa } else { Self::Schnorr }
+    }
+
+    /// Inverse of `from_ecdsa_bool`. When a third `MultisigCurve` variant
+    /// lands this method becomes lossy and the on-disk format bump should
+    /// land in the same commit so existing Borsh `Payload`s never serialize
+    /// a non-{Schnorr, Ecdsa} curve through the boolean shim.
+    pub fn as_ecdsa_bool(self) -> bool {
+        match self {
+            Self::Schnorr => false,
+            Self::Ecdsa => true,
+        }
+    }
+
+    /// Operator-readable name used in `Error::MultisigCosignerCountExceedsStandardness`
+    /// Display output and in wizard prompts.
+    pub fn display_name(self) -> &'static str {
+        match self {
+            Self::Schnorr => "Schnorr",
+            Self::Ecdsa => "ECDSA",
+        }
+    }
+}
+
 pub(crate) fn normalize_and_merge_xpubs(
     user_xpubs: Vec<String>,
     sorted_generated_xpubs: &[String],
     min_sigs: u16,
+    curve: MultisigCurve,
     wallet_network: kaspa_consensus_core::network::NetworkType,
 ) -> Result<Vec<String>> {
     // Validate every user-supplied xpub's BIP-32 prefix against the
@@ -1869,6 +1959,16 @@ pub(crate) fn normalize_and_merge_xpubs(
     normalized.sort_unstable();
 
     let n = normalized.len();
+    // Curve-aware cosigner-count cap derived from `max_script_element_size`.
+    // Surfaces operator intent ("at most X cosigners for this curve") before
+    // the lower-level `MultisigPubKeyCountExceedsConsensus` /
+    // `MultisigRedeemScriptExceedsElementSize` errors fire on the same
+    // band. The cap widens automatically when a future hardfork raises
+    // `kaspa_txscript::max_script_element_size`.
+    let cosigner_cap = max_multisig_cosigners(min_sigs, curve);
+    if n > cosigner_cap {
+        return Err(Error::MultisigCosignerCountExceedsStandardness { count: n, max: cosigner_cap, curve });
+    }
     let max = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
     if n > max {
         return Err(Error::MultisigPubKeyCountExceedsConsensus { count: n, max });
@@ -1877,7 +1977,7 @@ pub(crate) fn normalize_and_merge_xpubs(
         return Err(Error::MultisigInvalidThreshold { k: min_sigs, n });
     }
     let max_script_element_size = default_max_script_element_size();
-    let predicted = predicted_schnorr_redeem_script_size(min_sigs, n);
+    let predicted = predicted_multisig_redeem_script_size(min_sigs, n, curve);
     if predicted > max_script_element_size {
         return Err(Error::MultisigRedeemScriptExceedsElementSize { size: predicted, max: max_script_element_size });
     }
@@ -1892,27 +1992,67 @@ pub(crate) fn normalize_and_merge_xpubs(
     Ok(normalized)
 }
 
-/// Predict the byte size of the canonical Schnorr P2SH multisig redeem script
-/// for given `(min_sigs, n)` -- matching what `kaspa_txscript::multisig_redeem_script`
-/// emits -- so creation can refuse parameter combinations that would not fit a
+/// Bytes occupied by a single `OpCheckMultiSig[ECDSA]` opcode write at
+/// the tail of the redeem script. Sourced from the `u8` type-level size
+/// rather than a literal `1` so the dependency on the opcode-byte width
+/// is documented at the type level. `add_op(opcode: u8)` writes the
+/// opcode via `self.script.push(opcode)` (one byte by language guarantee).
+const OPCODE_BYTE_LEN: usize = std::mem::size_of::<u8>();
+
+/// Predict the byte size of the canonical P2SH multisig redeem script for
+/// `(min_sigs, n, curve)` -- matching what `kaspa_txscript::multisig_redeem_script`
+/// (Schnorr branch) and `multisig_redeem_script_ecdsa` (ECDSA branch) emit
+/// -- so creation can refuse parameter combinations that would not fit a
 /// single P2SH PUSHDATA element.
 ///
-/// Layout: `K` (`canonical_i64_size`) + `N` 32-byte Schnorr pubkey pushdatas
-/// (`1 + 32` bytes each) + `N` (`canonical_i64_size`) + `OpCheckMultiSig`
-/// (1 byte). The K/N integer-push sizes are delegated to
-/// [`kaspa_txscript::ScriptBuilder::canonical_i64_size`], which is the
-/// int-push counterpart of `canonical_data_size` and is branch-for-branch
-/// derived from `ScriptBuilder::add_i64` -- the same encoder
-/// `multisig_redeem_script` invokes. The cross-check test
-/// [`multisig_tests::predicted_schnorr_redeem_script_size_matches_canonical_builder`]
-/// guards the parametric K/N sweep against any future drift on either side.
+/// Layout: `K` (`canonical_i64_size`) + `N` per-cosigner pubkey pushdatas
+/// (`curve.pubkey_push_len()` bytes each) + `N` (`canonical_i64_size`) +
+/// trailing `OpCheckMultiSig` / `OpCheckMultiSigECDSA` opcode byte
+/// (`OPCODE_BYTE_LEN`). The per-cosigner push size is sourced from the
+/// `MultisigCurve` enum's delegation to `canonical_data_size`; the K/N
+/// integer-push sizes are delegated to
+/// [`kaspa_txscript::ScriptBuilder::canonical_i64_size`], the int-push
+/// counterpart of `canonical_data_size`. Both encoder counterparts are
+/// branch-for-branch derived from `ScriptBuilder::add_i64` /
+/// `ScriptBuilder::add_data` (the same encoders the canonical multisig
+/// redeem-script builders invoke). The cross-check tests
+/// `predicted_multisig_redeem_script_size_matches_canonical_builder_{schnorr,ecdsa}`
+/// guard the parametric K/N sweep against any future drift on either side.
 ///
-fn predicted_schnorr_redeem_script_size(min_sigs: u16, n: usize) -> usize {
-    const SCHNORR_PUBKEY_PUSH_LEN: usize = 1 + secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE;
+fn predicted_multisig_redeem_script_size(min_sigs: u16, n: usize, curve: MultisigCurve) -> usize {
     kaspa_txscript::script_builder::ScriptBuilder::canonical_i64_size(min_sigs as i64)
-        + SCHNORR_PUBKEY_PUSH_LEN * n
+        + curve.pubkey_push_len() * n
         + kaspa_txscript::script_builder::ScriptBuilder::canonical_i64_size(n as i64)
-        + 1
+        + OPCODE_BYTE_LEN
+}
+
+/// Largest cosigner count `N` whose `curve`-multisig P2SH redeem script
+/// for threshold `min_sigs` still fits under
+/// `kaspa_txscript::max_script_element_size`. Returns the live cap
+/// derived from the consensus constant; automatically widens when a
+/// future hardfork raises the script-element-size limit. Saturates at
+/// `kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG` because the stack-side
+/// cap also applies; the returned value is always
+/// `min(curve_cap, consensus_pub_keys_cap)`.
+///
+/// The Kaspa P2SH redeem script reaches `OpCheckMultiSig[ECDSA]` only via
+/// a single PUSHDATA push of itself, so the size of that push is the
+/// effective consensus-reachable cap on cosigner count. The
+/// O(consensus_cap) loop body iterates at most `MAX_PUB_KEYS_PER_MUTLTISIG`
+/// times (20 today).
+pub fn max_multisig_cosigners(min_sigs: u16, curve: MultisigCurve) -> usize {
+    let consensus_cap = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
+    let mut n = 1usize;
+    loop {
+        if n >= consensus_cap {
+            return consensus_cap;
+        }
+        let next = n + 1;
+        if predicted_multisig_redeem_script_size(min_sigs, next, curve) > default_max_script_element_size() {
+            return n;
+        }
+        n = next;
+    }
 }
 
 fn default_max_script_element_size() -> usize {
@@ -2081,7 +2221,7 @@ mod multisig_tests {
     use kaspa_bip32::{ChildNumber, Language, Mnemonic, Prefix as KeyPrefix};
     use kaspa_consensus_core::config::params::Params;
     use kaspa_consensus_core::network::{NetworkId, NetworkType};
-    use kaspa_txscript::{multisig_redeem_script, pay_to_address_script, pay_to_script_hash_script};
+    use kaspa_txscript::{multisig_redeem_script, multisig_redeem_script_ecdsa, pay_to_address_script, pay_to_script_hash_script};
     use kaspa_wallet_pskt::bundle::Bundle;
     use kaspa_wallet_pskt::input::InputBuilder;
     use kaspa_wallet_pskt::pskt::{Creator, PSKT};
@@ -2182,9 +2322,10 @@ mod multisig_tests {
             let mut gens_with_canonical = generated_xpubs.clone();
             gens_with_canonical.push(canonical_xpub.clone());
             gens_with_canonical.sort_unstable();
-            let canonical_output = normalize_and_merge_xpubs(Vec::new(), &gens_with_canonical, 2, network).unwrap();
+            let canonical_output =
+                normalize_and_merge_xpubs(Vec::new(), &gens_with_canonical, 2, MultisigCurve::Schnorr, network).unwrap();
 
-            let output = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, network).unwrap();
+            let output = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, MultisigCurve::Schnorr, network).unwrap();
             assert_eq!(output, canonical_output, "prefix {accepted_prefix:?} on {network:?} produced a different normalized set");
         }
     }
@@ -2228,8 +2369,10 @@ mod multisig_tests {
             }
 
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
-            let account =
-                wallet.create_account_multisig(&wallet_secret, create_args, external_xpubs.clone(), None, k, None).await.unwrap();
+            let account = wallet
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs.clone(), None, k, false, None)
+                .await
+                .unwrap();
 
             // Cast to a `DerivationCapableAccount` so we can reach the
             // `AddressDerivationManager` and its newly exposed families.
@@ -2313,7 +2456,7 @@ mod multisig_tests {
         create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
         let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
         let create_account = create_wallet
-            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, None)
+            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, false, None)
             .await
             .unwrap();
         let create_address = create_account.receive_address().unwrap();
@@ -2322,12 +2465,100 @@ mod multisig_tests {
         let import_wallet = test_wallet().await;
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
         let import_account = import_wallet
-            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()])
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()], false)
             .await
             .unwrap();
         let import_address = import_account.receive_address().unwrap();
 
         assert_eq!(create_address, import_address, "create-path and import-path produce identical P2SH first-receive addresses");
+    }
+
+    /// Same parity invariant as `multisig_create_import_parity`, exercised on
+    /// the ECDSA branch (`ecdsa=true` on both create + import). The first
+    /// receive addresses on the two paths must remain byte-equal under
+    /// matching inputs; the redeem-script bytes differ from the Schnorr cell
+    /// (33-byte compressed vs 32-byte x-only pubkey push) but the
+    /// create-vs-import parity is the property pinned here.
+    #[tokio::test]
+    async fn multisig_create_import_parity_ecdsa() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let mnemonic_a = mnemonics[0].clone();
+        let mnemonic_b = mnemonics[1].clone();
+        let external_xpub = xpub_from_mnemonic_phrase(&reference_phrase_12(0x00)).await;
+        let external_xpub_ktub = {
+            let mut k = kaspa_bip32::ExtendedKey::from_str(&external_xpub).unwrap();
+            k.prefix = KeyPrefix::KTUB;
+            k.to_string()
+        };
+
+        let create_wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data_a =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_a.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_b =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_b.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store_a = create_wallet.store().as_prv_key_data_store().unwrap();
+        store_a.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
+        store_a.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
+        create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
+        let create_account = create_wallet
+            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, true, None)
+            .await
+            .unwrap();
+        let create_address = create_account.receive_address().unwrap();
+
+        let import_wallet = test_wallet().await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
+        let import_account = import_wallet
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()], true)
+            .await
+            .unwrap();
+        let import_address = import_account.receive_address().unwrap();
+
+        assert_eq!(
+            create_address, import_address,
+            "create-path and import-path produce identical P2SH first-receive addresses under the ECDSA branch",
+        );
+    }
+
+    /// Two multisig accounts with the SAME cosigner mnemonics + same
+    /// `min_signatures` produce byte-DISTINCT first-receive addresses when
+    /// one uses `ecdsa=false` and the other `ecdsa=true`. The 32-byte
+    /// x-only Schnorr pubkey vs 33-byte compressed ECDSA pubkey encoding
+    /// distinction surfaces at the redeem-script byte level, so the P2SH
+    /// commitment differs even though the per-cosigner secret keys are
+    /// identical. Confirms the `ecdsa: bool` flag participates in account
+    /// identity, not just signing-time dispatch.
+    #[tokio::test]
+    async fn multisig_schnorr_ecdsa_distinct_addresses() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let mnemonic_a = mnemonics[0].clone();
+        let mnemonic_b = mnemonics[1].clone();
+
+        let wallet_schnorr = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
+        let schnorr_account =
+            wallet_schnorr.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let schnorr_address = schnorr_account.receive_address().unwrap();
+
+        let wallet_ecdsa = test_wallet().await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a, None), (mnemonic_b, None)];
+        let ecdsa_account =
+            wallet_ecdsa.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await.unwrap();
+        let ecdsa_address = ecdsa_account.receive_address().unwrap();
+
+        assert_eq!(
+            schnorr_address.prefix, ecdsa_address.prefix,
+            "both addresses share the network prefix (kaspatest:p... for tn-10 P2SH)",
+        );
+        assert_eq!(schnorr_address.version, ecdsa_address.version, "both addresses share the P2SH version byte");
+        assert_ne!(
+            schnorr_address.payload, ecdsa_address.payload,
+            "Schnorr-multisig and ECDSA-multisig accounts with the same cosigner mnemonics must produce distinct P2SH payload \
+             hashes; the encoded redeem scripts differ by 32-byte vs 33-byte per-cosigner pubkey push",
+        );
     }
 
     /// After `import_multisig_with_mnemonic` returns, a subsequent `Wallet::open`
@@ -2353,7 +2584,10 @@ mod multisig_tests {
         // Import the multisig account. Without a `commit` after the account
         // `store_single`, the local store's `is_modified` flag would remain set.
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub.clone()]).await.unwrap();
+        wallet
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub.clone()], false)
+            .await
+            .unwrap();
 
         // Re-open the same wallet payload. `LocalStore::open` checks the modified
         // flag first and panics on `is_modified == true`. With the import-path
@@ -2390,7 +2624,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         // Build a single-input unsigned PSKT pointing at the multisig's receive address.
         let receive_address = account.receive_address().unwrap();
@@ -2503,7 +2737,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         // Build a single-input unsigned PSKT pointing at the multisig's receive address.
         let receive_address = account.receive_address().unwrap();
@@ -2591,7 +2825,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         let receive_address = account.receive_address().unwrap();
         let script_public_key = pay_to_address_script(&receive_address);
@@ -2672,6 +2906,10 @@ mod multisig_tests {
     /// match the redeem-script slot the cosigner occupies, returning `EvalFalse`
     /// at extract time.
     async fn run_multisig_send_extract_for_cell(locals: usize, externals: usize, k: u16) {
+        run_multisig_send_extract_for_cell_curve(locals, externals, k, false).await
+    }
+
+    async fn run_multisig_send_extract_for_cell_curve(locals: usize, externals: usize, k: u16, ecdsa: bool) {
         let n_total = locals + externals;
         assert!(n_total >= k as usize, "(N={n_total}, K={k}) violates K <= N");
         let mnemonics = make_local_mnemonics(n_total).await;
@@ -2685,7 +2923,8 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, external_xpubs).await.unwrap();
+        let account =
+            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, external_xpubs, ecdsa).await.unwrap();
 
         let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
         let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
@@ -2711,8 +2950,12 @@ mod multisig_tests {
                 .unwrap();
             receive_pubkeys.push(*derived.public_key());
         }
-        let redeem_script = multisig_redeem_script(receive_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)
-            .expect("redeem script");
+        let redeem_script = if ecdsa {
+            multisig_redeem_script_ecdsa(receive_pubkeys.iter().map(|pk| pk.serialize()), k as usize).expect("ecdsa redeem script")
+        } else {
+            multisig_redeem_script(receive_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)
+                .expect("schnorr redeem script")
+        };
         let script_public_key = pay_to_script_hash_script(redeem_script.as_slice());
 
         // Sanity-check: the externally-derived script_public_key matches the multisig's
@@ -2848,26 +3091,52 @@ mod multisig_tests {
         run_multisig_send_extract_for_cell(8, 7, 8).await;
     }
 
-    /// Wallet rejects a multisig with cosigner count above the consensus
-    /// maximum at account-creation time rather than letting consensus reject
-    /// the spend later. Constructing a 222-cosigner account must fail with
-    /// `MultisigPubKeyCountExceedsConsensus`; 222 is well above
-    /// `kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG` and triggers the guard
-    /// inside `normalize_and_merge_xpubs`. The xpubs are cloned from a single
-    /// derivation because the guard fires on count alone, not on uniqueness.
+    /// (N=2, K=2) ECDSA cell, all-local cosigners. Exercises the
+    /// `OpCheckMultiSigECDSA` consensus-script path through the same harness
+    /// the Schnorr cell uses, with `ecdsa=true` selecting the
+    /// `multisig_redeem_script_ecdsa` redeem-script builder + the
+    /// `PSKBSigner::sign_ecdsa` signing primitive.
+    #[tokio::test]
+    async fn multisig_send_extract_2_of_2_ecdsa() {
+        run_multisig_send_extract_for_cell_curve(2, 0, 2, true).await;
+    }
+
+    /// (N=3, K=2) ECDSA cell, 2 local + 1 external xpub.
+    #[tokio::test]
+    async fn multisig_send_extract_2_of_3_mixed_external_ecdsa() {
+        run_multisig_send_extract_for_cell_curve(2, 1, 2, true).await;
+    }
+
+    /// (N=5, K=3) ECDSA cell, 3 local + 2 external xpubs.
+    #[tokio::test]
+    async fn multisig_send_extract_3_of_5_mixed_external_ecdsa() {
+        run_multisig_send_extract_for_cell_curve(3, 2, 3, true).await;
+    }
+
+    /// Wallet rejects a multisig with cosigner count well above the
+    /// curve-aware cap at account-creation time rather than letting
+    /// consensus reject the spend later. With the standardness
+    /// guard in place this fires the curve-aware
+    /// `MultisigCosignerCountExceedsStandardness` rejection first (it
+    /// precedes the consensus-cap check inside `normalize_and_merge_xpubs`).
+    /// 222 is well above any conceivable curve cap and exercises the
+    /// helper's count-only rejection arm; the xpubs are cloned from a
+    /// single derivation because the guard fires on count alone.
     #[tokio::test]
     async fn multisig_create_rejects_pub_key_count_above_consensus_max() {
         let xpub =
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         let generated_xpubs: Vec<String> = vec![xpub; 222];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 111, NetworkType::Testnet)
+        let cap = max_multisig_cosigners(111, MultisigCurve::Schnorr);
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 111, MultisigCurve::Schnorr, NetworkType::Testnet)
             .expect_err("222-cosigner multisig must be rejected before redeem-script construction");
         match err {
-            Error::MultisigPubKeyCountExceedsConsensus { count, max } => {
+            Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
                 assert_eq!(count, 222, "rejection names the supplied N");
-                assert_eq!(max, kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize, "rejection names the consensus max");
+                assert_eq!(max, cap, "rejection names the curve-aware standardness cap");
+                assert_eq!(curve, MultisigCurve::Schnorr);
             }
-            other => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+            other => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
         }
     }
 
@@ -2879,7 +3148,7 @@ mod multisig_tests {
         let xpub =
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         let generated_xpubs: Vec<String> = vec![xpub; 14];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 45, NetworkType::Testnet)
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 45, MultisigCurve::Schnorr, NetworkType::Testnet)
             .expect_err("45-of-14 must be rejected before redeem-script construction");
         match err {
             Error::MultisigInvalidThreshold { k, n } => {
@@ -2890,32 +3159,30 @@ mod multisig_tests {
         }
     }
 
-    /// Wallet rejects every cosigner count whose Schnorr P2SH redeem script
-    /// exceeds the consensus `max_script_element_size` PUSHDATA cap. The
-    /// canonical script length is `K_bytes + 33*N + N_bytes + 1` where K and
-    /// N use the small-int opcode (1 byte) for values 1..=16 and the
-    /// one-byte PUSHDATA form (2 bytes) for 17..=20. Every cosigner count in
-    /// {16, 17, 18, 19, 20} stays inside `MAX_PUB_KEYS_PER_MUTLTISIG` but
-    /// exceeds the 520-byte PUSHDATA cap. The wallet must refuse at
-    /// creation time rather than letting `ScriptBuilder::add_data` panic
-    /// later during script_sig assembly.
+    /// Wallet rejects every cosigner count above the curve-aware Schnorr
+    /// cap at account-creation time. With the standardness cap active, the
+    /// `MultisigCosignerCountExceedsStandardness` guard fires first on
+    /// every cell in {16, 17, 18, 19, 20} (cap=15 for Schnorr at K=1 today)
+    /// before the lower-level `MultisigRedeemScriptExceedsElementSize` is
+    /// reached. The cap is derived from the live helper so the test stays
+    /// correct under any future hardfork that widens
+    /// `max_script_element_size`.
     #[tokio::test]
     async fn multisig_create_rejects_redeem_script_above_element_size_at_each_boundary_n() {
         let xpub =
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
-        // Predicted sizes for K=1: N=16 -> 1+528+1+1=531; N=17 -> 1+561+2+1=565;
-        // N=18 -> 1+594+2+1=598; N=19 -> 1+627+2+1=631; N=20 -> 1+660+2+1=664.
-        let cells: &[(usize, usize)] = &[(16, 531), (17, 565), (18, 598), (19, 631), (20, 664)];
-        for &(n, expected_size) in cells {
+        let cap = max_multisig_cosigners(1, MultisigCurve::Schnorr);
+        for n in (cap + 1)..=(kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize) {
             let generated_xpubs: Vec<String> = vec![xpub.clone(); n];
-            let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 1, NetworkType::Testnet)
-                .expect_err("Schnorr multisig at boundary N must reject (redeem script exceeds element-size cap)");
+            let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 1, MultisigCurve::Schnorr, NetworkType::Testnet)
+                .expect_err("Schnorr multisig above curve cap must reject");
             match err {
-                Error::MultisigRedeemScriptExceedsElementSize { size, max } => {
-                    assert_eq!(size, expected_size, "N={n}: rejection names the predicted redeem-script size");
-                    assert_eq!(max, default_max_script_element_size(), "N={n}: rejection names the consensus element-size cap");
+                Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
+                    assert_eq!(count, n, "N={n}: rejection names the supplied N");
+                    assert_eq!(max, cap, "N={n}: rejection names the curve-aware standardness cap");
+                    assert_eq!(curve, MultisigCurve::Schnorr);
                 }
-                other => panic!("N={n}: expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+                other => panic!("N={n}: expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
             }
         }
     }
@@ -2931,7 +3198,7 @@ mod multisig_tests {
             xpub_from_mnemonic_phrase(Mnemonic::random(kaspa_bip32::WordCount::Words24, Language::English).unwrap().phrase()).await;
         // Two identical xpubs, K=2 over N=2, well inside the count and element-size guards.
         let generated_xpubs: Vec<String> = vec![xpub.clone(); 2];
-        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 2, NetworkType::Testnet)
+        let err = normalize_and_merge_xpubs(Vec::new(), &generated_xpubs, 2, MultisigCurve::Schnorr, NetworkType::Testnet)
             .expect_err("duplicate-xpub multisig must be rejected at creation time");
         match err {
             Error::MultisigDuplicateXpub { xpub: dup } => {
@@ -2941,25 +3208,283 @@ mod multisig_tests {
         }
     }
 
-    /// Cross-check `predicted_schnorr_redeem_script_size` against the byte
-    /// length the canonical builder `kaspa_txscript::multisig_redeem_script`
-    /// emits for the same (K, N). If the helper drifts from the canonical
+    /// Parametric K/N sweep covering the small-int boundary (K, N <= 16)
+    /// and the PUSHDATA boundary (17..=20). Cells are shared with the
+    /// ECDSA branch below so any future cell addition is a single-line
+    /// change at both call sites.
+    const PREDICTOR_PARITY_CELLS: &[(u16, usize)] =
+        &[(1, 1), (2, 2), (1, 16), (16, 16), (1, 17), (13, 17), (1, 20), (20, 20), (3, 5), (8, 15), (15, 15)];
+
+    /// Cross-check the Schnorr branch of `predicted_multisig_redeem_script_size`
+    /// against the byte length the canonical builder
+    /// `kaspa_txscript::multisig_redeem_script` emits for the same (K, N).
+    /// Pubkey bytes are synthetic: the canonical builder treats them as
+    /// opaque 32-byte pushdatas. If the helper drifts from the canonical
     /// encoding the on-disk wallet would accept parameters that fail later
     /// at extract, undoing the consensus guard.
     #[tokio::test]
-    async fn predicted_schnorr_redeem_script_size_matches_canonical_builder() {
-        use kaspa_txscript::multisig_redeem_script;
-        // Cells span the small-int boundary (K, N <= 16) and the PUSHDATA
-        // boundary (17..=20). Pubkey bytes are synthetic: the canonical
-        // builder treats them as opaque 32-byte pushdatas.
-        let cells: &[(u16, usize)] =
-            &[(1, 1), (2, 2), (1, 16), (16, 16), (1, 17), (13, 17), (1, 20), (20, 20), (3, 5), (8, 15), (15, 15)];
-        for &(k, n) in cells {
+    async fn predicted_multisig_redeem_script_size_matches_canonical_builder_schnorr() {
+        for &(k, n) in PREDICTOR_PARITY_CELLS {
             let pubkeys: Vec<[u8; 32]> = (0u8..n as u8).map(|i| [i; 32]).collect();
             let actual = multisig_redeem_script(pubkeys.iter().copied(), k as usize).expect("canonical redeem script");
-            let predicted = predicted_schnorr_redeem_script_size(k, n);
-            assert_eq!(actual.len(), predicted, "predicted size must match canonical builder output for {k}-of-{n}");
+            let predicted = predicted_multisig_redeem_script_size(k, n, MultisigCurve::Schnorr);
+            assert_eq!(actual.len(), predicted, "predicted Schnorr size must match canonical builder output for {k}-of-{n}");
         }
+    }
+
+    /// Cross-check the ECDSA branch of `predicted_multisig_redeem_script_size`
+    /// against the byte length `kaspa_txscript::multisig_redeem_script_ecdsa`
+    /// emits for the same (K, N). Pubkey bytes are synthetic 33-byte
+    /// compressed pushdatas.
+    #[tokio::test]
+    async fn predicted_multisig_redeem_script_size_matches_canonical_builder_ecdsa() {
+        for &(k, n) in PREDICTOR_PARITY_CELLS {
+            let pubkeys: Vec<[u8; 33]> = (0u8..n as u8).map(|i| [i; 33]).collect();
+            let actual = multisig_redeem_script_ecdsa(pubkeys.iter().copied(), k as usize).expect("canonical ecdsa redeem script");
+            let predicted = predicted_multisig_redeem_script_size(k, n, MultisigCurve::Ecdsa);
+            assert_eq!(actual.len(), predicted, "predicted ECDSA size must match canonical builder output for {k}-of-{n}");
+        }
+    }
+
+    /// `MultisigCurve::pubkey_push_len` returns the per-cosigner redeem-script
+    /// push byte count for each variant, sourced from
+    /// `ScriptBuilder::canonical_data_size`. Anchors the canonical-data-size
+    /// delegation invariant the redeem-script-size predictor rests on.
+    #[tokio::test]
+    async fn multisig_curve_pubkey_push_len_matches_canonical_builder() {
+        assert_eq!(
+            MultisigCurve::Schnorr.pubkey_push_len(),
+            kaspa_txscript::script_builder::ScriptBuilder::canonical_data_size(&[0u8; secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE]),
+            "Schnorr pubkey_push_len delegates to canonical_data_size",
+        );
+        assert_eq!(MultisigCurve::Schnorr.pubkey_push_len(), 33, "Schnorr push: 1-byte OpData32 + 32-byte x-only pubkey");
+        assert_eq!(
+            MultisigCurve::Ecdsa.pubkey_push_len(),
+            kaspa_txscript::script_builder::ScriptBuilder::canonical_data_size(&[0u8; secp256k1::constants::PUBLIC_KEY_SIZE]),
+            "ECDSA pubkey_push_len delegates to canonical_data_size",
+        );
+        assert_eq!(MultisigCurve::Ecdsa.pubkey_push_len(), 34, "ECDSA push: 1-byte OpData33 + 33-byte compressed pubkey");
+
+        // Cross-check at K=1, N=1 against the canonical redeem-script byte
+        // outputs: the per-cosigner push should match (single-cosigner script
+        // body = 1-byte K + push + 1-byte N + 1-byte trailing opcode).
+        let schnorr_pk = [0xaau8; secp256k1::constants::SCHNORR_PUBLIC_KEY_SIZE];
+        let schnorr_script = multisig_redeem_script([schnorr_pk].into_iter(), 1).unwrap();
+        assert_eq!(
+            schnorr_script.len(),
+            1 + MultisigCurve::Schnorr.pubkey_push_len() + 1 + 1,
+            "1-of-1 Schnorr redeem script length matches K + push + N + opcode",
+        );
+        let ecdsa_pk = [0xbbu8; secp256k1::constants::PUBLIC_KEY_SIZE];
+        let ecdsa_script = multisig_redeem_script_ecdsa([ecdsa_pk].into_iter(), 1).unwrap();
+        assert_eq!(
+            ecdsa_script.len(),
+            1 + MultisigCurve::Ecdsa.pubkey_push_len() + 1 + 1,
+            "1-of-1 ECDSA redeem script length matches K + push + N + opcode",
+        );
+    }
+
+    /// `MultisigCurve::from_ecdsa_bool` / `as_ecdsa_bool` roundtrip pins the
+    /// on-disk-format converter integrity. Adding a future variant breaks
+    /// this test, which is the signal to bump the Borsh `Payload` format.
+    #[tokio::test]
+    async fn multisig_curve_ecdsa_bool_roundtrip() {
+        for v in [MultisigCurve::Schnorr, MultisigCurve::Ecdsa] {
+            assert_eq!(MultisigCurve::from_ecdsa_bool(v.as_ecdsa_bool()), v, "roundtrip {v:?}");
+        }
+    }
+
+    /// `max_multisig_cosigners` returns the largest N whose
+    /// `(min_sigs, N, curve)` redeem script still fits under
+    /// `max_script_element_size`; the next N either exceeds the script
+    /// element-size cap OR saturates at the consensus stack-pubkey cap.
+    /// Pins the helper's boundary semantics for both curves across every
+    /// `min_sigs` in `1..=16`.
+    #[tokio::test]
+    async fn max_multisig_cosigners_matches_predictor_boundary_schnorr() {
+        for min_sigs in 1u16..=16 {
+            let cap = max_multisig_cosigners(min_sigs, MultisigCurve::Schnorr);
+            let at_cap_size = predicted_multisig_redeem_script_size(min_sigs, cap, MultisigCurve::Schnorr);
+            assert!(
+                at_cap_size <= default_max_script_element_size(),
+                "Schnorr cap N={cap} fits max_script_element_size (got predicted={at_cap_size})",
+            );
+            if cap < kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize {
+                let next_size = predicted_multisig_redeem_script_size(min_sigs, cap + 1, MultisigCurve::Schnorr);
+                assert!(
+                    next_size > default_max_script_element_size(),
+                    "Schnorr cap+1 N={} exceeds max_script_element_size (got predicted={next_size})",
+                    cap + 1,
+                );
+            }
+        }
+    }
+
+    /// Same shape as the Schnorr boundary test, for the ECDSA branch.
+    #[tokio::test]
+    async fn max_multisig_cosigners_matches_predictor_boundary_ecdsa() {
+        for min_sigs in 1u16..=16 {
+            let cap = max_multisig_cosigners(min_sigs, MultisigCurve::Ecdsa);
+            let at_cap_size = predicted_multisig_redeem_script_size(min_sigs, cap, MultisigCurve::Ecdsa);
+            assert!(
+                at_cap_size <= default_max_script_element_size(),
+                "ECDSA cap N={cap} fits max_script_element_size (got predicted={at_cap_size})",
+            );
+            if cap < kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize {
+                let next_size = predicted_multisig_redeem_script_size(min_sigs, cap + 1, MultisigCurve::Ecdsa);
+                assert!(
+                    next_size > default_max_script_element_size(),
+                    "ECDSA cap+1 N={} exceeds max_script_element_size (got predicted={next_size})",
+                    cap + 1,
+                );
+            }
+        }
+    }
+
+    /// Helper for the curve-cap create-path tests: builds N synthetic external
+    /// xpubs from in-session mnemonics and invokes `create_account_multisig`
+    /// with no local seeds at the requested curve. Returns whatever the
+    /// wallet-core path produced (Ok or curve-aware-cap rejection).
+    async fn create_account_multisig_with_external_xpubs(
+        wallet: &Arc<Wallet>,
+        wallet_secret: &Secret,
+        n_total: usize,
+        min_sigs: u16,
+        ecdsa: bool,
+    ) -> Result<Arc<dyn Account>> {
+        let externals = external_xpubs_for_testnet(n_total).await;
+        wallet.create_account_multisig(wallet_secret, Vec::new(), externals, None, min_sigs, ecdsa, None).await
+    }
+
+    /// `Wallet::create_account_multisig` rejects a Schnorr-curve
+    /// account with `n = cap+1` cosigners at the curve-aware
+    /// `MultisigCosignerCountExceedsStandardness` boundary. The cap is
+    /// derived from the live helper so the test stays correct under any
+    /// future hardfork that widens `max_script_element_size`.
+    #[tokio::test]
+    async fn multisig_create_rejects_above_curve_cap_schnorr() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
+        let result = create_account_multisig_with_external_xpubs(&wallet, &wallet_secret, cap + 1, 2, false).await;
+        let err = result.err().expect("above-cap create must reject");
+        match err {
+            Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
+                assert_eq!(count, cap + 1, "rejection reports the supplied cosigner count");
+                assert_eq!(max, cap, "rejection reports the curve-aware cap");
+                assert_eq!(curve, MultisigCurve::Schnorr, "rejection reports the curve under test");
+            }
+            other => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
+        }
+    }
+
+    /// Same shape for the ECDSA branch.
+    #[tokio::test]
+    async fn multisig_create_rejects_above_curve_cap_ecdsa() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
+        let result = create_account_multisig_with_external_xpubs(&wallet, &wallet_secret, cap + 1, 2, true).await;
+        let err = result.err().expect("above-cap create must reject");
+        match err {
+            Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
+                assert_eq!(count, cap + 1);
+                assert_eq!(max, cap);
+                assert_eq!(curve, MultisigCurve::Ecdsa);
+            }
+            other => panic!("expected MultisigCosignerCountExceedsStandardness ECDSA, got {other:?}"),
+        }
+    }
+
+    /// Positive control: `create_account_multisig` accepts a
+    /// Schnorr-curve account at `n = cap` cosigners. Confirms the cap is
+    /// INCLUSIVE.
+    #[tokio::test]
+    async fn multisig_create_accepts_at_curve_cap_schnorr() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
+        let result = create_account_multisig_with_external_xpubs(&wallet, &wallet_secret, cap, 2, false).await;
+        assert!(result.is_ok(), "Schnorr at-cap account must be accepted; got {:?}", result.err());
+    }
+
+    /// Positive control: ECDSA branch at cap is accepted.
+    #[tokio::test]
+    async fn multisig_create_accepts_at_curve_cap_ecdsa() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
+        let result = create_account_multisig_with_external_xpubs(&wallet, &wallet_secret, cap, 2, true).await;
+        assert!(result.is_ok(), "ECDSA at-cap account must be accepted; got {:?}", result.err());
+    }
+
+    /// `Wallet::import_multisig_with_mnemonic` rejects an
+    /// over-cap account at the same `MultisigCosignerCountExceedsStandardness`
+    /// boundary, exercising the import-path's `normalize_and_merge_xpubs`
+    /// invocation (Schnorr curve).
+    #[tokio::test]
+    async fn multisig_import_rejects_above_curve_cap_schnorr() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
+        let n_total = cap + 1;
+        let mnemonics = make_local_mnemonics(n_total).await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await;
+        let err = result.err().expect("above-cap import must reject");
+        match err {
+            Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
+                assert_eq!(count, cap + 1);
+                assert_eq!(max, cap);
+                assert_eq!(curve, MultisigCurve::Schnorr);
+            }
+            other => panic!("expected MultisigCosignerCountExceedsStandardness Schnorr (import), got {other:?}"),
+        }
+    }
+
+    /// Same import-path reject test, ECDSA branch.
+    #[tokio::test]
+    async fn multisig_import_rejects_above_curve_cap_ecdsa() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
+        let n_total = cap + 1;
+        let mnemonics = make_local_mnemonics(n_total).await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await;
+        let err = result.err().expect("above-cap import must reject");
+        match err {
+            Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
+                assert_eq!(count, cap + 1);
+                assert_eq!(max, cap);
+                assert_eq!(curve, MultisigCurve::Ecdsa);
+            }
+            other => panic!("expected MultisigCosignerCountExceedsStandardness Ecdsa (import), got {other:?}"),
+        }
+    }
+
+    /// Positive control: import path accepts at-cap Schnorr.
+    #[tokio::test]
+    async fn multisig_import_accepts_at_curve_cap_schnorr() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
+        let mnemonics = make_local_mnemonics(cap).await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await;
+        assert!(result.is_ok(), "Schnorr at-cap import must be accepted; got {:?}", result.err());
+    }
+
+    /// Positive control: import path accepts at-cap ECDSA.
+    #[tokio::test]
+    async fn multisig_import_accepts_at_curve_cap_ecdsa() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
+        let mnemonics = make_local_mnemonics(cap).await;
+        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await;
+        assert!(result.is_ok(), "ECDSA at-cap import must be accepted; got {:?}", result.err());
     }
 
     /// Cross-network xpub rejection at the construction-time gate.
@@ -2991,7 +3516,7 @@ mod multisig_tests {
             let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical).unwrap();
             reprefixed.prefix = supplied;
             let user_xpub = reprefixed.to_string();
-            let err = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, wallet_network)
+            let err = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, MultisigCurve::Schnorr, wallet_network)
                 .expect_err("cross-network or foreign-prefix user-supplied xpub must reject");
             match err {
                 Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network: rejected_for } => {
@@ -3023,7 +3548,7 @@ mod multisig_tests {
             let mut reprefixed = kaspa_bip32::ExtendedKey::from_str(&canonical).unwrap();
             reprefixed.prefix = accepted;
             let user_xpub = reprefixed.to_string();
-            let result = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, wallet_network);
+            let result = normalize_and_merge_xpubs(vec![user_xpub], &generated_xpubs, 2, MultisigCurve::Schnorr, wallet_network);
             assert!(result.is_ok(), "({wallet_network:?}, {accepted:?}) cell: accept path must succeed, got {result:?}");
             // Output preserves the count and contains XPUB-canonical entries.
             let output = result.unwrap();
@@ -3050,7 +3575,8 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![user_xpub_kpub]).await;
+        let result =
+            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![user_xpub_kpub], false).await;
         match result {
             Ok(_) => panic!("KPUB external xpub on Testnet wallet must reject at import-time"),
             Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
@@ -3090,14 +3616,16 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, externals).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, externals, false).await;
+        let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
         match result {
-            Err(Error::MultisigPubKeyCountExceedsConsensus { count, max }) => {
+            Err(Error::MultisigCosignerCountExceedsStandardness { count, max, curve }) => {
                 assert_eq!(count, OVER_CAP_TOTAL, "rejection names the merged cosigner count");
-                assert_eq!(max, CONSENSUS_CAP, "rejection names the consensus max");
+                assert_eq!(max, cap, "rejection names the curve-aware standardness cap");
+                assert_eq!(curve, MultisigCurve::Schnorr);
             }
             Ok(_) => panic!("over-cap import must reject"),
-            Err(other) => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+            Err(other) => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
         }
     }
 
@@ -3112,7 +3640,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 3, externals).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 3, externals, false).await;
         match result {
             Err(Error::MultisigInvalidThreshold { k, n }) => {
                 assert_eq!(k, 3, "rejection names the supplied K");
@@ -3137,14 +3665,19 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 1, externals).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 1, externals, false).await;
+        // The curve-aware standardness guard fires
+        // BEFORE the lower-level element-size guard. Cap=15 for Schnorr
+        // K=1 today; N=16 is the boundary `cap+1` value.
+        let cap = max_multisig_cosigners(1, MultisigCurve::Schnorr);
         match result {
-            Err(Error::MultisigRedeemScriptExceedsElementSize { size, max }) => {
-                assert_eq!(size, 531, "N=16 K=1: rejection names the predicted redeem-script size");
-                assert_eq!(max, default_max_script_element_size(), "rejection names the consensus element-size cap");
+            Err(Error::MultisigCosignerCountExceedsStandardness { count, max, curve }) => {
+                assert_eq!(count, 16, "N=16 K=1: rejection names the supplied N");
+                assert_eq!(max, cap, "rejection names the curve-aware cap");
+                assert_eq!(curve, MultisigCurve::Schnorr);
             }
-            Ok(_) => panic!("N=16 import must reject (redeem script exceeds element-size cap)"),
-            Err(other) => panic!("expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+            Ok(_) => panic!("N=16 import must reject (above curve-aware cap)"),
+            Err(other) => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
         }
     }
 
@@ -3167,7 +3700,7 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, vec![(mnemonic, None)], 1, vec![external]).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, vec![(mnemonic, None)], 1, vec![external], false).await;
         match result {
             Err(Error::MultisigDuplicateXpub { xpub: dup }) => {
                 assert_eq!(dup, canonical, "rejection names the duplicate xpub in canonical XPUB form");
@@ -3197,7 +3730,8 @@ mod multisig_tests {
             let wallet = test_wallet().await;
             let canonical = xpub_from_mnemonic_phrase(&reference_phrase_12(0x00)).await;
             let valid_ktub = external_xpub_for_testnet(&reference_phrase_12(0x7f)).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![canonical, valid_ktub], None, 2, None).await;
+            let result =
+                wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![canonical, valid_ktub], None, 2, false, None).await;
             match result {
                 Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
                     assert_eq!(supplied_prefix, KeyPrefix::XPUB, "rejection names the supplied prefix");
@@ -3213,7 +3747,8 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let ext = external_xpub_for_testnet(&reference_phrase_12(0x00)).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![ext.clone(), ext], None, 2, None).await;
+            let result =
+                wallet.create_account_multisig(&wallet_secret, Vec::new(), vec![ext.clone(), ext], None, 2, false, None).await;
             match result {
                 Err(Error::MultisigDuplicateXpub { xpub }) => {
                     assert!(xpub.starts_with("xpub"), "duplicate reported in canonical XPUB form, got: {xpub}");
@@ -3229,7 +3764,7 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(2).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 0, None).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 0, false, None).await;
             match result {
                 Err(Error::MultisigInvalidThreshold { k, n }) => {
                     assert_eq!(k, 0, "rejection names the supplied K");
@@ -3245,7 +3780,7 @@ mod multisig_tests {
         {
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(2).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 3, None).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 3, false, None).await;
             match result {
                 Err(Error::MultisigInvalidThreshold { k, n }) => {
                     assert_eq!(k, 3, "rejection names the supplied K");
@@ -3256,38 +3791,45 @@ mod multisig_tests {
             }
         }
 
-        // Cell 5 -- count cap. One cosigner above the consensus
-        // stack-pubkey-count cap must reject.
+        // Cell 5 -- standardness cap. The curve-aware
+        // guard fires before the consensus stack-pubkey-count cap. The
+        // OVER-CAP-TOTAL value (consensus_cap + 1 = 21) is well above the
+        // Schnorr curve cap (15 today), so the standardness arm rejects.
         {
-            const CONSENSUS_CAP: usize = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize;
-            const OVER_CAP_TOTAL: usize = CONSENSUS_CAP + 1;
+            const OVER_CAP_TOTAL: usize = kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG as usize + 1;
             let wallet = test_wallet().await;
             let externals = external_xpubs_for_testnet(OVER_CAP_TOTAL).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 2, None).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 2, false, None).await;
+            let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
             match result {
-                Err(Error::MultisigPubKeyCountExceedsConsensus { count, max }) => {
+                Err(Error::MultisigCosignerCountExceedsStandardness { count, max, curve }) => {
                     assert_eq!(count, OVER_CAP_TOTAL, "rejection names the cosigner count");
-                    assert_eq!(max, CONSENSUS_CAP, "rejection names the consensus max");
+                    assert_eq!(max, cap, "rejection names the curve-aware cap");
+                    assert_eq!(curve, MultisigCurve::Schnorr);
                 }
-                Ok(_) => panic!("watch-only create above consensus cap must reject"),
-                Err(other) => panic!("expected MultisigPubKeyCountExceedsConsensus, got {other:?}"),
+                Ok(_) => panic!("watch-only create above curve-aware cap must reject"),
+                Err(other) => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
             }
         }
 
-        // Cell 6 -- size cap N=16 Schnorr. Sixteen distinct KTUB cosigners
-        // produce a 531-byte Schnorr P2SH redeem script that exceeds the
-        // consensus 520-byte PUSHDATA cap.
+        // Cell 6 -- curve-aware cap boundary at N=cap+1 Schnorr K=1. With the
+        // curve-aware guard active, sixteen distinct KTUB cosigners are
+        // rejected one above the cap (15) rather than at the lower-level
+        // element-size guard.
         {
             let wallet = test_wallet().await;
-            let externals = external_xpubs_for_testnet(16).await;
-            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 1, None).await;
+            let cap = max_multisig_cosigners(1, MultisigCurve::Schnorr);
+            let n = cap + 1;
+            let externals = external_xpubs_for_testnet(n).await;
+            let result = wallet.create_account_multisig(&wallet_secret, Vec::new(), externals, None, 1, false, None).await;
             match result {
-                Err(Error::MultisigRedeemScriptExceedsElementSize { size, max }) => {
-                    assert_eq!(size, 531, "N=16 K=1: rejection names the predicted redeem-script size");
-                    assert_eq!(max, default_max_script_element_size(), "rejection names the consensus element-size cap");
+                Err(Error::MultisigCosignerCountExceedsStandardness { count, max, curve }) => {
+                    assert_eq!(count, n, "N={n} K=1: rejection names the supplied N");
+                    assert_eq!(max, cap, "rejection names the curve-aware cap");
+                    assert_eq!(curve, MultisigCurve::Schnorr);
                 }
-                Ok(_) => panic!("watch-only create with N=16 must reject (redeem script exceeds element-size cap)"),
-                Err(other) => panic!("expected MultisigRedeemScriptExceedsElementSize, got {other:?}"),
+                Ok(_) => panic!("watch-only create with N={n} K=1 must reject"),
+                Err(other) => panic!("expected MultisigCosignerCountExceedsStandardness, got {other:?}"),
             }
         }
     }
@@ -3327,7 +3869,7 @@ mod multisig_tests {
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(local_a, None), (local_b, None)];
         let account =
-            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub]).await.unwrap();
+            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub], false).await.unwrap();
 
         let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
         let prv_key_data_ids: Vec<PrvKeyDataId> = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").as_ref().clone();
@@ -3449,7 +3991,15 @@ mod multisig_tests {
             vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
         let k: u16 = 2;
         let account = wallet
-            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], peer_xpubs, None, k, None)
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(prv_key_data.id, None)],
+                peer_xpubs,
+                None,
+                k,
+                false,
+                None,
+            )
             .await
             .unwrap();
 
@@ -3534,7 +4084,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         let result = wallet.is_account_key_encrypted(&account).await.expect("multi-id account encryption query succeeds");
         assert_eq!(result, Some(false), "unencrypted local cosigner keys yield Some(false)");
@@ -3560,7 +4110,7 @@ mod multisig_tests {
         wallet.inner.store.commit(&wallet_secret).await.unwrap();
 
         let account = wallet
-            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], vec![], None, 1, None)
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], vec![], None, 1, false, None)
             .await
             .unwrap();
 
@@ -3593,7 +4143,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         let receive_address = account.receive_address().unwrap();
         let script_public_key = pay_to_address_script(&receive_address);
@@ -3686,7 +4236,7 @@ mod multisig_tests {
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
         let k: u16 = 2;
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, vec![], false).await.unwrap();
 
         // Pick a peer-family index distinct from the local cosigner_index so
         // the test exercises the cross-family path. With three xpubs sorted
@@ -3832,7 +4382,7 @@ mod multisig_tests {
             wallet.inner.store.commit(&wallet_secret).await.unwrap();
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
             let account = wallet
-                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, k, None)
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, k, false, None)
                 .await
                 .unwrap();
             wallets_and_accounts.push((wallet, account));
@@ -4002,7 +4552,7 @@ mod multisig_tests {
             vec![external_xpub_for_testnet(mnemonics[1].phrase()).await, external_xpub_for_testnet(mnemonics[2].phrase()).await];
         let k: u16 = 2;
         let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
-        let account = wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs, None, k, None).await.unwrap();
+        let account = wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs, None, k, false, None).await.unwrap();
 
         // Decoy destination + minimum priority fee; the send call is
         // expected to fail at the wallet-side guard before reaching any
@@ -4069,7 +4619,7 @@ mod multisig_tests {
             wallet.inner.store.commit(&wallet_secret).await.unwrap();
             let create_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];
             let account = wallet
-                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, 2, None)
+                .create_account_multisig(&wallet_secret, create_args, external_xpubs_per_cosigner[i].clone(), None, 2, false, None)
                 .await
                 .unwrap();
             wallets_and_accounts.push((wallet, account));
@@ -4136,7 +4686,7 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![]).await.unwrap();
+        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
 
         // Operator-Send invariant: with all seeds local the smallest
         // sorted-position across local xpubs equals 0.
@@ -4208,6 +4758,305 @@ mod multisig_tests {
         );
     }
 
+    /// The (1,1) ECDSA cell signs through `pskb_signer_for_address` (the
+    /// single-sig signing primitive that `MultiSig::send` routes to when
+    /// `route_as_single_sig` returns true): the produced `partial_sigs`
+    /// entry carries a `Signature::ECDSA(_)` variant, not `Schnorr`.
+    /// Exercises the per-account curve dispatch that
+    /// `pskb_signer_for_address` reads via `signer.inner.account.ecdsa()`
+    /// against a (1,1) ECDSA multisig account whose receive address is
+    /// P2PK-ECDSA-typed. Pins the load-bearing (1,1) ECDSA signing
+    /// primitive without depending on the daemon/RPC stack the on-chain
+    /// validation surface exercises.
+    #[tokio::test]
+    async fn multisig_one_of_one_pskb_signer_emits_ecdsa_signature() {
+        use crate::account::pskb::PSKBSigner;
+        use crate::account::pskb::pskb_signer_for_address;
+
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let xpub_key = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let account: Arc<MultiSig> = Arc::new(
+            MultiSig::try_new(&wallet, None, Arc::new(vec![xpub_key]), Some(Arc::new(vec![prv_key_data.id])), Some(0), 1, true, 0)
+                .await
+                .unwrap(),
+        );
+        let account_dyn: Arc<dyn Account> = account.clone();
+
+        let receive_address = account_dyn.receive_address().unwrap();
+        assert_eq!(
+            receive_address.version,
+            kaspa_addresses::Version::PubKeyECDSA,
+            "(1,1) ECDSA multisig derives P2PK-ECDSA address (precondition)",
+        );
+
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xab; 32]),
+                index: 0,
+            })
+            .sig_op_count(1)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let bundle = kaspa_wallet_pskt::bundle::Bundle::from(pskt_inner);
+
+        let signer = Arc::new(PSKBSigner::new(account_dyn.clone(), prv_key_data, None));
+        let network_id = wallet.network_id().unwrap();
+        let signed_bundle = pskb_signer_for_address(&bundle, signer, network_id, Some(&receive_address), None, None).await.unwrap();
+
+        assert_eq!(signed_bundle.0.len(), 1, "single PSKT in bundle");
+        assert_eq!(signed_bundle.0[0].inputs.len(), 1, "single input per PSKT");
+        let signatures: Vec<_> = signed_bundle.0[0].inputs[0].partial_sigs.values().collect();
+        assert_eq!(signatures.len(), 1, "exactly one partial signature on the signed input");
+        match signatures[0] {
+            kaspa_wallet_pskt::prelude::Signature::ECDSA(_) => {}
+            kaspa_wallet_pskt::prelude::Signature::Schnorr(_) => {
+                panic!(
+                    "(1,1) ECDSA multisig signing through pskb_signer_for_address must emit a Signature::ECDSA variant, got Schnorr"
+                )
+            }
+        }
+    }
+
+    /// `Wallet::create_account_bip32` honors the `ecdsa: bool` flag on
+    /// `AccountCreateArgsBip32`: the constructed account reports
+    /// `account.ecdsa() == true` through the trait accessor, the
+    /// derived receive address byte-encodes a 33-byte compressed pubkey
+    /// (P2PK-ECDSA `Version::PubKeyECDSA`) rather than the 32-byte
+    /// x-only Schnorr form, and the same wallet's Schnorr-branch
+    /// account on the same prv_key_data_id derives a distinct address
+    /// (`Version::PubKey`). Confirms the curve-flag plumbing from
+    /// wizard-supplied boolean through args -> wallet-core -> Bip32
+    /// account -> address derivation lands the curve flag end-to-end.
+    #[tokio::test]
+    async fn create_account_bip32_with_ecdsa_yields_ecdsa_account() {
+        use crate::wallet::args::AccountCreateArgsBip32;
+        use storage::keydata::PrvKeyData;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_id = prv_key_data.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let ecdsa_args = AccountCreateArgsBip32::new(Some("ecdsa-bip32".to_string()), Some(0), true);
+        let ecdsa_account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, None, ecdsa_args).await.unwrap();
+        assert!(ecdsa_account.ecdsa(), "create_account_bip32(ecdsa=true) must yield account.ecdsa() == true");
+        let ecdsa_address = ecdsa_account.receive_address().unwrap();
+        assert_eq!(
+            ecdsa_address.version,
+            kaspa_addresses::Version::PubKeyECDSA,
+            "ECDSA bip32 first receive address must be P2PK-ECDSA (33-byte compressed pubkey); got {:?}",
+            ecdsa_address.version,
+        );
+
+        let schnorr_args = AccountCreateArgsBip32::new(Some("schnorr-bip32".to_string()), Some(1), false);
+        let schnorr_account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, None, schnorr_args).await.unwrap();
+        assert!(!schnorr_account.ecdsa(), "create_account_bip32(ecdsa=false) must yield account.ecdsa() == false");
+        let schnorr_address = schnorr_account.receive_address().unwrap();
+        assert_eq!(
+            schnorr_address.version,
+            kaspa_addresses::Version::PubKey,
+            "Schnorr bip32 first receive address must be P2PK (32-byte x-only pubkey); got {:?}",
+            schnorr_address.version,
+        );
+        assert_ne!(
+            ecdsa_address.payload, schnorr_address.payload,
+            "ECDSA and Schnorr bip32 accounts on the same seed must derive byte-distinct addresses (different pubkey encoding)",
+        );
+    }
+
+    /// The ECDSA bip32 single-sig send path signs through
+    /// `pskb_signer_for_address` (the curve-aware branch on
+    /// `account.ecdsa()`): the produced `partial_sigs` entry carries a
+    /// `Signature::ECDSA(_)` variant. Pins the signing primitive on the
+    /// generic-ECDSA bip32 send path without depending on the daemon /
+    /// RPC stack the on-chain validation surface exercises. The full
+    /// tn-10 round-trip is the validation gate's responsibility, not
+    /// the unit-test layer's.
+    #[tokio::test]
+    async fn bip32_ecdsa_pskb_signer_emits_ecdsa_signature() {
+        use crate::account::pskb::PSKBSigner;
+        use crate::account::pskb::pskb_signer_for_address;
+        use crate::wallet::args::AccountCreateArgsBip32;
+        use storage::keydata::PrvKeyData;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_id = prv_key_data.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let args = AccountCreateArgsBip32::new(Some("ecdsa-bip32-send".to_string()), Some(0), true);
+        let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, None, args).await.unwrap();
+        let receive_address = account.receive_address().unwrap();
+        assert_eq!(
+            receive_address.version,
+            kaspa_addresses::Version::PubKeyECDSA,
+            "precondition: ECDSA bip32 account derives P2PK-ECDSA receive address",
+        );
+
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xbc; 32]),
+                index: 0,
+            })
+            .sig_op_count(1)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let bundle = kaspa_wallet_pskt::bundle::Bundle::from(pskt_inner);
+
+        let signer = Arc::new(PSKBSigner::new(account.clone(), prv_key_data, None));
+        let network_id = wallet.network_id().unwrap();
+        let signed_bundle = pskb_signer_for_address(&bundle, signer, network_id, Some(&receive_address), None, None).await.unwrap();
+
+        assert_eq!(signed_bundle.0.len(), 1, "single PSKT in bundle");
+        assert_eq!(signed_bundle.0[0].inputs.len(), 1, "single input per PSKT");
+        let signatures: Vec<_> = signed_bundle.0[0].inputs[0].partial_sigs.values().collect();
+        assert_eq!(signatures.len(), 1, "exactly one partial signature on the signed input");
+        match signatures[0] {
+            kaspa_wallet_pskt::prelude::Signature::ECDSA(_) => {}
+            kaspa_wallet_pskt::prelude::Signature::Schnorr(_) => {
+                panic!("ECDSA bip32 signing through pskb_signer_for_address must emit a Signature::ECDSA variant, got Schnorr")
+            }
+        }
+    }
+
+    /// `wallet create` wizard plumbing of the curve flag at
+    /// `cli/src/wizards/wallet.rs`: when the operator answers ECDSA at
+    /// the curve prompt, the default account in the freshly-created
+    /// wallet reports `account.ecdsa() == true` and derives a
+    /// `Version::PubKeyECDSA` first receive address (33-byte compressed
+    /// pubkey encoding). Pins the wizard's call shape
+    /// `AccountCreateArgsBip32::new(account_name, None, ecdsa)` -
+    /// `account_index = None` distinguishes the wallet-create flow from
+    /// the `account create` flow, whose test pins the
+    /// `Some(0)` / `Some(1)` shape.
+    ///
+    /// No Terminal mock exists in tree, so the load-bearing wizard
+    /// plumbing (curve flag -> args -> account encoding) is pinned here
+    /// at wallet-core scope; the wizard-driving variant is exercised by
+    /// the cross-binary round trip at validation time.
+    #[tokio::test]
+    async fn wallet_create_with_ecdsa_yields_ecdsa_default_account() {
+        use crate::wallet::args::AccountCreateArgsBip32;
+        use storage::keydata::PrvKeyData;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let prv_key_data_id = prv_key_data.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let args = AccountCreateArgsBip32::new(Some("default".to_string()), None, true);
+        let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, None, args).await.unwrap();
+        assert!(account.ecdsa(), "wallet-create ECDSA prompt must plumb ecdsa=true through to account.ecdsa()");
+        let address = account.receive_address().unwrap();
+        assert_eq!(
+            address.version,
+            kaspa_addresses::Version::PubKeyECDSA,
+            "wallet-create ECDSA default account first receive address must be P2PK-ECDSA (33-byte compressed pubkey); got {:?}",
+            address.version,
+        );
+    }
+
+    /// 4-cell operator-internal-consistency invariant: for each
+    /// `(word_count, curve)` in
+    /// `{Words12, Words24} x {Schnorr, ECDSA}`, a wallet built from
+    /// mnemonic M with curve C derives the same first receive address
+    /// as a fresh wallet that re-imports the same mnemonic M with the
+    /// same curve C. Pins the deterministic derivation property at
+    /// wallet-core scope; the `wallet import` operator
+    /// flow at `cli/src/wizards/wallet.rs` re-runs the same
+    /// `create_account_bip32` call path through the
+    /// `ask_curve` prompt, so this pin validates the round-trip
+    /// equality the operator observes.
+    ///
+    /// The crate's `tests/` directory hosts only fixture JSON files (no
+    /// top-level integration `.rs` files); the load-bearing substance is
+    /// mnemonic-driven deterministic derivation, fully exercisable at
+    /// the wallet-core unit-test scope. The cross-binary round
+    /// trip is the Validator's load-bearing evidence; this test pins the
+    /// wallet-core determinism property that holds independent of the
+    /// peer binary.
+    #[tokio::test]
+    async fn wallet_create_import_with_mnemonic_ecdsa_round_trip() {
+        use crate::wallet::args::AccountCreateArgsBip32;
+        use storage::keydata::PrvKeyData;
+
+        async fn derive_first_address(mnemonic: Mnemonic, ecdsa: bool, wallet_secret: &Secret) -> kaspa_addresses::Address {
+            let wallet = test_wallet().await;
+            let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let prv_key_data_id = prv_key_data.id;
+            let store = wallet.store().as_prv_key_data_store().unwrap();
+            store.store(wallet_secret, prv_key_data).await.unwrap();
+            wallet.inner.store.commit(wallet_secret).await.unwrap();
+            let args = AccountCreateArgsBip32::new(Some("default".to_string()), None, ecdsa);
+            let account = wallet.create_account_bip32(wallet_secret, prv_key_data_id, None, args).await.unwrap();
+            account.receive_address().unwrap()
+        }
+
+        let wallet_secret = Secret::new(vec![]);
+        for word_count in [WordCount::Words12, WordCount::Words24] {
+            for ecdsa in [false, true] {
+                let mnemonic = Mnemonic::random(word_count, Language::English).unwrap();
+                let addr_create = derive_first_address(mnemonic.clone(), ecdsa, &wallet_secret).await;
+                let addr_import = derive_first_address(mnemonic, ecdsa, &wallet_secret).await;
+                assert_eq!(
+                    addr_create.version, addr_import.version,
+                    "({word_count:?}, ecdsa={ecdsa}): version mismatch on round-trip - create yielded {:?}, import yielded {:?}",
+                    addr_create.version, addr_import.version,
+                );
+                assert_eq!(
+                    addr_create.payload, addr_import.payload,
+                    "({word_count:?}, ecdsa={ecdsa}): payload byte-mismatch on round-trip - wallet create vs wallet import must derive identical first receive addresses",
+                );
+                let expected_version = if ecdsa { kaspa_addresses::Version::PubKeyECDSA } else { kaspa_addresses::Version::PubKey };
+                assert_eq!(
+                    addr_create.version, expected_version,
+                    "({word_count:?}, ecdsa={ecdsa}): expected {expected_version:?} for the supplied curve",
+                );
+            }
+        }
+    }
+
     /// `Wallet::create_account_multisig` invoked with `account_index=None`
     /// auto-assigns the next-available hardened index. The first multisig
     /// account in a wallet lands at index `0` (the canonical
@@ -4227,7 +5076,7 @@ mod multisig_tests {
                 prv_key_data_args.push(PrvKeyDataArgs::new(id, None));
             }
             wallet.inner.store.commit(wallet_secret).await.unwrap();
-            wallet.create_account_multisig(wallet_secret, prv_key_data_args, vec![], None, 2, None).await.unwrap()
+            wallet.create_account_multisig(wallet_secret, prv_key_data_args, vec![], None, 2, false, None).await.unwrap()
         }
 
         let wallet = test_wallet().await;
@@ -4306,11 +5155,12 @@ mod multisig_tests {
         wallet.inner.store.commit(&wallet_secret).await.unwrap();
 
         let create_args = vec![PrvKeyDataArgs::new(id_a, None), PrvKeyDataArgs::new(id_b, None)];
-        let account_0 = wallet.create_account_multisig(&wallet_secret, create_args.clone(), vec![], None, 2, None).await.unwrap();
+        let account_0 =
+            wallet.create_account_multisig(&wallet_secret, create_args.clone(), vec![], None, 2, false, None).await.unwrap();
         let derivation_capable_0 = account_0.clone().as_derivation_capable().unwrap();
         assert_eq!(derivation_capable_0.account_index(), 0, "first multisig account is at account_index=0");
 
-        let account_1 = wallet.create_account_multisig(&wallet_secret, create_args, vec![], None, 2, None).await.unwrap();
+        let account_1 = wallet.create_account_multisig(&wallet_secret, create_args, vec![], None, 2, false, None).await.unwrap();
         let derivation_capable_1 = account_1.clone().as_derivation_capable().unwrap();
         assert_eq!(derivation_capable_1.account_index(), 1, "second multisig account auto-assigns to account_index=1");
 
@@ -4357,7 +5207,7 @@ mod multisig_tests {
         }
         expected.sort_unstable();
 
-        let merged = normalize_and_merge_xpubs(user_xpubs, &[], 2, NetworkType::Testnet).unwrap();
+        let merged = normalize_and_merge_xpubs(user_xpubs, &[], 2, MultisigCurve::Schnorr, NetworkType::Testnet).unwrap();
         assert_eq!(merged, expected, "merged cosigner set is the canonical XPUB strings in Base58 string order");
     }
 

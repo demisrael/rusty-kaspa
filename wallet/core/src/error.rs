@@ -3,6 +3,7 @@
 //!
 
 use crate::imports::{AccountId, AccountKind, AssocPrvKeyDataIds, PrvKeyDataId};
+use crate::wallet::MultisigCurve;
 use base64::DecodeError;
 use downcast::DowncastError;
 use kaspa_bip32::Error as BIP32Error;
@@ -389,6 +390,9 @@ pub enum Error {
 
     #[error("Multisig cosigner count {count} exceeds consensus maximum {max}")]
     MultisigPubKeyCountExceedsConsensus { count: usize, max: usize },
+
+    #[error("Multisig accounts with more than {max} cosigners are not supported for {} multisig at this network's P2SH script-element-size limit (got {count})", curve.display_name())]
+    MultisigCosignerCountExceedsStandardness { count: usize, max: usize, curve: MultisigCurve },
 
     #[error("Multisig threshold K={k} is invalid for N={n} cosigners (K must be 1..=N)")]
     MultisigInvalidThreshold { k: u16, n: usize },

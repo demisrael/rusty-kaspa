@@ -126,6 +126,10 @@ impl Account for Keypair {
         KEYPAIR_ACCOUNT_KIND.into()
     }
 
+    fn ecdsa(&self) -> bool {
+        self.ecdsa
+    }
+
     fn prv_key_data_id(&self) -> Result<&PrvKeyDataId> {
         Ok(&self.prv_key_data_id)
     }

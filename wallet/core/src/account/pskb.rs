@@ -10,7 +10,7 @@ use crate::tx::PaymentOutputs;
 use futures::stream;
 use kaspa_bip32::{DerivationPath, KeyFingerprint, PrivateKey};
 use kaspa_consensus_client::UtxoEntry as ClientUTXO;
-use kaspa_consensus_core::hashing::sighash::{SigHashReusedValuesUnsync, calc_schnorr_signature_hash};
+use kaspa_consensus_core::hashing::sighash::{SigHashReusedValuesUnsync, calc_ecdsa_signature_hash, calc_schnorr_signature_hash};
 use kaspa_consensus_core::tx::VerifiableTransaction;
 use kaspa_consensus_core::tx::{TransactionInput, UtxoEntry};
 use kaspa_txscript::MAX_PUB_KEYS_PER_MUTLTISIG;
@@ -25,6 +25,7 @@ use kaspa_wallet_pskt::prelude::lock_script_sig_templating_bytes;
 use kaspa_wallet_pskt::prelude::{Finalizer, Inner, SignInputOk, Signature, Signer};
 pub use kaspa_wallet_pskt::pskt::{Creator, PSKT};
 use secp256k1::constants::{PUBLIC_KEY_SIZE, SCHNORR_PUBLIC_KEY_SIZE, SECRET_KEY_SIZE};
+use secp256k1::ecdsa;
 use secp256k1::schnorr;
 use secp256k1::{Message, PublicKey};
 use std::iter;
@@ -83,6 +84,24 @@ impl PSKBSigner {
             Some(private_key) => {
                 let schnorr_key = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, private_key)?;
                 Ok(schnorr_key.sign_schnorr(message))
+            }
+            None => Err(Error::from("PSKBSigner address coverage error")),
+        }
+    }
+
+    /// Sign `message` for the cosigner whose receive/change address is
+    /// `for_address`, using ECDSA. `SecretKey::sign_ecdsa` derives its
+    /// nonce per RFC 6979 (deterministic); calling this method twice with
+    /// the same `(private_key, message)` returns byte-identical
+    /// signatures. The deterministic property is what enables cross-binary
+    /// handoff parity (two binaries signing the same `(privkey, sighash)`
+    /// pair produce byte-equal sigscripts).
+    fn sign_ecdsa(&self, for_address: &Address, message: Message) -> Result<ecdsa::Signature> {
+        let keys = self.inner.keys.lock()?;
+        match keys.get(for_address) {
+            Some(private_key) => {
+                let secret_key = secp256k1::SecretKey::from_slice(private_key)?;
+                Ok(secret_key.sign_ecdsa(message))
             }
             None => Err(Error::from("PSKBSigner address coverage error")),
         }
@@ -205,6 +224,14 @@ pub async fn pskb_signer_for_address(
         key_source = Some(KeySource { key_fingerprint, derivation_path: derivation_path.clone() });
     }
 
+    // Per-account curve selection: ECDSA-bearing accounts (`account.ecdsa()`
+    // returns `true`) sign with `calc_ecdsa_signature_hash` +
+    // `signer.sign_ecdsa(..)` and wrap as `Signature::ECDSA(..)`; all other
+    // accounts use the original Schnorr path. The branch is per-account
+    // (constant across every input of every PSKT in this bundle) so the
+    // dispatch cost is one boolean read per PSKT.
+    let ecdsa = signer.inner.account.ecdsa();
+
     // Process each PSKT in the bundle
     for (pskt_idx, pskt_inner) in bundle.iter().cloned().enumerate() {
         let pskt: PSKT<Signer> = PSKT::from(pskt_inner);
@@ -221,9 +248,6 @@ pub async fn pskb_signer_for_address(
                         .iter()
                         .enumerate()
                         .map(|(input_idx, _input)| {
-                            let hash = calc_schnorr_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
-                            let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
-
                             // Get the appropriate address for this input
                             let address = if let Some(sign_addr) = sign_for_address {
                                 sign_addr
@@ -233,9 +257,23 @@ pub async fn pskb_signer_for_address(
 
                             let pub_key = signer.public_key(address).map_err(|e| format!("Failed to get public key: {}", e))?;
 
-                            let signature = signer.sign_schnorr(address, msg).map_err(|e| format!("Failed to sign: {}", e))?;
+                            let signature = if ecdsa {
+                                let hash =
+                                    calc_ecdsa_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
+                                let msg =
+                                    secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
+                                let sig = signer.sign_ecdsa(address, msg).map_err(|e| format!("Failed to sign: {}", e))?;
+                                Signature::ECDSA(sig)
+                            } else {
+                                let hash =
+                                    calc_schnorr_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
+                                let msg =
+                                    secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
+                                let sig = signer.sign_schnorr(address, msg).map_err(|e| format!("Failed to sign: {}", e))?;
+                                Signature::Schnorr(sig)
+                            };
 
-                            Ok(SignInputOk { signature: Signature::Schnorr(signature), pub_key, key_source: key_source.clone() })
+                            Ok(SignInputOk { signature, pub_key, key_source: key_source.clone() })
                         })
                         .collect()
                 })
@@ -403,6 +441,14 @@ pub async fn pskb_signer_for_multisig_cosigner(
     let derivation = derivation_capable.derivation();
     let account_index = derivation_capable.account_index();
 
+    // Per-account curve selection: ECDSA-bearing multisig accounts
+    // (`account.ecdsa()` returns `true`) sign with
+    // `calc_ecdsa_signature_hash` + `secret_key.sign_ecdsa(msg)` and wrap
+    // as `Signature::ECDSA(..)`. Schnorr-bearing accounts retain the
+    // original `keypair.sign_schnorr(msg)` path. The dispatch cost is one
+    // boolean read for the whole bundle.
+    let ecdsa = account.ecdsa();
+
     let mut signed_bundle = Bundle::new();
 
     for pskt_inner in bundle.iter().cloned() {
@@ -480,12 +526,18 @@ pub async fn pskb_signer_for_multisig_cosigner(
                     .map(|(input_idx, _input)| {
                         let (secret_key, pub_key, key_source) =
                             input_keys.get(input_idx).ok_or_else(|| format!("No signing key prepared for input {input_idx}"))?;
-                        let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())
-                            .map_err(|e| e.to_string())?;
-                        let hash = calc_schnorr_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
-                        let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
-                        let signature = keypair.sign_schnorr(msg);
-                        Ok(SignInputOk { signature: Signature::Schnorr(signature), pub_key: *pub_key, key_source: key_source.clone() })
+                        let signature = if ecdsa {
+                            let hash = calc_ecdsa_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
+                            let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
+                            Signature::ECDSA(secret_key.sign_ecdsa(msg))
+                        } else {
+                            let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())
+                                .map_err(|e| e.to_string())?;
+                            let hash = calc_schnorr_signature_hash(&tx.as_verifiable(), input_idx, sighash[input_idx], &reused_values);
+                            let msg = secp256k1::Message::from_digest_slice(hash.as_bytes().as_slice()).map_err(|e| e.to_string())?;
+                            Signature::Schnorr(keypair.sign_schnorr(msg))
+                        };
+                        Ok(SignInputOk { signature, pub_key: *pub_key, key_source: key_source.clone() })
                     })
                     .collect()
             })
@@ -546,7 +598,7 @@ pub fn finalize_pskt_one_or_more_sig_and_redeem_script(pskt: PSKT<Finalizer>) ->
                         ScriptBuilder::new()
                             .add_data(redeem_script.as_slice())
                             .expect(
-                                "multisig redeem script bounded by predicted_schnorr_redeem_script_size; \
+                                "multisig redeem script bounded by predicted_multisig_redeem_script_size; \
                                      account-construction guard refuses larger via normalize_and_merge_xpubs",
                             )
                             .drain()
@@ -944,6 +996,49 @@ mod tests {
         malformed.push(OpCheckMultiSig);
         malformed.push(0xff); // arbitrary trailing byte
         assert!(parse_redeem_script_pubkeys(&malformed).is_err(), "trailing bytes after OpCheckMultiSig rejected");
+    }
+
+    /// Pin the RFC 6979 deterministic-nonce invariant the ECDSA-multisig
+    /// signing path inherits from `secp256k1::SecretKey::sign_ecdsa`. The
+    /// PSKBSigner::sign_ecdsa method wraps exactly the same call sequence
+    /// (`SecretKey::from_slice(..)` then `secret_key.sign_ecdsa(message)`),
+    /// so the property tested here is the one operators observe through
+    /// the PSKB signing path. Cross-binary handoff parity rests on this
+    /// invariant: two binaries signing the same (privkey, sighash) pair
+    /// emit byte-identical ECDSA signatures whose assembled sigscripts
+    /// match bit-for-bit.
+    #[test]
+    fn multisig_ecdsa_rfc6979_determinism() {
+        let secp = Secp256k1::new();
+        let keypair = Keypair::new(&secp, &mut thread_rng());
+        let secret_key = keypair.secret_key();
+
+        // Two deterministic messages exercising the property across hash
+        // values; same-key/same-message pair must yield byte-identical
+        // signatures across repeated calls.
+        let msg_a = secp256k1::Message::from_digest([0x11u8; 32]);
+        let msg_b = secp256k1::Message::from_digest([0xaau8; 32]);
+
+        let sig_a1 = secret_key.sign_ecdsa(msg_a);
+        let sig_a2 = secret_key.sign_ecdsa(msg_a);
+        let sig_b1 = secret_key.sign_ecdsa(msg_b);
+        let sig_b2 = secret_key.sign_ecdsa(msg_b);
+
+        assert_eq!(
+            sig_a1.serialize_compact(),
+            sig_a2.serialize_compact(),
+            "RFC 6979 deterministic: same (privkey, msg_a) pair must yield byte-identical compact signatures",
+        );
+        assert_eq!(
+            sig_b1.serialize_compact(),
+            sig_b2.serialize_compact(),
+            "RFC 6979 deterministic: same (privkey, msg_b) pair must yield byte-identical compact signatures",
+        );
+        assert_ne!(
+            sig_a1.serialize_compact(),
+            sig_b1.serialize_compact(),
+            "different messages with the same key must produce distinct signatures (sanity)",
+        );
     }
 
     /// Build a synthetic 17-of-17 multisig redeem script via the canonical

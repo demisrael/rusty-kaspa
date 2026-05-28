@@ -2,6 +2,7 @@ use crate::cli::KaspaCli;
 use crate::imports::*;
 use crate::result::Result;
 use kaspa_bip32::{Language, Mnemonic, WordCount};
+use kaspa_wallet_core::error::Error as WalletError;
 use kaspa_wallet_core::storage::keydata::PrvKeyDataVariantKind;
 use kaspa_wallet_core::{
     storage::{Hint, make_filename},
@@ -22,8 +23,8 @@ pub(crate) async fn create(
         Some(locked_guard) => locked_guard,
         None => local_guard.lock().await,
     };
-    // TODO @aspect
-    let word_count = WordCount::Words12;
+    let word_count_answer = term.ask(false, "Mnemonic length in words (12 or 24, press <enter> for default 12): ").await?;
+    let word_count = parse_word_count_answer(word_count_answer.trim())?;
 
     if let Err(err) = wallet.network_id() {
         tprintln!(ctx);
@@ -136,6 +137,8 @@ pub(crate) async fn create(
 
     let mnemonic_phrase = prv_key_data_args.secret.clone();
 
+    let ecdsa = crate::wizards::account::ask_curve(&term).await?;
+
     let notifier = ctx.notifier().show(Notification::Processing).await;
 
     // suspend commits for multiple operations
@@ -145,7 +148,7 @@ pub(crate) async fn create(
     let (_wallet_descriptor, storage_descriptor) = ctx.wallet().create_wallet(&wallet_secret, wallet_args).await?;
     let prv_key_data_id = wallet.create_prv_key_data(&wallet_secret, prv_key_data_args).await?;
 
-    let account_args = AccountCreateArgsBip32::new(account_name, None);
+    let account_args = AccountCreateArgsBip32::new(account_name, None, ecdsa);
     let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, payment_secret.as_ref(), account_args).await?;
 
     // flush data to storage
@@ -192,4 +195,45 @@ pub(crate) async fn create(
     wallet.activate_accounts(None, &guard).await?;
 
     Ok(())
+}
+
+/// Parse the operator's answer to the wallet-create mnemonic word-count
+/// prompt. Empty input (operator presses <enter>) yields the legacy
+/// 12-word default so the wizard's default behavior is unchanged from
+/// the pre-prompt era. Explicit `12` and `24` map to the corresponding
+/// `WordCount`. Any other answer yields `WalletError::Custom(..)`
+/// naming the supplied value so the operator sees what they typed.
+/// Hoisted as a `pub(crate) fn` so the unit test
+/// `parse_word_count_answer_accepts_default_12_and_explicit_24` can
+/// exercise the contract without driving the interactive shell.
+pub(crate) fn parse_word_count_answer(s: &str) -> std::result::Result<WordCount, WalletError> {
+    match s {
+        "" | "12" => Ok(WordCount::Words12),
+        "24" => Ok(WordCount::Words24),
+        other => Err(WalletError::Custom(format!("invalid mnemonic length '{other}'; expected 12 or 24"))),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// Pin the operator-facing word-count prompt contract: empty +
+    /// explicit "12" map to `Words12`; explicit "24" maps to `Words24`;
+    /// any other input yields `WalletError::Custom` naming the supplied
+    /// value.
+    #[test]
+    fn parse_word_count_answer_accepts_default_12_and_explicit_24() {
+        assert!(matches!(parse_word_count_answer(""), Ok(WordCount::Words12)), "empty input defaults to 12");
+        assert!(matches!(parse_word_count_answer("12"), Ok(WordCount::Words12)), "explicit 12 maps to Words12");
+        assert!(matches!(parse_word_count_answer("24"), Ok(WordCount::Words24)), "explicit 24 maps to Words24");
+
+        for invalid in ["15", "abc", "42", "0", "-1", "twelve", " "] {
+            let err = parse_word_count_answer(invalid).expect_err("invalid word-count answer must reject");
+            match err {
+                WalletError::Custom(msg) => assert!(msg.contains(invalid), "error names the supplied value {invalid:?}: got {msg}"),
+                other => panic!("expected WalletError::Custom for {invalid:?}, got {other:?}"),
+            }
+        }
+    }
 }

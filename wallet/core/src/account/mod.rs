@@ -132,6 +132,15 @@ pub trait Account: AnySync + Send + Sync + 'static {
         None
     }
 
+    /// Whether this account signs with ECDSA rather than Schnorr. Default
+    /// `false` for accounts that have no curve-selection knob (resident
+    /// keypair-bearing variants always Schnorr). Variants that persist an
+    /// `ecdsa: bool` field on their on-disk payload override this to
+    /// expose the field through the trait.
+    fn ecdsa(&self) -> bool {
+        false
+    }
+
     fn name_or_id(&self) -> String {
         if let Some(name) = self.name() { if name.is_empty() { self.id().short() } else { name } } else { self.id().short() }
     }
