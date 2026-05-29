@@ -25,6 +25,15 @@ pub struct RpcCoreMock {
     ctl: RpcCtl,
     core_notifier: Arc<RpcCoreNotifier>,
     _sync_receiver: Receiver<()>,
+    /// Canned per-address balances surfaced via `get_balances_by_addresses_call`.
+    /// `None` (entry absent) keeps the default `Option<u64>::None` semantics
+    /// (BIP-44 section 6 "no transactions" - treated as zero by the gap-limit walk).
+    /// `Some(v)` returns `Some(v)` to the caller.
+    balances: std::sync::Mutex<std::collections::HashMap<RpcAddress, Option<u64>>>,
+    /// Counter incremented on every `get_balances_by_addresses_call` invocation.
+    /// Tests pin the gap-limit termination by reading the counter against the
+    /// expected candidate-account walk count.
+    balance_call_count: std::sync::atomic::AtomicU64,
 }
 
 impl RpcCoreMock {
@@ -41,7 +50,26 @@ impl RpcCoreMock {
             policies,
             Some(sync_sender),
         ));
-        Self { core_notifier, _sync_receiver: sync_receiver, ctl: RpcCtl::new() }
+        Self {
+            core_notifier,
+            _sync_receiver: sync_receiver,
+            ctl: RpcCtl::new(),
+            balances: std::sync::Mutex::new(std::collections::HashMap::new()),
+            balance_call_count: std::sync::atomic::AtomicU64::new(0),
+        }
+    }
+
+    /// Pin a per-address balance for the next `get_balances_by_addresses_call`
+    /// response. `Some(v)` returns `Some(v)`; addresses not pinned default to
+    /// `None` ("no transactions" per BIP-44 section 6).
+    pub fn set_balance(&self, address: RpcAddress, balance: u64) {
+        self.balances.lock().unwrap().insert(address, Some(balance));
+    }
+
+    /// Return the cumulative number of `get_balances_by_addresses_call`
+    /// invocations since mock construction.
+    pub fn balance_call_count(&self) -> u64 {
+        self.balance_call_count.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     pub fn core_notifier(&self) -> Arc<RpcCoreNotifier> {
@@ -294,9 +322,19 @@ impl RpcApi for RpcCoreMock {
     async fn get_balances_by_addresses_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _request: GetBalancesByAddressesRequest,
+        request: GetBalancesByAddressesRequest,
     ) -> RpcResult<GetBalancesByAddressesResponse> {
-        Err(RpcError::NotImplemented)
+        self.balance_call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let cache = self.balances.lock().unwrap();
+        let entries = request
+            .addresses
+            .into_iter()
+            .map(|address| {
+                let balance = cache.get(&address).copied().unwrap_or(None);
+                RpcBalancesByAddressesEntry { address, balance }
+            })
+            .collect();
+        Ok(GetBalancesByAddressesResponse { entries })
     }
 
     async fn get_utxos_by_addresses_call(

@@ -148,8 +148,43 @@ pub(crate) async fn create(
     let (_wallet_descriptor, storage_descriptor) = ctx.wallet().create_wallet(&wallet_secret, wallet_args).await?;
     let prv_key_data_id = wallet.create_prv_key_data(&wallet_secret, prv_key_data_args).await?;
 
-    let account_args = AccountCreateArgsBip32::new(account_name, None, ecdsa);
-    let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, payment_secret.as_ref(), account_args).await?;
+    // Wallet restore via BIP-44 gap-limit auto-discovery: walk
+    // account_index = 0, 1, ... up to a 20-account empty gap; register
+    // every account with non-zero balance. The fresh-create path
+    // (plain `wallet create`, no mnemonic restore) skips the walk and
+    // creates only the canonical default account at account_index=0.
+    let (account, restore_summary) = if import_with_mnemonic {
+        let prv_key_data = wallet
+            .store()
+            .as_prv_key_data_store()?
+            .load_key_data(&wallet_secret, &prv_key_data_id)
+            .await?
+            .ok_or(WalletError::PrivateKeyNotFound(prv_key_data_id))?;
+        let summary = wallet
+            .restore_bip44_with_discovery(
+                &wallet_secret,
+                payment_secret.as_ref(),
+                &prv_key_data,
+                ecdsa,
+                kaspa_wallet_core::wallet::BIP44_DEFAULT_GAP,
+            )
+            .await?;
+        let default = summary
+            .accounts
+            .iter()
+            .find(|a| Arc::clone(*a).as_derivation_capable().ok().map(|d| d.account_index()) == Some(0))
+            .cloned()
+            .expect("restore_bip44_with_discovery guarantees account_index=0 is present");
+        (default, Some(summary))
+    } else {
+        let account_args = AccountCreateArgsBip32::new(account_name, None, ecdsa);
+        let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, payment_secret.as_ref(), account_args).await?;
+        (account, None)
+    };
+
+    if let Some(summary) = restore_summary.as_ref() {
+        tprintln!(ctx, "Restored wallet with {} accounts; {} had non-zero balance.", summary.accounts.len(), summary.non_zero_count,);
+    }
 
     // flush data to storage
     wallet.store().flush(&wallet_secret).await?;

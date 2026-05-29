@@ -258,6 +258,26 @@ impl Account for Bip32 {
         Ok(descriptor)
     }
 
+    fn get_list_string(&self) -> Result<String> {
+        let name = style(self.name_with_id()).blue();
+        let balance = self.balance_as_strings(None)?;
+        let mature_utxo_size = self.utxo_context().mature_utxo_size();
+        let pending_utxo_size = self.utxo_context().pending_utxo_size();
+        let index_suffix = format!("[account_index={}]", self.account_index);
+        let info = match (mature_utxo_size, pending_utxo_size) {
+            (0, 0) => index_suffix,
+            (_, 0) => format!("{} UTXOs {}", mature_utxo_size.separated_string(), index_suffix),
+            (0, _) => format!("{} UTXOs pending {}", pending_utxo_size.separated_string(), index_suffix),
+            _ => format!(
+                "{} UTXOs, {} UTXOs pending {}",
+                mature_utxo_size.separated_string(),
+                pending_utxo_size.separated_string(),
+                index_suffix
+            ),
+        };
+        Ok(format!("{name}: {balance}   {}", style(info).dim()))
+    }
+
     fn as_derivation_capable(self: Arc<Self>) -> Result<Arc<dyn DerivationCapableAccount>> {
         Ok(self.clone())
     }

@@ -90,6 +90,27 @@ pub enum WalletBusMessage {
     Discovery { record: TransactionRecord },
 }
 
+/// BIP-44 section 6 default address-and-account gap limit. The reference value is
+/// 20 per BIP-44 section 6; the address-chain gap and the account-discovery gap
+/// collapse to the same constant by spec.
+pub const BIP44_DEFAULT_GAP: u32 = 20;
+
+/// Summary returned by `Wallet::restore_bip44_with_discovery`. Names the
+/// registered accounts, how many of them carried a non-zero balance, the
+/// highest non-zero account index seen, and the total candidate-account
+/// walk extent (for instrumentation / gap-limit-termination tests).
+pub struct RestoreSummary {
+    pub accounts: Vec<Arc<dyn Account>>,
+    /// Count of accounts the discovery walk registered for a non-zero
+    /// aggregate balance. Distinct from `accounts.len()`: the BIP-44 section 3
+    /// default account at `account_index = 0` is always present in
+    /// `accounts` even when its balance is zero, so when index 0 is
+    /// force-added with no balance `non_zero_count < accounts.len()`.
+    pub non_zero_count: usize,
+    pub last_nonzero_account_index: Option<u64>,
+    pub scan_extent: u64,
+}
+
 /// Internal wallet state.
 struct Inner {
     active_accounts: ActiveAccountMap,
@@ -1661,11 +1682,84 @@ impl Wallet {
         Ok(account)
     }
 
-    /// Perform a "2d" scan of account derivations while scanning addresses
-    /// in each account (UTXOs up to `address_scan_extent` address derivation).
-    /// Report back the last account index that has UTXOs. The scan is performed
-    /// until we have encountered at least `account_scan_extent` of empty
-    /// accounts.
+    /// BIP-44 section 6 gap-limit auto-discovery. Walks `account_index = 0, 1, 2, ...`
+    /// deriving a candidate BIP32 single-sig account per index; queries
+    /// `get_balances_by_addresses` over the first `gap` receive + `gap`
+    /// change addresses; registers (persists + records on the wallet) every
+    /// account with non-zero aggregate balance. Terminates after `gap`
+    /// consecutive empty accounts past the last non-zero index (or after
+    /// `gap` empty accounts when no non-zero index has been seen). BIP-44
+    /// section 3 default-account invariant: `account_index = 0` is always present
+    /// post-restore even when its balance is zero.
+    ///
+    /// The `Option<u64>` per-address balance returned by
+    /// `RpcBalancesByAddressesEntry.balance` carries both "no transactions"
+    /// (`None`) and "currently zero" (`Some(0)`) into the same gap-limit
+    /// termination semantics via `filter_map(|e| e.balance).sum`.
+    pub async fn restore_bip44_with_discovery(
+        self: &Arc<Self>,
+        wallet_secret: &Secret,
+        payment_secret: Option<&Secret>,
+        prv_key_data: &PrvKeyData,
+        ecdsa: bool,
+        gap: u32,
+    ) -> Result<RestoreSummary> {
+        let mut accounts: Vec<Arc<dyn Account>> = vec![];
+        let mut non_zero_count: usize = 0;
+        let mut last_nonzero: Option<u64> = None;
+        let mut account_index: u64 = 0;
+
+        loop {
+            let in_scan_window = match last_nonzero {
+                Some(n) => account_index <= n + gap as u64,
+                None => account_index < gap as u64,
+            };
+            if !in_scan_window {
+                break;
+            }
+
+            let xpub_key = prv_key_data.create_xpub(payment_secret, BIP32_ACCOUNT_KIND.into(), account_index).await?;
+            let xpub_keys = Arc::new(vec![xpub_key]);
+            let candidate = bip32::Bip32::try_new(self, None, prv_key_data.id, account_index, xpub_keys, ecdsa).await?;
+
+            let candidate_addresses = candidate.get_address_range_for_scan(0..gap)?;
+            let balance_entries = self.rpc_api().get_balances_by_addresses(candidate_addresses).await?;
+            let candidate_balance: u64 = balance_entries.iter().filter_map(|e| e.balance).sum();
+
+            if candidate_balance > 0 {
+                let account_store = self.inner.store.as_account_store()?;
+                let storage = <bip32::Bip32 as Account>::to_storage(&candidate)?;
+                account_store.store_single(&storage, None).await?;
+                let registered: Arc<dyn Account> = Arc::new(candidate);
+                accounts.push(registered);
+                non_zero_count += 1;
+                last_nonzero = Some(account_index);
+            }
+
+            account_index += 1;
+        }
+
+        let scan_extent = account_index;
+
+        // BIP-44 section 3 - default account at account_index=0 always present.
+        if !accounts.iter().any(|a| a.clone().as_derivation_capable().ok().map(|d| d.account_index()) == Some(0)) {
+            let default_args = crate::wallet::args::AccountCreateArgsBip32::new(None, Some(0), ecdsa);
+            let default = self.create_account_bip32(wallet_secret, prv_key_data.id, payment_secret, default_args).await?;
+            accounts.insert(0, default);
+        }
+
+        self.inner.store.commit(wallet_secret).await?;
+
+        Ok(RestoreSummary { accounts, non_zero_count, last_nonzero_account_index: last_nonzero, scan_extent })
+    }
+
+    /// Back-compat shim for the `accounts_discovery_call` API surface.
+    /// Walks `account_index` from `0` driven by the same `gap` semantics
+    /// as `restore_bip44_with_discovery` but returns only the
+    /// `last_nonzero_account_index` (defaulting to `0` when no non-zero
+    /// account was found); does NOT register accounts. The persistent
+    /// auto-discovery flow goes through `restore_bip44_with_discovery`
+    /// at `wallet import` time.
     pub async fn scan_bip44_accounts(
         self: &Arc<Self>,
         bip39_mnemonic: Secret,
@@ -1675,31 +1769,36 @@ impl Wallet {
     ) -> Result<u32> {
         let bip39_mnemonic = std::str::from_utf8(bip39_mnemonic.as_ref()).map_err(|_| Error::InvalidMnemonicPhrase)?;
         let mnemonic = Mnemonic::new(bip39_mnemonic, Language::English)?;
-
-        // TODO @aspect - this is not efficient, we need to scan without encrypting prv_key_data
         let prv_key_data =
             storage::PrvKeyData::try_new_from_mnemonic(mnemonic, bip39_passphrase.as_ref(), EncryptionKind::XChaCha20Poly1305)?;
 
-        let mut last_account_index = 0;
-        let mut account_index = 0;
+        let mut last_account_index: u64 = 0;
+        let mut last_nonzero: Option<u64> = None;
+        let mut account_index: u64 = 0;
 
-        while account_index < last_account_index + account_scan_extent {
-            let xpub_key =
-                prv_key_data.create_xpub(bip39_passphrase.as_ref(), BIP32_ACCOUNT_KIND.into(), account_index as u64).await?;
+        loop {
+            let in_scan_window = match last_nonzero {
+                Some(n) => account_index <= n + account_scan_extent as u64,
+                None => account_index < account_scan_extent as u64,
+            };
+            if !in_scan_window {
+                break;
+            }
+
+            let xpub_key = prv_key_data.create_xpub(bip39_passphrase.as_ref(), BIP32_ACCOUNT_KIND.into(), account_index).await?;
             let xpub_keys = Arc::new(vec![xpub_key]);
-            let ecdsa = false;
-            // ---
-
-            let addresses = bip32::Bip32::try_new(self, None, prv_key_data.id, account_index as u64, xpub_keys, ecdsa)
-                .await?
-                .get_address_range_for_scan(0..address_scan_extent)?;
-            if self.rpc_api().get_utxos_by_addresses(addresses).await?.is_not_empty() {
+            let candidate = bip32::Bip32::try_new(self, None, prv_key_data.id, account_index, xpub_keys, false).await?;
+            let candidate_addresses = candidate.get_address_range_for_scan(0..address_scan_extent)?;
+            let balance_entries = self.rpc_api().get_balances_by_addresses(candidate_addresses).await?;
+            let candidate_balance: u64 = balance_entries.iter().filter_map(|e| e.balance).sum();
+            if candidate_balance > 0 {
                 last_account_index = account_index;
+                last_nonzero = Some(account_index);
             }
             account_index += 1;
         }
 
-        Ok(last_account_index)
+        Ok(last_account_index as u32)
     }
 
     pub async fn import_multisig_with_mnemonic(
@@ -5184,6 +5283,251 @@ mod multisig_tests {
             parent_xpub_at_1.to_string(Some(KeyPrefix::XPUB)),
             "parent xpubs at m/45'/111111'/0' and m/45'/111111'/1' MUST diverge (hardened-step isolation)",
         );
+    }
+
+    /// Helper for discovery-walk tests: construct a wallet with `RpcCoreMock`
+    /// plumbed in so the discovery walk's `get_balances_by_addresses`
+    /// calls hit canned responses.
+    async fn test_wallet_with_mock_rpc() -> (Arc<Wallet>, Arc<crate::tests::RpcCoreMock>) {
+        let resident_store = Wallet::resident_store().unwrap();
+        let mock = Arc::new(crate::tests::RpcCoreMock::new());
+        let rpc: Rpc = Arc::clone(&mock).into();
+        let wallet =
+            Arc::new(Wallet::try_with_rpc(Some(rpc), resident_store, Some(NetworkId::with_suffix(NetworkType::Testnet, 10))).unwrap());
+        let wallet_secret = Secret::new(vec![]);
+        wallet
+            .create_wallet(
+                &wallet_secret,
+                WalletCreateArgs {
+                    title: None,
+                    filename: None,
+                    encryption_kind: EncryptionKind::XChaCha20Poly1305,
+                    user_hint: None,
+                    overwrite_wallet_storage: false,
+                },
+            )
+            .await
+            .unwrap();
+        (wallet, mock)
+    }
+
+    /// Pin balances at every receive + change address of the candidate
+    /// BIP32 account at the given index. Returns the cumulative address
+    /// count for instrumentation. `gap` is the per-account address scan
+    /// extent the discovery walk uses (`BIP44_DEFAULT_GAP` in production).
+    async fn pin_account_balance_in_mock(
+        wallet: &Arc<Wallet>,
+        mock: &Arc<crate::tests::RpcCoreMock>,
+        prv_key_data: &storage::PrvKeyData,
+        ecdsa: bool,
+        account_index: u64,
+        gap: u32,
+        per_address_balance_sompi: u64,
+    ) -> usize {
+        let xpub_key = prv_key_data.create_xpub(None, BIP32_ACCOUNT_KIND.into(), account_index).await.unwrap();
+        let candidate =
+            bip32::Bip32::try_new(wallet, None, prv_key_data.id, account_index, Arc::new(vec![xpub_key]), ecdsa).await.unwrap();
+        let addresses = candidate.get_address_range_for_scan(0..gap).unwrap();
+        let count = addresses.len();
+        for address in addresses {
+            mock.set_balance(address, per_address_balance_sompi);
+        }
+        count
+    }
+
+    /// `wallet import` of a mnemonic with
+    /// non-zero balance at `account_index in {0, 1, 3}` (gap = 2 inclusive
+    /// of empty index 2) registers all three accounts under the default
+    /// `BIP44_DEFAULT_GAP = 20`. The summary's
+    /// `last_nonzero_account_index = Some(3)` and `scan_extent = 24`
+    /// (3 + 20 + 1, the loop's terminating off-by-one) are the load-bearing
+    /// invariants the test pins.
+    #[tokio::test]
+    async fn restore_with_mnemonic_gap_limit_scan_registers_three_accounts() {
+        let (wallet, mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        for idx in [0_u64, 1, 3] {
+            pin_account_balance_in_mock(&wallet, &mock, &prv_key_data, false, idx, BIP44_DEFAULT_GAP, 100_000_000).await;
+        }
+
+        let summary =
+            wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, false, BIP44_DEFAULT_GAP).await.unwrap();
+
+        assert_eq!(summary.accounts.len(), 3, "three non-zero accounts registered");
+        assert_eq!(summary.last_nonzero_account_index, Some(3), "highest non-zero index is 3");
+        // scan_extent: the loop terminates after walking up to `last_nonzero + gap` inclusive,
+        // i.e. account_index counter reaches `3 + 20 + 1 = 24` (the boundary that fails the predicate).
+        assert_eq!(summary.scan_extent, 24, "scan_extent = last_nonzero + gap + 1");
+    }
+
+    /// `wallet import` of a fresh mnemonic
+    /// (no on-chain balance) registers exactly one account at
+    /// `account_index = 0` (BIP-44 default-account invariant). Walk
+    /// terminates after exactly `BIP44_DEFAULT_GAP = 20` consecutive
+    /// empty checks.
+    #[tokio::test]
+    async fn restore_with_mnemonic_no_balance_registers_account_zero() {
+        let (wallet, _mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // No mock balances pinned - every address returns `None`.
+
+        let summary =
+            wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, false, BIP44_DEFAULT_GAP).await.unwrap();
+
+        assert_eq!(summary.accounts.len(), 1, "BIP-44 section 3 default-account-0 always present");
+        assert_eq!(summary.last_nonzero_account_index, None, "no non-zero account observed");
+        assert_eq!(summary.scan_extent, BIP44_DEFAULT_GAP as u64, "walk terminated after exactly gap=20 empty checks");
+    }
+
+    /// Cross-projection: the `ecdsa` flag plumbs end-to-end
+    /// through the discovery walk; ECDSA wallets discover ECDSA-encoded
+    /// receive addresses (33-byte compressed pubkey -> `Version::PubKeyECDSA`)
+    /// and Schnorr wallets discover Schnorr (32-byte x-only -> `Version::PubKey`).
+    #[tokio::test]
+    async fn restore_with_mnemonic_curve_propagates_ecdsa_and_schnorr() {
+        for ecdsa in [false, true] {
+            let (wallet, mock) = test_wallet_with_mock_rpc().await;
+            let wallet_secret = Secret::new(vec![]);
+            let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+            let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let store = wallet.store().as_prv_key_data_store().unwrap();
+            store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+            wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+            for idx in [0_u64, 1] {
+                pin_account_balance_in_mock(&wallet, &mock, &prv_key_data, ecdsa, idx, BIP44_DEFAULT_GAP, 100_000_000).await;
+            }
+
+            let summary =
+                wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, ecdsa, BIP44_DEFAULT_GAP).await.unwrap();
+
+            assert!(summary.accounts.len() >= 2, "ecdsa={ecdsa}: at least two accounts registered");
+            for account in summary.accounts.iter() {
+                assert_eq!(account.ecdsa(), ecdsa, "ecdsa={ecdsa}: registered account carries supplied curve flag");
+                let address = account.receive_address().unwrap();
+                let expected_version = if ecdsa { kaspa_addresses::Version::PubKeyECDSA } else { kaspa_addresses::Version::PubKey };
+                assert_eq!(address.version, expected_version, "ecdsa={ecdsa}: receive address encodes curve-correct pubkey");
+            }
+        }
+    }
+
+    /// Instrumented variant: with non-zero balance at `account_index = 0`
+    /// only, the walk performs exactly `0 + gap + 1 = 21` candidate-account
+    /// derivations (`{0..=20}`). Pins the gap-limit constant + termination
+    /// invariant via the mock-RPC call counter.
+    #[tokio::test]
+    async fn restore_with_mnemonic_gap_terminates_at_default_20() {
+        let (wallet, mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        pin_account_balance_in_mock(&wallet, &mock, &prv_key_data, false, 0, BIP44_DEFAULT_GAP, 100_000_000).await;
+
+        let summary =
+            wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, false, BIP44_DEFAULT_GAP).await.unwrap();
+
+        // last_nonzero = 0 -> loop exits when account_index > 0 + gap = 20.
+        // So account_index visits {0, 1, ..., 20} - 21 candidate walks.
+        let call_count = mock.balance_call_count();
+        assert_eq!(call_count, 21, "exactly 21 candidate-account balance probes (`0..=20`)");
+        assert_eq!(summary.scan_extent, 21);
+        assert_eq!(summary.last_nonzero_account_index, Some(0));
+    }
+
+    /// The operator-facing summary line emitted at restore
+    /// completion names the registered-account count + the non-zero-balance
+    /// count. The wizard wiring at `cli/src/wizards/wallet.rs:create`
+    /// formats this line via `tprintln!(ctx, "Restored wallet with {} accounts; {} had non-zero balance.", ...)`.
+    /// This test pins the format-string shape against the `RestoreSummary`
+    /// returned by the discovery primitive.
+    #[tokio::test]
+    async fn wallet_create_import_with_mnemonic_emits_restore_summary_line() {
+        let (wallet, mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        for idx in [0_u64, 2] {
+            pin_account_balance_in_mock(&wallet, &mock, &prv_key_data, false, idx, BIP44_DEFAULT_GAP, 100_000_000).await;
+        }
+
+        let summary =
+            wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, false, BIP44_DEFAULT_GAP).await.unwrap();
+
+        // The wizard formats this line from `summary.accounts.len()` +
+        // `summary.non_zero_count` (see `cli/src/wizards/wallet.rs:create`);
+        // the test consumes the same fields rather than re-deriving the
+        // count, so a regression in the count semantics surfaces here.
+        let summary_line =
+            format!("Restored wallet with {} accounts; {} had non-zero balance.", summary.accounts.len(), summary.non_zero_count,);
+
+        assert!(summary_line.starts_with("Restored wallet with "), "summary names canonical phrase: {summary_line}");
+        assert!(summary_line.contains("accounts;"), "summary names account count: {summary_line}");
+        assert!(summary_line.contains("had non-zero balance"), "summary names balance qualifier: {summary_line}");
+        // Two accounts at indices {0, 2}; both non-zero.
+        assert_eq!(summary.non_zero_count, 2, "both registered accounts carried a non-zero balance");
+        assert!(summary_line.contains("2 accounts"), "summary names the registered-account count: {summary_line}");
+        assert!(summary_line.contains("2 had non-zero balance"), "summary names the non-zero count: {summary_line}");
+    }
+
+    /// Regression: when `account_index = 0` has zero balance but a higher
+    /// index does carry a balance, the BIP-44 default account at index 0
+    /// is force-added with no balance. The non-zero-balance count MUST then
+    /// be strictly less than `accounts.len()` - `non_zero_count` reflects only
+    /// the accounts the walk registered for a non-zero balance, never the
+    /// force-added default. Pins the summary count against the
+    /// over-count where the displayed "had non-zero balance" number equalled
+    /// the total registered-account count.
+    #[tokio::test]
+    async fn restore_with_mnemonic_zero_at_zero_nonzero_higher_counts_nonzero_accurately() {
+        let (wallet, mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.into_iter().next().unwrap();
+        let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // Balance at account_index = 1 only; index 0 stays empty (every
+        // address returns `None`) and is force-added by the section 3 invariant.
+        pin_account_balance_in_mock(&wallet, &mock, &prv_key_data, false, 1, BIP44_DEFAULT_GAP, 100_000_000).await;
+
+        let summary =
+            wallet.restore_bip44_with_discovery(&wallet_secret, None, &prv_key_data, false, BIP44_DEFAULT_GAP).await.unwrap();
+
+        // Two accounts registered: the non-zero index 1 + the force-added
+        // zero-balance default at index 0.
+        assert_eq!(summary.accounts.len(), 2, "force-added default-0 plus the non-zero index 1");
+        assert_eq!(summary.last_nonzero_account_index, Some(1), "highest non-zero index is 1");
+        // The load-bearing assertion: exactly ONE account had a non-zero
+        // balance, NOT accounts.len() == 2.
+        assert_eq!(summary.non_zero_count, 1, "only index 1 carried a non-zero balance; the default-0 did not");
+        assert!(summary.non_zero_count < summary.accounts.len(), "force-added default must not inflate the non-zero count");
+
+        // The operator-facing summary line reflects the accurate count.
+        let summary_line =
+            format!("Restored wallet with {} accounts; {} had non-zero balance.", summary.accounts.len(), summary.non_zero_count,);
+        assert!(summary_line.contains("2 accounts"), "summary names the registered-account count: {summary_line}");
+        assert!(summary_line.contains("1 had non-zero balance"), "summary names the accurate non-zero count: {summary_line}");
     }
 
     // ----- mechanism-shape invariants (internal-generator replacements for
