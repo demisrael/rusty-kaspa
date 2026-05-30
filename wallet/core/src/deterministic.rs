@@ -141,7 +141,7 @@ pub fn from_multisig<const N: usize>(prv_key_data_ids: &Option<Arc<Vec<PrvKeyDat
         account_kind: &multisig::MULTISIG_ACCOUNT_KIND.into(),
         prv_key_data_ids,
         ecdsa: Some(data.ecdsa),
-        account_index: None,
+        account_index: (data.account_index != 0).then_some(data.account_index),
         secp256k1_public_key: None,
         data: Some(borsh::to_vec(&data.xpub_keys).unwrap()),
     };
@@ -214,4 +214,46 @@ pub fn from_data<const N: usize>(account_kind: &AccountKind, data: &[u8]) -> [Ha
         data: Some(data.to_vec()),
     };
     make_hashes(hashable)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::tests::make_xpub;
+
+    fn multisig_payload(account_index: u64) -> multisig::Payload {
+        multisig::Payload::new(Arc::new(vec![make_xpub()]), Some(0), 1, false, account_index)
+    }
+
+    #[test]
+    fn multisig_account_index_zero_preserves_legacy_identity_hash() {
+        let prv_key_data_ids = Some(Arc::new(vec![PrvKeyDataId::new(0x1ee7c0de)]));
+        let payload = multisig_payload(0);
+        let legacy_hashable = DeterministicHashData {
+            account_kind: &multisig::MULTISIG_ACCOUNT_KIND.into(),
+            prv_key_data_ids: &prv_key_data_ids,
+            ecdsa: Some(payload.ecdsa),
+            account_index: None,
+            secp256k1_public_key: None,
+            data: Some(borsh::to_vec(&payload.xpub_keys).unwrap()),
+        };
+
+        let actual = make_account_hashes(from_multisig(&prv_key_data_ids, &payload));
+        assert_eq!(actual.0.to_hex(), "cedbfaaabff8914b92ff0de268b88a6fa10be63507f729dcce4b618cea5fd452");
+        assert_eq!(actual.1.to_hex(), "55c0cfb9687b6e9d799142fc1912abef1cf7a92bc9792b0d028c257856c9fb52");
+        assert_eq!(
+            actual,
+            make_account_hashes(make_hashes(legacy_hashable)),
+            "index-0 multisig accounts must keep the pre-account-index hash input",
+        );
+    }
+
+    #[test]
+    fn multisig_nonzero_account_index_disambiguates_identity_hash() {
+        let prv_key_data_ids = Some(Arc::new(vec![PrvKeyDataId::new(0x1ee7c0de)]));
+        let index_zero = make_account_hashes(from_multisig(&prv_key_data_ids, &multisig_payload(0)));
+        let index_one = make_account_hashes(from_multisig(&prv_key_data_ids, &multisig_payload(1)));
+
+        assert_ne!(index_zero, index_one, "non-zero multisig account indexes must produce distinct account identity");
+    }
 }

@@ -9,6 +9,7 @@ use kaspa_notify::scope::Scope;
 use kaspa_notify::subscription::context::SubscriptionContext;
 use kaspa_notify::subscription::{MutationPolicies, UtxosChangedMutationPolicy};
 use kaspa_rpc_core::api::ctl::RpcCtl;
+use kaspa_rpc_core::api::ops::{RPC_API_REVISION, RPC_API_VERSION};
 use kaspa_rpc_core::{RpcResult, notify::connection::ChannelConnection};
 use kaspa_rpc_core::{api::connection::DynRpcConnection, api::rpc::RpcApi, *};
 use std::sync::Arc;
@@ -34,6 +35,8 @@ pub struct RpcCoreMock {
     /// Tests pin the gap-limit termination by reading the counter against the
     /// expected candidate-account walk count.
     balance_call_count: std::sync::atomic::AtomicU64,
+    /// Batch sizes observed by `get_utxos_by_addresses_call`.
+    utxo_address_batch_sizes: std::sync::Mutex<Vec<usize>>,
 }
 
 impl RpcCoreMock {
@@ -56,6 +59,7 @@ impl RpcCoreMock {
             ctl: RpcCtl::new(),
             balances: std::sync::Mutex::new(std::collections::HashMap::new()),
             balance_call_count: std::sync::atomic::AtomicU64::new(0),
+            utxo_address_batch_sizes: std::sync::Mutex::new(Vec::new()),
         }
     }
 
@@ -70,6 +74,10 @@ impl RpcCoreMock {
     /// invocations since mock construction.
     pub fn balance_call_count(&self) -> u64 {
         self.balance_call_count.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    pub fn utxo_request_sizes(&self) -> Vec<usize> {
+        self.utxo_address_batch_sizes.lock().unwrap().clone()
     }
 
     pub fn core_notifier(&self) -> Arc<RpcCoreNotifier> {
@@ -148,7 +156,15 @@ impl RpcApi for RpcCoreMock {
         _connection: Option<&DynRpcConnection>,
         _request: GetServerInfoRequest,
     ) -> RpcResult<GetServerInfoResponse> {
-        Err(RpcError::NotImplemented)
+        Ok(GetServerInfoResponse {
+            rpc_api_version: RPC_API_VERSION,
+            rpc_api_revision: RPC_API_REVISION,
+            server_version: "wallet-mock".to_string(),
+            network_id: NetworkId::with_suffix(NetworkType::Testnet, 10),
+            has_utxo_index: true,
+            is_synced: true,
+            virtual_daa_score: 1,
+        })
     }
 
     async fn get_system_info_call(
@@ -340,9 +356,10 @@ impl RpcApi for RpcCoreMock {
     async fn get_utxos_by_addresses_call(
         &self,
         _connection: Option<&DynRpcConnection>,
-        _request: GetUtxosByAddressesRequest,
+        request: GetUtxosByAddressesRequest,
     ) -> RpcResult<GetUtxosByAddressesResponse> {
-        Err(RpcError::NotImplemented)
+        self.utxo_address_batch_sizes.lock().unwrap().push(request.addresses.len());
+        Ok(GetUtxosByAddressesResponse::new(Vec::new()))
     }
 
     async fn get_sink_blue_score_call(

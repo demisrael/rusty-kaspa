@@ -173,6 +173,9 @@ pub enum Error {
     #[error("account {0} already exists")]
     AccountAlreadyExists(AccountId),
 
+    #[error("multisig group already exists as account {account_id}{account_name}")]
+    MultisigGroupAlreadyExists { account_id: AccountId, account_name: String },
+
     #[error("xprv key is not supported for this key type")]
     XPrvSupport,
 
@@ -384,6 +387,9 @@ pub enum Error {
 
     #[error("Multisig cosigner key {prv_key_data_id} derives to xpub '{derived_xpub}' not present in the stored multisig xpub set")]
     MultisigCosignerXpubNotFound { prv_key_data_id: PrvKeyDataId, derived_xpub: String },
+
+    #[error("None of the supplied multisig xpubs belong to the imported mnemonic")]
+    MultisigOwnXpubNotFound,
 
     #[error("Multisig duplicate cosigner signature for cosigner_index={cosigner_index} pub_key={pub_key}")]
     MultisigDuplicateCosignerSignature { cosigner_index: u32, pub_key: secp256k1::PublicKey },

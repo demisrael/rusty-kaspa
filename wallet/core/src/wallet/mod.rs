@@ -111,6 +111,13 @@ pub struct RestoreSummary {
     pub scan_extent: u64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultisigOwnXpubMatch {
+    pub account_index: u64,
+    pub cosigner_index: u8,
+    pub xpub: String,
+}
+
 /// Internal wallet state.
 struct Inner {
     active_accounts: ActiveAccountMap,
@@ -746,12 +753,8 @@ impl Wallet {
         Ok(account)
     }
 
-    /// Compute the next-available hardened `account_index` for a new multisig
-    /// account in this wallet. Returns `max(existing_multisig.account_index) + 1`,
-    /// or `0` if no multisig account exists yet. The default-zero case yields
-    /// the canonical derivation at `m/45'/111111'/0'` for the common
-    /// single-multisig-account-per-wallet path.
-    async fn next_multisig_account_index(self: &Arc<Wallet>) -> Result<u64> {
+    /// Compute the next-available wallet-local multisig account slot.
+    pub async fn next_multisig_account_index(self: &Arc<Wallet>) -> Result<u64> {
         let account_store = self.inner.store.clone().as_account_store()?;
         let mut iter = account_store.iter(None).await?;
         let mut highest: Option<u64> = None;
@@ -766,6 +769,79 @@ impl Wallet {
         Ok(highest.map_or(0, |h| h + 1))
     }
 
+    /// Enumerate the multisig derivation indexes already backed by the given
+    /// key, read from the embedded hardened child number of each stored own
+    /// xpub (proven by re-derivation), never from the wallet-local
+    /// `account_index` slot values.
+    pub async fn used_multisig_seat_indexes_for_key(
+        self: &Arc<Wallet>,
+        prv_key_data: &PrvKeyData,
+        payment_secret: Option<&Secret>,
+    ) -> Result<HashSet<u64>> {
+        let account_store = self.inner.store.clone().as_account_store()?;
+        let mut iter = account_store.iter(Some(prv_key_data.id)).await?;
+        let mut used = HashSet::new();
+        while let Some((storage, _metadata)) = iter.try_next().await? {
+            if storage.kind != MULTISIG_ACCOUNT_KIND {
+                continue;
+            }
+            let payload = multisig::Payload::try_load(&storage)?;
+            for xpub in payload.xpub_keys.iter() {
+                let seat_index = multisig::xpub_seat_index(xpub);
+                let derived = prv_key_data
+                    .create_xpub(payment_secret, MULTISIG_ACCOUNT_KIND.into(), seat_index)
+                    .await?
+                    .to_string(Some(KeyPrefix::XPUB));
+                if derived == xpub.to_string(Some(KeyPrefix::XPUB)) {
+                    used.insert(seat_index);
+                }
+            }
+        }
+        Ok(used)
+    }
+
+    /// Compute the lowest multisig derivation index not yet backed by the
+    /// given key (see [`Wallet::used_multisig_seat_indexes_for_key`]).
+    pub async fn next_multisig_seat_index_for_key(
+        self: &Arc<Wallet>,
+        prv_key_data: &PrvKeyData,
+        payment_secret: Option<&Secret>,
+    ) -> Result<u64> {
+        let used = self.used_multisig_seat_indexes_for_key(prv_key_data, payment_secret).await?;
+
+        let mut seat_index = 0;
+        while used.contains(&seat_index) {
+            seat_index += 1;
+        }
+        Ok(seat_index)
+    }
+
+    async fn ensure_multisig_group_unused(
+        self: &Arc<Wallet>,
+        normalized_xpubs: &[String],
+        minimum_signatures: u16,
+        ecdsa: bool,
+    ) -> Result<()> {
+        let account_store = self.inner.store.clone().as_account_store()?;
+        let mut iter = account_store.iter(None).await?;
+        while let Some((storage, metadata)) = iter.try_next().await? {
+            if storage.kind != MULTISIG_ACCOUNT_KIND {
+                continue;
+            }
+            let payload = multisig::Payload::try_load(&storage)?;
+            if payload.minimum_signatures != minimum_signatures || payload.ecdsa != ecdsa {
+                continue;
+            }
+            let existing_xpubs = payload.xpub_keys.iter().map(|xpub| xpub.to_string(Some(KeyPrefix::XPUB))).collect::<Vec<_>>();
+            if existing_xpubs == normalized_xpubs {
+                let account = try_load_account(self, storage, metadata).await?;
+                let account_name = account.name().filter(|name| !name.is_empty()).map(|name| format!(" ({name})")).unwrap_or_default();
+                return Err(Error::MultisigGroupAlreadyExists { account_id: *account.id(), account_name });
+            }
+        }
+        Ok(())
+    }
+
     pub async fn create_account_multisig(
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
@@ -776,28 +852,36 @@ impl Wallet {
         ecdsa: bool,
         account_index: Option<u64>,
     ) -> Result<Arc<dyn Account>> {
-        let account_index = match account_index {
-            Some(n) => n,
-            None => self.next_multisig_account_index().await?,
-        };
         let account_store = self.inner.store.clone().as_account_store()?;
         let wallet_network = self.network_id()?.network_type();
+        let prv_key_data_store = self.inner.store.as_prv_key_data_store()?;
+
+        let mut local_keydata = Vec::with_capacity(prv_key_data_args.len());
+        for prv_key_data_arg in prv_key_data_args.into_iter() {
+            let PrvKeyDataArgs { prv_key_data_id, payment_secret } = prv_key_data_arg;
+            let prv_key_data = prv_key_data_store
+                .load_key_data(wallet_secret, &prv_key_data_id)
+                .await?
+                .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
+            local_keydata.push((prv_key_data_id, payment_secret, prv_key_data));
+        }
+
+        let account_index = match account_index {
+            Some(n) => n,
+            None if local_keydata.is_empty() => self.next_multisig_account_index().await?,
+            None => {
+                let (_, payment_secret, prv_key_data) = &local_keydata[0];
+                self.next_multisig_seat_index_for_key(prv_key_data, payment_secret.as_ref()).await?
+            }
+        };
 
         // Derive an xpub per local seed; the cosigner_index and the
         // prv_key_data_ids vector are populated only when the operator
         // contributes one or more local seeds. The vectors are empty
         // for an all-external-cosigner (watch-only) multisig.
-        let mut generated_xpubs = Vec::with_capacity(prv_key_data_args.len());
-        let mut prv_key_data_ids = Vec::with_capacity(prv_key_data_args.len());
-        for prv_key_data_arg in prv_key_data_args.into_iter() {
-            let PrvKeyDataArgs { prv_key_data_id, payment_secret } = prv_key_data_arg;
-            let prv_key_data = self
-                .inner
-                .store
-                .as_prv_key_data_store()?
-                .load_key_data(wallet_secret, &prv_key_data_id)
-                .await?
-                .ok_or_else(|| Error::PrivateKeyNotFound(prv_key_data_id))?;
+        let mut generated_xpubs = Vec::with_capacity(local_keydata.len());
+        let mut prv_key_data_ids = Vec::with_capacity(local_keydata.len());
+        for (prv_key_data_id, payment_secret, prv_key_data) in local_keydata.into_iter() {
             let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index).await?; // todo it can be done concurrently
             generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
             prv_key_data_ids.push(prv_key_data_id);
@@ -817,6 +901,7 @@ impl Wallet {
             MultisigCurve::from_ecdsa_bool(ecdsa),
             wallet_network,
         )?;
+        self.ensure_multisig_group_unused(&xpub_keys, minimum_signatures, ecdsa).await?;
 
         let (prv_key_data_ids_opt, min_cosigner_index) = if prv_key_data_ids.is_empty() {
             (None, None)
@@ -934,7 +1019,7 @@ impl Wallet {
         Ok(account)
     }
 
-    async fn create_account_legacy(
+    pub async fn create_account_legacy(
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
         prv_key_data_id: PrvKeyDataId,
@@ -1439,10 +1524,6 @@ impl Wallet {
         wallet_secret: &Secret,
         file: SingleWalletFileV1<'_, T>,
     ) -> Result<Arc<dyn Account>> {
-        if file.ecdsa {
-            return Err(Error::Custom("ecdsa currently not suppoerted".to_owned()));
-            // todo import_with_mnemonic should accept both
-        }
         let mnemonic = decrypt_mnemonic(SingleWalletFileV1::<T>::NUM_THREADS, file.encrypted_mnemonic, import_secret.as_ref())?;
         let mnemonic = Mnemonic::new(mnemonic.trim(), Language::English)?;
         let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic.clone(), None, self.store().encryption_kind()?)?;
@@ -1452,7 +1533,7 @@ impl Wallet {
         if prv_key_data.create_xpub(None, BIP32_ACCOUNT_KIND.into(), 0).await?.to_string(Some(prefix)) != file.xpublic_key {
             return Err(Custom("imported xpub does not equal derived one".to_owned()));
         }
-        self.import_with_mnemonic(wallet_secret, None, mnemonic, BIP32_ACCOUNT_KIND.into()).await
+        self.import_with_mnemonic(wallet_secret, None, mnemonic, BIP32_ACCOUNT_KIND.into(), file.ecdsa).await
     }
 
     pub async fn import_kaspawallet_golang_single_v0<T: AsRef<[u8]>>(
@@ -1461,10 +1542,6 @@ impl Wallet {
         wallet_secret: &Secret,
         file: SingleWalletFileV0<'_, T>,
     ) -> Result<Arc<dyn Account>> {
-        if file.ecdsa {
-            return Err(Error::Custom("ecdsa currently not suppoerted".to_owned()));
-            // todo import_with_mnemonic should accept both
-        }
         let mnemonic = decrypt_mnemonic(file.num_threads, file.encrypted_mnemonic, import_secret.as_ref())?;
         let mnemonic = Mnemonic::new(mnemonic.trim(), Language::English)?;
         let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic.clone(), None, self.store().encryption_kind()?)?;
@@ -1473,7 +1550,7 @@ impl Wallet {
         if prv_key_data.create_xpub(None, BIP32_ACCOUNT_KIND.into(), 0).await.unwrap().to_string(Some(prefix)) != file.xpublic_key {
             return Err(Custom("imported xpub does not equal derived one".to_owned()));
         }
-        self.import_with_mnemonic(wallet_secret, None, mnemonic, BIP32_ACCOUNT_KIND.into()).await
+        self.import_with_mnemonic(wallet_secret, None, mnemonic, BIP32_ACCOUNT_KIND.into(), file.ecdsa).await
     }
 
     pub async fn import_kaspawallet_golang_multisig_v0<T: AsRef<[u8]>>(
@@ -1482,10 +1559,6 @@ impl Wallet {
         wallet_secret: &Secret,
         file: MultisigWalletFileV0<'_, T>,
     ) -> Result<Arc<dyn Account>> {
-        if file.ecdsa {
-            return Err(Error::Custom("ecdsa currently not suppoerted".to_owned()));
-            // todo import_with_mnemonic should accept both
-        }
         let Some(first_pub_key) = file.xpublic_keys.first() else {
             return Err(Error::Custom("no public keys".to_owned()));
         };
@@ -1514,8 +1587,14 @@ impl Wallet {
         pubkeys_from_mnemonics.sort_unstable();
         all_pub_keys.retain(|v| pubkeys_from_mnemonics.binary_search_by_key(v, |xpub| xpub.as_str()).is_err());
         let additional_pub_keys = all_pub_keys.into_iter().map(String::from).collect();
-        self.import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys, false)
-            .await
+        self.import_kaspawallet_golang_multisig_with_mnemonics(
+            wallet_secret,
+            mnemonics_and_secrets,
+            file.required_signatures,
+            additional_pub_keys,
+            file.ecdsa,
+        )
+        .await
     }
 
     pub async fn import_kaspawallet_golang_multisig_v1<T: AsRef<[u8]>>(
@@ -1524,10 +1603,6 @@ impl Wallet {
         wallet_secret: &Secret,
         file: MultisigWalletFileV1<'_, T>,
     ) -> Result<Arc<dyn Account>> {
-        if file.ecdsa {
-            return Err(Error::Custom("ecdsa currently not suppoerted".to_owned()));
-            // todo import_with_mnemonic should accept both
-        }
         let Some(first_pub_key) = file.xpublic_keys.first() else {
             return Err(Error::Custom("no public keys".to_owned()));
         };
@@ -1563,10 +1638,87 @@ impl Wallet {
             found.is_err()
         });
         let additional_pub_keys = all_pub_keys.into_iter().map(String::from).collect();
-        let acc = self
-            .import_multisig_with_mnemonic(wallet_secret, mnemonics_and_secrets, file.required_signatures, additional_pub_keys, false)
-            .await?;
-        Ok(acc)
+        self.import_kaspawallet_golang_multisig_with_mnemonics(
+            wallet_secret,
+            mnemonics_and_secrets,
+            file.required_signatures,
+            additional_pub_keys,
+            file.ecdsa,
+        )
+        .await
+    }
+
+    async fn import_kaspawallet_golang_multisig_with_mnemonics(
+        self: &Arc<Wallet>,
+        wallet_secret: &Secret,
+        mnemonics_secrets: Vec<(Mnemonic, Option<Secret>)>,
+        minimum_signatures: u16,
+        additional_xpub_keys: Vec<String>,
+        ecdsa: bool,
+    ) -> Result<Arc<dyn Account>> {
+        if mnemonics_secrets.is_empty() {
+            return Err(Error::Custom("no encrypted mnemonics".to_owned()));
+        }
+
+        let wallet_network = self.network_id()?.network_type();
+        let curve = MultisigCurve::from_ecdsa_bool(ecdsa);
+        let prv_key_data_store = self.store().as_prv_key_data_store()?;
+        let mut generated_xpubs = Vec::with_capacity(mnemonics_secrets.len());
+        let mut prv_key_data = Vec::with_capacity(mnemonics_secrets.len());
+
+        for (mnemonic, payment_secret) in mnemonics_secrets {
+            let key_data =
+                storage::PrvKeyData::try_new_from_mnemonic(mnemonic, payment_secret.as_ref(), self.store().encryption_kind()?)?;
+            let xpub_key =
+                key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), 0).await?.to_string(Some(KeyPrefix::XPUB));
+            generated_xpubs.push(xpub_key);
+            prv_key_data.push(key_data);
+        }
+
+        generated_xpubs.sort_unstable();
+        let normalized = normalize_and_merge_xpubs(additional_xpub_keys, &generated_xpubs, minimum_signatures, curve, wallet_network)?;
+        self.ensure_multisig_group_unused(&normalized, minimum_signatures, ecdsa).await?;
+        let cosigner_index =
+            generated_xpubs.first().and_then(|first_generated| normalized.binary_search(first_generated).ok()).map(|v| v as u8);
+
+        let xpub_keys = normalized
+            .into_iter()
+            .map(|xpub_key| {
+                ExtendedPublicKeySecp256k1::from_str(&xpub_key).map_err(|err| Error::InvalidExtendedPublicKey(xpub_key, err))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let prv_key_data_ids = prv_key_data.iter().map(|key_data| key_data.id).collect::<Vec<_>>();
+        let account_slot = self.next_multisig_account_index().await?;
+        let account: Arc<dyn Account> = Arc::new(
+            multisig::MultiSig::try_new(
+                self,
+                None,
+                Arc::new(xpub_keys),
+                Some(Arc::new(prv_key_data_ids)),
+                cosigner_index,
+                minimum_signatures,
+                ecdsa,
+                account_slot,
+            )
+            .await?,
+        );
+
+        let account_store = self.inner.store.clone().as_account_store()?;
+        if account_store.load_single(account.id()).await?.is_some() {
+            return Err(Error::AccountAlreadyExists(*account.id()));
+        }
+
+        self.inner.store.batch().await?;
+        for key_data in prv_key_data {
+            if prv_key_data_store.load_key_data(wallet_secret, &key_data.id).await?.is_none() {
+                prv_key_data_store.store(wallet_secret, key_data).await?;
+            }
+        }
+        account_store.store_single(&account.to_storage()?, None).await?;
+        self.inner.store.flush(wallet_secret).await?;
+        account.clone().start().await?;
+
+        Ok(account)
     }
 
     pub async fn import_legacy_keydata(
@@ -1629,20 +1781,17 @@ impl Wallet {
         payment_secret: Option<&Secret>,
         mnemonic: Mnemonic,
         account_kind: AccountKind,
+        ecdsa: bool,
     ) -> Result<Arc<dyn Account>> {
         let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, payment_secret, self.store().encryption_kind()?)?;
         let prv_key_data_store = self.store().as_prv_key_data_store()?;
-        if prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_some() {
-            return Err(Error::PrivateKeyAlreadyExists(prv_key_data.id));
-        }
+        let key_exists = prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_some();
         // let mut is_legacy = false;
         let account: Arc<dyn Account> = match account_kind.as_ref() {
             BIP32_ACCOUNT_KIND => {
                 let account_index = 0;
                 let xpub_key = prv_key_data.create_xpub(payment_secret, account_kind, account_index).await?;
                 let xpub_keys = Arc::new(vec![xpub_key]);
-                let ecdsa = false;
-                // ---
                 Arc::new(bip32::Bip32::try_new(self, None, prv_key_data.id, account_index, xpub_keys, ecdsa).await?)
             }
             LEGACY_ACCOUNT_KIND => Arc::new(legacy::Legacy::try_new(self, None, prv_key_data.id).await?),
@@ -1652,7 +1801,20 @@ impl Wallet {
         };
 
         let account_store = self.inner.store.as_account_store()?;
+        if let Some((stored_account, stored_metadata)) = account_store.load_single(account.id()).await? {
+            if let Some(active_account) = self.active_accounts().get(account.id()) {
+                return Ok(active_account);
+            }
+            if let Some(legacy_account) = self.legacy_accounts().get(account.id()) {
+                return Ok(legacy_account);
+            }
+            return try_load_account(self, stored_account, stored_metadata).await;
+        }
+
         self.inner.store.batch().await?;
+        if !key_exists {
+            prv_key_data_store.store(wallet_secret, prv_key_data).await?;
+        }
         account_store.store_single(&account.to_storage()?, None).await?;
         self.inner.store.flush(wallet_secret).await?;
 
@@ -1801,45 +1963,85 @@ impl Wallet {
         Ok(last_account_index as u32)
     }
 
+    /// Import a multisig account from the operator's single own mnemonic plus
+    /// the peer cosigner xpubs. The own mnemonic is stored as its own
+    /// separately-encrypted wallet key entry and becomes the account's local
+    /// cosigner seat; re-importing the same key is idempotent (the existing
+    /// entry is reused rather than re-stored), so one key can back multiple
+    /// registered groups.
+    ///
+    /// `account_index` selects the mode. `Some(i)`: the explicit form - the
+    /// own xpub derives at `i` and the account lands at wallet-local slot
+    /// `i` (the caller chooses the landing slot; mirrors
+    /// [`Wallet::create_account_multisig`]'s parameter). `None`: the
+    /// identification form - the own xpubs are proven from the provided set
+    /// and ONE account registers the group, carrying every matched own xpub
+    /// as a local seat, at the next free wallet-local slot.
     pub async fn import_multisig_with_mnemonic(
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
-        mnemonics_secrets: Vec<(Mnemonic, Option<Secret>)>,
+        mnemonic_secret: (Mnemonic, Option<Secret>),
+        account_index: Option<u64>,
         minimum_signatures: u16,
-        additional_xpub_keys: Vec<String>,
+        xpub_keys: Vec<String>,
         ecdsa: bool,
-    ) -> Result<Arc<dyn Account>> {
-        let account_index = self.next_multisig_account_index().await?;
-        let mut generated_xpubs = Vec::with_capacity(mnemonics_secrets.len());
-        let mut prv_key_data_ids = Vec::with_capacity(mnemonics_secrets.len());
+    ) -> Result<Vec<Arc<dyn Account>>> {
         let prv_key_data_store = self.store().as_prv_key_data_store()?;
 
-        for (mnemonic, payment_secret) in mnemonics_secrets {
-            let prv_key_data =
-                storage::PrvKeyData::try_new_from_mnemonic(mnemonic, payment_secret.as_ref(), self.store().encryption_kind()?)?;
-            if prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_some() {
-                return Err(Error::PrivateKeyAlreadyExists(prv_key_data.id));
-            }
-            let xpub_key = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index).await?; // todo it can be done concurrently
-            generated_xpubs.push(xpub_key.to_string(Some(KeyPrefix::XPUB)));
-            prv_key_data_ids.push(prv_key_data.id);
-            prv_key_data_store.store(wallet_secret, prv_key_data).await?;
-        }
-
-        generated_xpubs.sort_unstable();
+        let (mnemonic, payment_secret) = mnemonic_secret;
+        let prv_key_data =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonic, payment_secret.as_ref(), self.store().encryption_kind()?)?;
         let wallet_network = self.network_id()?.network_type();
-        let xpub_keys = normalize_and_merge_xpubs(
-            additional_xpub_keys,
-            &generated_xpubs,
-            minimum_signatures,
-            MultisigCurve::from_ecdsa_bool(ecdsa),
-            wallet_network,
-        )?;
+        let curve = MultisigCurve::from_ecdsa_bool(ecdsa);
+        let own_matches = match account_index {
+            Some(account_index) => {
+                let own_xpub = prv_key_data
+                    .create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index)
+                    .await?
+                    .to_string(Some(KeyPrefix::XPUB));
+                let generated_xpubs = if canonicalize_user_xpubs(&xpub_keys, wallet_network)?.binary_search(&own_xpub).is_ok() {
+                    Vec::new()
+                } else {
+                    vec![own_xpub.clone()]
+                };
+                let normalized =
+                    normalize_and_merge_xpubs(xpub_keys.clone(), &generated_xpubs, minimum_signatures, curve, wallet_network)?;
+                let cosigner_index = normalized.binary_search(&own_xpub).map_err(|_| Error::MultisigCosignerXpubNotFound {
+                    prv_key_data_id: prv_key_data.id,
+                    derived_xpub: own_xpub.clone(),
+                })?;
+                vec![(MultisigOwnXpubMatch { account_index, cosigner_index: cosigner_index as u8, xpub: own_xpub }, normalized)]
+            }
+            None => {
+                let matches = self.identify_own_multisig_xpubs(&prv_key_data, payment_secret.as_ref(), &xpub_keys).await?;
+                let normalized = normalize_and_merge_xpubs(xpub_keys.clone(), &[], minimum_signatures, curve, wallet_network)?;
+                matches.into_iter().map(|own_match| (own_match, normalized.clone())).collect()
+            }
+        };
 
+        // One registration per group identity: the full cosigner set
+        // registers once, every matched own xpub is a local seat of that
+        // single account (each seat self-describes via its embedded index),
+        // and the account's cosigner position is the lowest matched
+        // position. The explicit form constructs exactly one match and
+        // identification rejects a zero-match set before reaching here, so
+        // the minimum always exists.
+        let normalized_xpubs = own_matches.first().map(|(_, normalized)| normalized.clone()).ok_or(Error::MultisigOwnXpubNotFound)?;
         let min_cosigner_index =
-            generated_xpubs.first().and_then(|first_generated| xpub_keys.binary_search(first_generated).ok()).map(|v| v as u8);
+            own_matches.iter().map(|(own_match, _)| own_match.cosigner_index).min().ok_or(Error::MultisigOwnXpubNotFound)?;
 
-        let xpub_keys = xpub_keys
+        let account_store = self.inner.store.clone().as_account_store()?;
+        // Explicit form: the caller-chosen index is the landing slot.
+        // Identification form: the account lands at the next free
+        // wallet-local slot.
+        let account_slot = match account_index {
+            Some(explicit_slot) => explicit_slot,
+            None => self.next_multisig_account_index().await?,
+        };
+        // All-or-nothing: every validation completes before any key or
+        // account store below.
+        self.ensure_multisig_group_unused(&normalized_xpubs, minimum_signatures, ecdsa).await?;
+        let xpub_keys = normalized_xpubs
             .into_iter()
             .map(|xpub_key| {
                 ExtendedPublicKeySecp256k1::from_str(&xpub_key).map_err(|err| Error::InvalidExtendedPublicKey(xpub_key, err))
@@ -1851,22 +2053,59 @@ impl Wallet {
                 self,
                 None,
                 Arc::new(xpub_keys),
-                Some(Arc::new(prv_key_data_ids)),
-                min_cosigner_index,
+                Some(Arc::new(vec![prv_key_data.id])),
+                Some(min_cosigner_index),
                 minimum_signatures,
                 ecdsa,
-                account_index,
+                account_slot,
             )
             .await?,
         );
 
-        self.inner.store.clone().as_account_store()?.store_single(&account.to_storage()?, None).await?;
-        // Mirror `create_account_multisig`'s post-write commit; clears LocalStore's
-        // modified flag so the next wallet open does not trip the dirty-store guard.
-        self.inner.store.commit(wallet_secret).await?;
+        if account_store.load_single(account.id()).await?.is_some() {
+            return Err(Error::AccountAlreadyExists(*account.id()));
+        }
+
+        self.inner.store.batch().await?;
+        if prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_none() {
+            prv_key_data_store.store(wallet_secret, prv_key_data).await?;
+        }
+        account_store.store_single(&account.to_storage()?, None).await?;
+        self.inner.store.flush(wallet_secret).await?;
+
         account.clone().start().await?;
 
-        Ok(account)
+        Ok(vec![account])
+    }
+
+    pub async fn identify_own_multisig_xpubs(
+        self: &Arc<Wallet>,
+        prv_key_data: &PrvKeyData,
+        payment_secret: Option<&Secret>,
+        candidate_xpubs: &[String],
+    ) -> Result<Vec<MultisigOwnXpubMatch>> {
+        let wallet_network = self.network_id()?.network_type();
+        let normalized = canonicalize_user_xpubs(candidate_xpubs, wallet_network)?;
+        let mut matches = Vec::new();
+
+        for (position, xpub) in normalized.iter().enumerate() {
+            let parsed = ExtendedKey::from_str(xpub)?;
+            let account_index = parsed.attrs.child_number.index() as u64;
+            let derived = prv_key_data
+                .create_xpub(payment_secret, MULTISIG_ACCOUNT_KIND.into(), account_index)
+                .await?
+                .to_string(Some(KeyPrefix::XPUB));
+            if &derived == xpub {
+                matches.push(MultisigOwnXpubMatch {
+                    account_index,
+                    cosigner_index: u8::try_from(position)
+                        .map_err(|_| Error::InvalidArgument("too many multisig cosigners".into()))?,
+                    xpub: derived,
+                });
+            }
+        }
+
+        if matches.is_empty() { Err(Error::MultisigOwnXpubNotFound) } else { Ok(matches) }
     }
 
     async fn rename(&self, title: Option<String>, filename: Option<String>, wallet_secret: &Secret) -> Result<()> {
@@ -2011,6 +2250,31 @@ impl MultisigCurve {
     }
 }
 
+fn canonicalize_user_xpubs(user_xpubs: &[String], wallet_network: kaspa_consensus_core::network::NetworkType) -> Result<Vec<String>> {
+    use kaspa_consensus_core::network::NetworkType;
+    let mut normalized: Vec<String> = user_xpubs
+        .iter()
+        .map(|raw_xpub| {
+            let mut parsed = ExtendedKey::from_str(raw_xpub)?;
+            let accepted = matches!(
+                (parsed.prefix, wallet_network),
+                (KeyPrefix::KPUB, NetworkType::Mainnet)
+                    | (KeyPrefix::KTUB, NetworkType::Testnet | NetworkType::Simnet | NetworkType::Devnet)
+            );
+            if !accepted {
+                return Err(Error::MultisigXpubNetworkMismatch { supplied_prefix: parsed.prefix, wallet_network });
+            }
+            parsed.prefix = KeyPrefix::XPUB;
+            Ok(parsed.to_string())
+        })
+        .collect::<Result<Vec<_>>>()?;
+    normalized.sort_unstable();
+    if let Some(window) = normalized.windows(2).find(|w| w[0] == w[1]) {
+        return Err(Error::MultisigDuplicateXpub { xpub: window[0].clone() });
+    }
+    Ok(normalized)
+}
+
 pub(crate) fn normalize_and_merge_xpubs(
     user_xpubs: Vec<String>,
     sorted_generated_xpubs: &[String],
@@ -2032,28 +2296,7 @@ pub(crate) fn normalize_and_merge_xpubs(
     // Already-persisted wallets whose `xpub_keys` carry `XPUB` entries also
     // bypass: this validation runs at user-input time only, not on
     // storage-read paths.
-    use kaspa_consensus_core::network::NetworkType;
-    for raw_xpub in user_xpubs.iter() {
-        let parsed = ExtendedKey::from_str(raw_xpub)?;
-        let accepted = matches!(
-            (parsed.prefix, wallet_network),
-            (KeyPrefix::KPUB, NetworkType::Mainnet)
-                | (KeyPrefix::KTUB, NetworkType::Testnet | NetworkType::Simnet | NetworkType::Devnet)
-        );
-        if !accepted {
-            return Err(Error::MultisigXpubNetworkMismatch { supplied_prefix: parsed.prefix, wallet_network });
-        }
-    }
-
-    let mut normalized: Vec<String> = user_xpubs
-        .into_iter()
-        .map(|xpub| {
-            ExtendedKey::from_str(&xpub).map(|mut xpub| {
-                xpub.prefix = KeyPrefix::XPUB;
-                xpub.to_string()
-            })
-        })
-        .collect::<Result<Vec<_>, kaspa_bip32::Error>>()?;
+    let mut normalized = canonicalize_user_xpubs(&user_xpubs, wallet_network)?;
     normalized.extend_from_slice(sorted_generated_xpubs);
     normalized.sort_unstable();
 
@@ -2314,6 +2557,7 @@ mod test {
 #[cfg(test)]
 mod multisig_tests {
     use super::*;
+    use crate::account::descriptor::AccountDescriptorValue;
     use crate::account::pskb::finalize_pskt_one_or_more_sig_and_redeem_script;
     use crate::account::pskb::pskb_signer_for_multisig_cosigner;
     use crate::account::variants::multisig::{MULTISIG_ACCOUNT_KIND, MultiSig};
@@ -2348,12 +2592,23 @@ mod multisig_tests {
         wallet
     }
 
+    fn imported_account(mut accounts: Vec<Arc<dyn Account>>) -> Arc<dyn Account> {
+        assert_eq!(accounts.len(), 1, "this fixture imports exactly one local multisig seat");
+        accounts.remove(0)
+    }
+
     /// Derive the canonical XPUB-prefixed extended public key from a BIP-39
     /// mnemonic phrase at the multisig account-kind derivation path.
     async fn xpub_from_mnemonic_phrase(phrase: &str) -> String {
+        xpub_from_mnemonic_phrase_at(phrase, 0).await
+    }
+
+    /// Derive the canonical XPUB-prefixed extended public key from a BIP-39
+    /// mnemonic phrase at a specific multisig account index.
+    async fn xpub_from_mnemonic_phrase_at(phrase: &str, account_index: u64) -> String {
         let mnemonic = Mnemonic::new(phrase, Language::English).unwrap();
         let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
-        let xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), account_index).await.unwrap();
         xpub.to_string(Some(KeyPrefix::XPUB))
     }
 
@@ -2362,7 +2617,12 @@ mod multisig_tests {
     /// it passes the cross-network prefix gate when threaded into
     /// `Wallet::create_account_multisig` / `import_multisig_with_mnemonic`.
     async fn external_xpub_for_testnet(phrase: &str) -> String {
-        let raw = xpub_from_mnemonic_phrase(phrase).await;
+        external_xpub_for_testnet_at(phrase, 0).await
+    }
+
+    /// Derive a Testnet-prefixed multisig xpub at a specific account index.
+    async fn external_xpub_for_testnet_at(phrase: &str, account_index: u64) -> String {
+        let raw = xpub_from_mnemonic_phrase_at(phrase, account_index).await;
         let mut k = kaspa_bip32::ExtendedKey::from_str(&raw).unwrap();
         k.prefix = KeyPrefix::KTUB;
         k.to_string()
@@ -2532,41 +2792,45 @@ mod multisig_tests {
     /// than the import-path.
     #[tokio::test]
     async fn multisig_create_import_parity() {
+        // Registered one-seat shape: the operator holds one own seed (`a`); the other
+        // cosigners (`b` + a fixed external) are peer xpubs. The create path
+        // and the import path must agree on the same 2-of-3 cosigner set and
+        // produce byte-identical first-receive addresses.
         let mnemonics = make_local_mnemonics(2).await;
         let mnemonic_a = mnemonics[0].clone();
-        let mnemonic_b = mnemonics[1].clone();
+        let peer_xpub_b = external_xpub_for_testnet(mnemonics[1].phrase()).await;
         let external_xpub = xpub_from_mnemonic_phrase(&reference_phrase_12(0x00)).await;
         let external_xpub_ktub = {
             let mut k = kaspa_bip32::ExtendedKey::from_str(&external_xpub).unwrap();
             k.prefix = KeyPrefix::KTUB;
             k.to_string()
         };
+        let peer_xpubs = vec![peer_xpub_b, external_xpub_ktub];
 
         // Create path.
         let create_wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let prv_key_data_a =
             storage::PrvKeyData::try_new_from_mnemonic(mnemonic_a.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
-        let prv_key_data_b =
-            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_b.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
         let store_a = create_wallet.store().as_prv_key_data_store().unwrap();
         store_a.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
-        store_a.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
         create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
-        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
+        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None)];
         let create_account = create_wallet
-            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, false, None)
+            .create_account_multisig(&wallet_secret, create_args, peer_xpubs.clone(), None, 2, false, None)
             .await
             .unwrap();
         let create_address = create_account.receive_address().unwrap();
 
-        // Import path with the SAME mnemonics + SAME external xpub (also `ktub`-prefixed).
+        // Import path with the SAME own mnemonic + SAME peer xpubs.
         let import_wallet = test_wallet().await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
-        let import_account = import_wallet
-            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()], false)
-            .await
-            .unwrap();
+        let mnemonics_with_secrets = (mnemonic_a.clone(), None);
+        let import_account = imported_account(
+            import_wallet
+                .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 2, peer_xpubs.clone(), false)
+                .await
+                .unwrap(),
+        );
         let import_address = import_account.receive_address().unwrap();
 
         assert_eq!(create_address, import_address, "create-path and import-path produce identical P2SH first-receive addresses");
@@ -2580,39 +2844,39 @@ mod multisig_tests {
     /// create-vs-import parity is the property pinned here.
     #[tokio::test]
     async fn multisig_create_import_parity_ecdsa() {
+        // Registered one-seat shape (see `multisig_create_import_parity`): one own
+        // seed (`a`) + peer xpubs (`b` + a fixed external), ECDSA branch.
         let mnemonics = make_local_mnemonics(2).await;
         let mnemonic_a = mnemonics[0].clone();
-        let mnemonic_b = mnemonics[1].clone();
+        let peer_xpub_b = external_xpub_for_testnet(mnemonics[1].phrase()).await;
         let external_xpub = xpub_from_mnemonic_phrase(&reference_phrase_12(0x00)).await;
         let external_xpub_ktub = {
             let mut k = kaspa_bip32::ExtendedKey::from_str(&external_xpub).unwrap();
             k.prefix = KeyPrefix::KTUB;
             k.to_string()
         };
+        let peer_xpubs = vec![peer_xpub_b, external_xpub_ktub];
 
         let create_wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let prv_key_data_a =
             storage::PrvKeyData::try_new_from_mnemonic(mnemonic_a.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
-        let prv_key_data_b =
-            storage::PrvKeyData::try_new_from_mnemonic(mnemonic_b.clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
         let store_a = create_wallet.store().as_prv_key_data_store().unwrap();
         store_a.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
-        store_a.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
         create_wallet.inner.store.commit(&wallet_secret).await.unwrap();
-        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None), PrvKeyDataArgs::new(prv_key_data_b.id, None)];
-        let create_account = create_wallet
-            .create_account_multisig(&wallet_secret, create_args, vec![external_xpub_ktub.clone()], None, 2, true, None)
-            .await
-            .unwrap();
+        let create_args = vec![PrvKeyDataArgs::new(prv_key_data_a.id, None)];
+        let create_account =
+            create_wallet.create_account_multisig(&wallet_secret, create_args, peer_xpubs.clone(), None, 2, true, None).await.unwrap();
         let create_address = create_account.receive_address().unwrap();
 
         let import_wallet = test_wallet().await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
-        let import_account = import_wallet
-            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub_ktub.clone()], true)
-            .await
-            .unwrap();
+        let mnemonics_with_secrets = (mnemonic_a.clone(), None);
+        let import_account = imported_account(
+            import_wallet
+                .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 2, peer_xpubs.clone(), true)
+                .await
+                .unwrap(),
+        );
         let import_address = import_account.receive_address().unwrap();
 
         assert_eq!(
@@ -2631,21 +2895,37 @@ mod multisig_tests {
     /// identity, not just signing-time dispatch.
     #[tokio::test]
     async fn multisig_schnorr_ecdsa_distinct_addresses() {
+        // Registered one-seat shape: one own seed (`a`) + one peer xpub (`b`); the
+        // Schnorr-vs-ECDSA address distinction is independent of how many
+        // seats are local.
         let mnemonics = make_local_mnemonics(2).await;
         let mnemonic_a = mnemonics[0].clone();
-        let mnemonic_b = mnemonics[1].clone();
+        let peer_xpub_b = external_xpub_for_testnet(mnemonics[1].phrase()).await;
 
         let wallet_schnorr = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a.clone(), None), (mnemonic_b.clone(), None)];
-        let schnorr_account =
-            wallet_schnorr.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let schnorr_account = imported_account(
+            wallet_schnorr
+                .import_multisig_with_mnemonic(
+                    &wallet_secret,
+                    (mnemonic_a.clone(), None),
+                    Some(0),
+                    2,
+                    vec![peer_xpub_b.clone()],
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
         let schnorr_address = schnorr_account.receive_address().unwrap();
 
         let wallet_ecdsa = test_wallet().await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(mnemonic_a, None), (mnemonic_b, None)];
-        let ecdsa_account =
-            wallet_ecdsa.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await.unwrap();
+        let ecdsa_account = imported_account(
+            wallet_ecdsa
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonic_a, None), Some(0), 2, vec![peer_xpub_b], true)
+                .await
+                .unwrap(),
+        );
         let ecdsa_address = ecdsa_account.receive_address().unwrap();
 
         assert_eq!(
@@ -2674,7 +2954,9 @@ mod multisig_tests {
     /// gate on testnet.
     #[tokio::test]
     async fn multisig_post_import_open() {
-        let mnemonics = make_local_mnemonics(2).await;
+        // One own seed + one peer xpub (2-of-2). The cosigner shape is
+        // incidental to the reopen-without-panic property.
+        let mnemonics = make_local_mnemonics(1).await;
         let external_xpub = external_xpub_for_testnet(&reference_phrase_12(0x00)).await;
 
         let wallet = test_wallet().await;
@@ -2682,9 +2964,9 @@ mod multisig_tests {
 
         // Import the multisig account. Without a `commit` after the account
         // `store_single`, the local store's `is_modified` flag would remain set.
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
+        let mnemonics_with_secrets = (mnemonics[0].clone(), None);
         wallet
-            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub.clone()], false)
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 2, vec![external_xpub.clone()], false)
             .await
             .unwrap();
 
@@ -2718,12 +3000,21 @@ mod multisig_tests {
     async fn multisig_cosigner_partial_sig_matches_redeem_slot() {
         // Deterministic constant-fill mnemonics: same mnemonics in, same xpubs
         // derived, same signing pubkey expected at each cosigner position
-        // across runs.
-        let mnemonics = [mnemonic_24_from_fill(0xa1), mnemonic_24_from_fill(0xb2)];
+        // across runs. The operator holds one own seed; the second cosigner
+        // is contributed as a peer xpub. The signing primitive /
+        // redeem-script population is exercised for the single local seat;
+        // the xpub set (hence the redeem-script bytes) is the same
+        // 2-cosigner group.
+        let own_mnemonic = mnemonic_24_from_fill(0xa1);
+        let peer_xpub_b = external_xpub_for_testnet(mnemonic_24_from_fill(0xb2).phrase()).await;
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (own_mnemonic, None), Some(0), 2, vec![peer_xpub_b], false)
+                .await
+                .unwrap(),
+        );
 
         // Build a single-input unsigned PSKT pointing at the multisig's receive address.
         let receive_address = account.receive_address().unwrap();
@@ -2831,12 +3122,19 @@ mod multisig_tests {
         // The same `(2, 2)` constant-fill mnemonics
         // `multisig_cosigner_partial_sig_matches_redeem_slot` uses, so the
         // expected slot pubkeys and redeem-script bytes are reproducible from
-        // the same canonical derivation walk.
-        let mnemonics = [mnemonic_24_from_fill(0xa1), mnemonic_24_from_fill(0xb2)];
+        // the same canonical derivation walk. The operator holds one own
+        // seed; the second cosigner is contributed as a peer xpub, the same
+        // 2-cosigner group shape as the slot-match test above.
+        let own_mnemonic = mnemonic_24_from_fill(0xa1);
+        let peer_xpub_b = external_xpub_for_testnet(mnemonic_24_from_fill(0xb2).phrase()).await;
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (own_mnemonic, None), Some(0), 2, vec![peer_xpub_b], false)
+                .await
+                .unwrap(),
+        );
 
         // Build a single-input unsigned PSKT pointing at the multisig's receive address.
         let receive_address = account.receive_address().unwrap();
@@ -2868,9 +3166,10 @@ mod multisig_tests {
             "pre-condition: PSKT-conversion path leaves redeem_script unpopulated",
         );
 
-        // The override populates `redeem_script` AND adds the per-cosigner
-        // signatures for the wallet's local seeds (2 local seeds in this
-        // fixture, so the returned bundle is fully-signed).
+        // The override populates `redeem_script` AND adds the single local
+        // seat's signature. The redeem-script bytes asserted below depend only
+        // on the cosigner xpub set, not on how many seats are local, so the
+        // one-seat partial bundle exercises the same population path.
         let signed_bundle = account.clone().pskb_sign(&bundle, wallet_secret.clone(), None, None).await.unwrap();
         let signed_input = &signed_bundle.as_ref()[0].inputs[0];
         let populated_redeem_script =
@@ -2900,317 +3199,30 @@ mod multisig_tests {
             multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2).unwrap();
         assert_eq!(populated_redeem_script, expected_redeem_script, "populated redeem_script byte-equals multisig_redeem_script(K=2)");
 
-        // Idempotency: a second invocation on the already-populated bundle
-        // preserves the redeem-script (no overwrite). This is the multi-party
-        // PSKT exchange invariant -- a downstream cosigner receiving the
-        // bundle does not overwrite the upstream cosigner's redeem-script
-        // contribution.
-        let twice_signed = account.clone().pskb_sign(&signed_bundle, wallet_secret.clone(), None, None).await.unwrap();
-        let twice_signed_redeem = twice_signed.as_ref()[0].inputs[0].redeem_script.as_ref().expect("idempotent populate").clone();
+        // Idempotency: re-running the redeem-script population on the
+        // already-populated bundle preserves the redeem-script (the helper's
+        // `.is_some()` skip-guard). This is the multi-party PSKT exchange
+        // invariant -- a downstream cosigner receiving the bundle does not
+        // overwrite the upstream cosigner's redeem-script contribution.
+        let mut repopulated = Bundle(signed_bundle.0.clone());
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut repopulated, 2).await.unwrap();
+        let repopulated_redeem = repopulated.as_ref()[0].inputs[0].redeem_script.as_ref().expect("idempotent populate").clone();
         assert_eq!(
-            twice_signed_redeem, populated_redeem_script,
-            "second pskb_sign preserves the existing redeem_script byte-for-byte"
+            repopulated_redeem, populated_redeem_script,
+            "re-running redeem-script population preserves the existing redeem_script byte-for-byte"
         );
     }
 
-    /// K-of-N multi-cosigner signing flow produces exactly K signatures per
-    /// input. Tests the `(N=2, K=2)` cell directly through
-    /// `pskb_signer_for_multisig_cosigner` + accumulate-via-`Input::add` (the
-    /// same shape `build_multisig_signed_bundle` uses); the on-chain TXID
-    /// dimension is the Validator's gate on the testnet substrate.
-    #[tokio::test]
-    async fn multisig_send_local_k_of_n_2_of_2() {
-        let mnemonics = make_local_mnemonics(2).await;
-        let wallet = test_wallet().await;
-        let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
-
-        let receive_address = account.receive_address().unwrap();
-        let script_public_key = pay_to_address_script(&receive_address);
-        let utxo = kaspa_consensus_core::tx::UtxoEntry {
-            amount: 100_000_000,
-            script_public_key,
-            block_daa_score: 1,
-            is_coinbase: false,
-            covenant_id: None,
-        };
-        let input = InputBuilder::default()
-            .utxo_entry(utxo)
-            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
-                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xcd; 32]),
-                index: 0,
-            })
-            .sig_op_count(2)
-            .build()
-            .unwrap();
-        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
-        let pskt_inner = pskt_creator.constructor().input(input);
-        let mut accumulator = Bundle::from(pskt_inner);
-
-        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
-        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
-        let network_id = wallet.network_id().unwrap();
-        let xpub_keys_strings: Vec<String> = account.xpub_keys().unwrap().iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
-        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
-
-        // Per-cosigner signing with per-input K-cap break-out gate (same shape as `build_multisig_signed_bundle`).
-        let k: usize = 2;
-        for prv_key_data_id in prv_key_data_ids.iter() {
-            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k));
-            if all_full {
-                break;
-            }
-            let prv_key_data = prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data");
-            let this_xpub = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
-            let this_xpub_string = this_xpub.to_string(Some(KeyPrefix::XPUB));
-            assert!(xpub_keys_strings.iter().any(|s| s == &this_xpub_string), "cosigner xpub present in multisig set");
-            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
-                &accumulator,
-                account.clone(),
-                &prv_key_data,
-                None,
-                multisig_derivation_index,
-                network_id,
-            )
-            .await
-            .unwrap();
-            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
-                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
-                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
-                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
-                }
-            }
-        }
-
-        assert_eq!(accumulator.0.len(), 1, "single PSKT in bundle");
-        assert_eq!(accumulator.0[0].inputs.len(), 1, "single input per PSKT");
-        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k, "exactly K=2 signatures per input post-multi-cosigner sign");
-    }
-
-    /// Round-trips a K-of-N multisig with `locals` local cosigner seeds and
-    /// `externals` external xpubs (derived from in-session mnemonics) through
-    /// sign / finalize / extract on a synthetic PSKT. The extractor invokes the
-    /// consensus `TxScriptEngine` on every input, so passing this helper proves
-    /// the assembled signature script verifies under the multisig redeem-script's
-    /// `OpCheckMultiSig` at consensus rules -- the load-bearing property
-    /// `multisig_send_local_k_of_n_2_of_2` does not pin (it asserts only
-    /// `partial_sigs.len() == K` and never finalizes). The per-cell wrappers
-    /// below close the structural REPL-vs-integration coverage gap across the
-    /// full validation matrix and negatively-key against per-cosigner-position
-    /// BIP-32 derivation: a signer that derives each cosigner's signing key off
-    /// the cosigner's positional index rather than the multisig account's
-    /// persisted derivation index produces signing keys whose pubkey does not
-    /// match the redeem-script slot the cosigner occupies, returning `EvalFalse`
-    /// at extract time.
-    async fn run_multisig_send_extract_for_cell(locals: usize, externals: usize, k: u16) {
-        run_multisig_send_extract_for_cell_curve(locals, externals, k, false).await
-    }
-
-    async fn run_multisig_send_extract_for_cell_curve(locals: usize, externals: usize, k: u16, ecdsa: bool) {
-        let n_total = locals + externals;
-        assert!(n_total >= k as usize, "(N={n_total}, K={k}) violates K <= N");
-        let mnemonics = make_local_mnemonics(n_total).await;
-        let local_mnemonics: Vec<Mnemonic> = mnemonics[..locals].to_vec();
-        let external_mnemonics: &[Mnemonic] = &mnemonics[locals..];
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = local_mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let mut external_xpubs: Vec<String> = Vec::with_capacity(externals);
-        for em in external_mnemonics.iter() {
-            external_xpubs.push(external_xpub_for_testnet(em.phrase()).await);
-        }
-
-        let wallet = test_wallet().await;
-        let wallet_secret = Secret::new(vec![]);
-        let account =
-            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, external_xpubs, ecdsa).await.unwrap();
-
-        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
-        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
-        let network_id = wallet.network_id().unwrap();
-        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
-        assert_eq!(xpub_keys.len(), n_total, "multisig has N cosigner xpubs");
-        let multisig_derivation_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
-
-        // Build the receive[0] redeem-script externally by walking each cosigner xpub
-        // through the same unhardened tail (`multisig_derivation_index / receive / 0`)
-        // the `AddressDerivationManager` uses for the multisig's receive[0]. The synthetic
-        // UTXO's `script_pub_key` is the P2SH commitment to that redeem-script; consensus
-        // verifies the assembled signature script against it at `extract_tx`.
-        let mut receive_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
-        for xpub in xpub_keys.iter() {
-            let derived = xpub
-                .clone()
-                .derive_child(ChildNumber::new(multisig_derivation_index, false).unwrap())
-                .unwrap()
-                .derive_child(ChildNumber::new(0, false).unwrap())
-                .unwrap()
-                .derive_child(ChildNumber::new(0, false).unwrap())
-                .unwrap();
-            receive_pubkeys.push(*derived.public_key());
-        }
-        let redeem_script = if ecdsa {
-            multisig_redeem_script_ecdsa(receive_pubkeys.iter().map(|pk| pk.serialize()), k as usize).expect("ecdsa redeem script")
-        } else {
-            multisig_redeem_script(receive_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize)
-                .expect("schnorr redeem script")
-        };
-        let script_public_key = pay_to_script_hash_script(redeem_script.as_slice());
-
-        // Sanity-check: the externally-derived script_public_key matches the multisig's
-        // actual receive[0] address. Asserts the address-derivation pipeline reads the
-        // multisig at the persisted derivation index, the same value driving signing below.
-        let receive_address = account.receive_address().unwrap();
-        let receive_script = pay_to_address_script(&receive_address);
-        assert_eq!(
-            script_public_key, receive_script,
-            "(N={n_total}, K={k}) externally-derived redeem-script's P2SH must match the multisig's receive[0] address",
-        );
-
-        let utxo = kaspa_consensus_core::tx::UtxoEntry {
-            amount: 100_000_000,
-            script_public_key,
-            block_daa_score: 1,
-            is_coinbase: false,
-            covenant_id: None,
-        };
-        let input = InputBuilder::default()
-            .utxo_entry(utxo)
-            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
-                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xee; 32]),
-                index: 0,
-            })
-            .sig_op_count(n_total as u8)
-            .redeem_script(redeem_script)
-            .build()
-            .unwrap();
-        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
-        let pskt_inner = pskt_creator.constructor().input(input);
-        let mut accumulator = Bundle::from(pskt_inner);
-
-        let k_usize = k as usize;
-        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-        for prv_key_data_id in prv_key_data_ids.iter() {
-            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k_usize));
-            if all_full {
-                break;
-            }
-            let prv_key_data =
-                prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data loaded");
-            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
-                &accumulator,
-                account.clone(),
-                &prv_key_data,
-                None,
-                multisig_derivation_index,
-                network_id,
-            )
-            .await
-            .unwrap();
-            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
-                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
-                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
-                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
-                }
-            }
-        }
-
-        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k_usize, "(N={n_total}, K={k}) exactly K signatures accumulated",);
-
-        // Finalize, then extract -- the extractor runs `TxScriptEngine::execute()` per
-        // input. With per-cosigner-position derivation `extract_tx` would return
-        // Err(EvalFalse) because at least one signing key's pubkey would not match the
-        // redeem-script slot the cosigner occupies. With every cosigner deriving at the
-        // shared multisig derivation index, signatures verify, and `extract_tx` returns Ok.
-        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
-            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
-        let finalizer_pskt = signer_pskt.finalizer();
-        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
-        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
-        let params = Params::from(network_id);
-        let extract_result = extractor.extract_tx(&params);
-        assert!(
-            extract_result.is_ok(),
-            "(N={n_total}, K={k}) extract_tx must succeed under consensus script verify; got {extract_result:?}",
-        );
-    }
-
-    // Per-cell wrappers exercising the lead-named multisig validation matrix. Each cell
-    // closes the same structural REPL-vs-integration coverage gap on a different
-    // (locals, externals, K) topology; mixed-source cells (externals > 0) pin the
-    // create-with-external-xpub path the substrate-class topology exercises.
-    //
-    // The (1,1) cell is intentionally excluded: at `N = 1`, address derivation in
-    // `create_address` takes the single-key P2PK branch and emits a
-    // pay-to-pubkey address rather than a P2SH multisig. The helper exercises the
-    // `OpCheckMultiSig` consensus-script path, which the (1,1) cell does not reach;
-    // covering it requires a different harness shape on the P2PK send path and falls
-    // outside the OpCheckMultiSig-slot defect class the call-site derivation-index closes.
-
-    /// (N=2, K=2) cell, all-local cosigners.
-    #[tokio::test]
-    async fn multisig_send_extract_2_of_2() {
-        run_multisig_send_extract_for_cell(2, 0, 2).await;
-    }
-
-    /// (N=3, K=2) cell, 2 local + 1 external xpub.
-    #[tokio::test]
-    async fn multisig_send_extract_2_of_3_mixed_external() {
-        run_multisig_send_extract_for_cell(2, 1, 2).await;
-    }
-
-    /// (N=4, K=2) cell, 2 local + 2 external xpubs.
-    #[tokio::test]
-    async fn multisig_send_extract_2_of_4_mixed_external() {
-        run_multisig_send_extract_for_cell(2, 2, 2).await;
-    }
-
-    /// (N=5, K=3) cell, 3 local + 2 external xpubs.
-    #[tokio::test]
-    async fn multisig_send_extract_3_of_5_mixed_external() {
-        run_multisig_send_extract_for_cell(3, 2, 3).await;
-    }
-
-    /// (N=6, K=3) cell, 3 local + 3 external xpubs.
-    #[tokio::test]
-    async fn multisig_send_extract_3_of_6_mixed_external() {
-        run_multisig_send_extract_for_cell(3, 3, 3).await;
-    }
-
-    /// Drives an 8-of-15 multisig (8 local seeds + 7 external xpubs) end-to-end
-    /// through the same production PSKT-construction path the smaller cells use.
-    /// N=15 is the largest Schnorr P2SH cosigner count whose canonical redeem
-    /// script fits the consensus `max_script_element_size` PUSHDATA cap (the
-    /// `MAX_PUB_KEYS_PER_MUTLTISIG = 20` stack-pubkey cap is looser than the
-    /// element-size cap, so the effective Schnorr P2SH limit binds at N=15).
-    /// This cell pushes Finalizer reorder over the largest currently-shippable
-    /// xpub set.
-    #[tokio::test]
-    async fn multisig_send_extract_8_of_15_max_p2sh_element_size() {
-        run_multisig_send_extract_for_cell(8, 7, 8).await;
-    }
-
-    /// (N=2, K=2) ECDSA cell, all-local cosigners. Exercises the
-    /// `OpCheckMultiSigECDSA` consensus-script path through the same harness
-    /// the Schnorr cell uses, with `ecdsa=true` selecting the
-    /// `multisig_redeem_script_ecdsa` redeem-script builder + the
-    /// `PSKBSigner::sign_ecdsa` signing primitive.
-    #[tokio::test]
-    async fn multisig_send_extract_2_of_2_ecdsa() {
-        run_multisig_send_extract_for_cell_curve(2, 0, 2, true).await;
-    }
-
-    /// (N=3, K=2) ECDSA cell, 2 local + 1 external xpub.
-    #[tokio::test]
-    async fn multisig_send_extract_2_of_3_mixed_external_ecdsa() {
-        run_multisig_send_extract_for_cell_curve(2, 1, 2, true).await;
-    }
-
-    /// (N=5, K=3) ECDSA cell, 3 local + 2 external xpubs.
-    #[tokio::test]
-    async fn multisig_send_extract_3_of_5_mixed_external_ecdsa() {
-        run_multisig_send_extract_for_cell_curve(3, 2, 3, true).await;
-    }
+    // Removed: `multisig_send_local_k_of_n_2_of_2` and the
+    // `run_multisig_send_extract_for_cell[_curve]` parametric send-extract
+    // matrix (the 2-of-2 / 2-of-3 / 2-of-4 / 3-of-5 / 3-of-6 / 8-of-15 cells
+    // and their ECDSA variants). All gathered K signatures from K seeds held
+    // locally in one wallet -- the all-seeds-local operator-Send topology the
+    // registered one-seat-per-account model removes. K-of-N consensus extraction is covered
+    // through the production signing path by the cross-wallet `pskb_sign`
+    // exchange round-trip test, and the curve-aware redeem-script encoding by
+    // the predictor + populate-redeem-script tests; the (N,K) breadth on a
+    // live network is the Validator's cross-binary acceptance matrix.
 
     /// Wallet rejects a multisig with cosigner count well above the
     /// curve-aware cap at account-creation time rather than letting
@@ -3526,10 +3538,10 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
-        let n_total = cap + 1;
-        let mnemonics = make_local_mnemonics(n_total).await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await;
+        // Registered one-seat shape: one own seed + `cap` peer xpubs = cap+1 cosigners, one over the curve cap.
+        let own = make_local_mnemonics(1).await.remove(0);
+        let peers = external_xpubs_for_testnet(cap).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, (own, None), Some(0), 2, peers, false).await;
         let err = result.err().expect("above-cap import must reject");
         match err {
             Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
@@ -3547,10 +3559,10 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
         let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
-        let n_total = cap + 1;
-        let mnemonics = make_local_mnemonics(n_total).await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await;
+        // Registered one-seat shape: one own seed + `cap` peer xpubs = cap+1 cosigners, one over the curve cap.
+        let own = make_local_mnemonics(1).await.remove(0);
+        let peers = external_xpubs_for_testnet(cap).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, (own, None), Some(0), 2, peers, true).await;
         let err = result.err().expect("above-cap import must reject");
         match err {
             Error::MultisigCosignerCountExceedsStandardness { count, max, curve } => {
@@ -3567,10 +3579,12 @@ mod multisig_tests {
     async fn multisig_import_accepts_at_curve_cap_schnorr() {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
+        // Registered one-seat shape: one own seed + (cap-1) peer xpubs reaches the
+        // cosigner-count cap with a single local seat.
         let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
-        let mnemonics = make_local_mnemonics(cap).await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await;
+        let own = make_local_mnemonics(1).await;
+        let peers = external_xpubs_for_testnet(cap - 1).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, (own[0].clone(), None), Some(0), 2, peers, false).await;
         assert!(result.is_ok(), "Schnorr at-cap import must be accepted; got {:?}", result.err());
     }
 
@@ -3579,10 +3593,12 @@ mod multisig_tests {
     async fn multisig_import_accepts_at_curve_cap_ecdsa() {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
+        // Registered one-seat shape: one own seed + (cap-1) peer xpubs reaches the
+        // cosigner-count cap with a single local seat.
         let cap = max_multisig_cosigners(2, MultisigCurve::Ecdsa);
-        let mnemonics = make_local_mnemonics(cap).await;
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], true).await;
+        let own = make_local_mnemonics(1).await;
+        let peers = external_xpubs_for_testnet(cap - 1).await;
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, (own[0].clone(), None), Some(0), 2, peers, true).await;
         assert!(result.is_ok(), "ECDSA at-cap import must be accepted; got {:?}", result.err());
     }
 
@@ -3673,9 +3689,10 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result =
-            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![user_xpub_kpub], false).await;
+        let mnemonics_with_secrets = (mnemonics[0].clone(), None);
+        let result = wallet
+            .import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 2, vec![user_xpub_kpub], false)
+            .await;
         match result {
             Ok(_) => panic!("KPUB external xpub on Testnet wallet must reject at import-time"),
             Err(Error::MultisigXpubNetworkMismatch { supplied_prefix, wallet_network }) => {
@@ -3699,6 +3716,380 @@ mod multisig_tests {
         xpubs
     }
 
+    #[tokio::test]
+    async fn multisig_guarded_import_identifies_own_xpub_from_full_set() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let own_xpub = external_xpub_for_testnet(mnemonics[0].phrase()).await;
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let accounts = wallet
+            .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 2, vec![peer_xpub, own_xpub], false)
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1, "one own xpub in the submitted full set yields one local account");
+        let account = accounts.into_iter().next().unwrap();
+        assert_eq!(account.clone().as_derivation_capable().unwrap().account_index(), 0, "own xpub account index is preserved");
+        assert_eq!(account.xpub_keys().map(|keys| keys.len()), Some(2), "full cosigner set is stored without duplicating own xpub");
+    }
+
+    #[tokio::test]
+    async fn multisig_guarded_import_registers_all_matched_own_seats() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let own_index_0 = external_xpub_for_testnet_at(mnemonics[0].phrase(), 0).await;
+        let own_index_1 = external_xpub_for_testnet_at(mnemonics[0].phrase(), 1).await;
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let accounts = wallet
+            .import_multisig_with_mnemonic(
+                &wallet_secret,
+                (mnemonics[0].clone(), None),
+                None,
+                2,
+                vec![peer_xpub, own_index_1, own_index_0],
+                false,
+            )
+            .await
+            .unwrap();
+        assert_eq!(accounts.len(), 1, "every matched own xpub registers as a local seat of ONE account");
+        let account = accounts.into_iter().next().unwrap();
+        assert_eq!(
+            account.clone().as_derivation_capable().unwrap().account_index(),
+            0,
+            "the single account lands at the next free slot"
+        );
+        assert_eq!(account.xpub_keys().map(|keys| keys.len()), Some(3), "the full cosigner set registers once");
+
+        let prv = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_0 = prv.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap().to_string(Some(KeyPrefix::XPUB));
+        let own_1 = prv.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 1).await.unwrap().to_string(Some(KeyPrefix::XPUB));
+        let stored: Vec<String> = account.xpub_keys().unwrap().iter().map(|xpub| xpub.to_string(Some(KeyPrefix::XPUB))).collect();
+        assert!(stored.contains(&own_0) && stored.contains(&own_1), "both matched own xpubs are local seats of the single account",);
+
+        let exported =
+            wallet.store().wallet_export(&wallet_secret, WalletExportOptions { include_transactions: false }).await.unwrap();
+        let stored_wallet = storage::local::WalletStorage::try_from_slice(&exported).unwrap();
+        let stored_payload = stored_wallet.payload(&wallet_secret).unwrap();
+        let persisted_indexes = stored_payload
+            .accounts
+            .iter()
+            .filter(|storage| storage.kind.as_ref() == MULTISIG_ACCOUNT_KIND)
+            .map(|storage| crate::account::variants::multisig::Payload::try_load(storage).unwrap().account_index)
+            .collect::<Vec<_>>();
+        assert_eq!(persisted_indexes, vec![0], "exactly one multisig account persists, at the auto slot");
+
+        let lock = wallet.guard();
+        let guard = lock.lock().await;
+        let descriptor_indexes = wallet
+            .clone()
+            .account_descriptors(&guard)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|descriptor| descriptor.kind.as_ref() == MULTISIG_ACCOUNT_KIND)
+            .map(|descriptor| match descriptor.properties.get(&AccountDescriptorProperty::AccountIndex) {
+                Some(AccountDescriptorValue::U64(index)) => *index,
+                other => panic!("multisig descriptor must carry account_index, got {other:?}"),
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(descriptor_indexes, vec![0], "the account list exposes the single registration");
+    }
+
+    #[tokio::test]
+    async fn multisig_guarded_import_connected_registers_all_matched_own_seats_without_empty_scan_batches() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let own_index_0 = external_xpub_for_testnet_at(mnemonics[0].phrase(), 0).await;
+        let own_index_1 = external_xpub_for_testnet_at(mnemonics[0].phrase(), 1).await;
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let (wallet, mock) = test_wallet_with_mock_rpc().await;
+        let wallet_secret = Secret::new(vec![]);
+        mock.ctl().signal_open().await.unwrap();
+        wallet.start().await.unwrap();
+
+        let accounts = match wallet
+            .import_multisig_with_mnemonic(
+                &wallet_secret,
+                (mnemonics[0].clone(), None),
+                None,
+                2,
+                vec![peer_xpub, own_index_1, own_index_0],
+                false,
+            )
+            .await
+        {
+            Ok(accounts) => accounts,
+            Err(err) => {
+                let _ = wallet.stop().await;
+                panic!("connected guarded import must succeed, got {err:?}");
+            }
+        };
+        let returned_indexes =
+            accounts.iter().map(|account| account.clone().as_derivation_capable().unwrap().account_index()).collect::<Vec<_>>();
+
+        let active_indexes = wallet
+            .active_accounts()
+            .collect()
+            .iter()
+            .filter(|account| account.account_kind().as_ref() == MULTISIG_ACCOUNT_KIND)
+            .map(|account| account.clone().as_derivation_capable().unwrap().account_index())
+            .collect::<Vec<_>>();
+        let scan_batches = mock.utxo_request_sizes();
+
+        wallet.stop().await.unwrap();
+
+        assert_eq!(returned_indexes, vec![0], "connected import returns the single multi-seat account");
+        assert_eq!(active_indexes, vec![0], "the single multi-seat account is active");
+        assert!(!scan_batches.is_empty(), "connected account start must scan registered address batches");
+        assert!(
+            scan_batches.iter().all(|size| *size > 0),
+            "connected account start must not pass an empty address batch to UTXO registration: {scan_batches:?}",
+        );
+    }
+
+    #[tokio::test]
+    async fn multisig_guarded_import_rejects_peer_only_set_without_storing_key() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let result =
+            wallet.import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 1, vec![peer_xpub], false).await;
+        match result {
+            Err(Error::MultisigOwnXpubNotFound) => {}
+            Ok(_) => panic!("guarded import must reject when the full set does not contain the imported mnemonic's xpub"),
+            Err(other) => panic!("expected MultisigOwnXpubNotFound, got {other:?}"),
+        }
+        let stored_keys = wallet.store().as_prv_key_data_store().unwrap().iter().await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert!(stored_keys.is_empty(), "failed guarded import must not persist the imported key");
+    }
+
+    #[tokio::test]
+    async fn multisig_import_validates_before_storing_key() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let result = wallet
+            .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 3, vec![peer_xpub], false)
+            .await;
+        match result {
+            Err(Error::MultisigInvalidThreshold { k, n }) => {
+                assert_eq!(k, 3);
+                assert_eq!(n, 2);
+            }
+            Ok(_) => panic!("invalid threshold import must reject"),
+            Err(other) => panic!("expected MultisigInvalidThreshold, got {other:?}"),
+        }
+        let stored_keys = wallet.store().as_prv_key_data_store().unwrap().iter().await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert!(stored_keys.is_empty(), "validation failure must happen before private key storage");
+    }
+
+    #[tokio::test]
+    async fn multisig_go_boundary_distinct_group_reuses_embedded_seat_with_new_slot() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let own_xpub = external_xpub_for_testnet(mnemonics[0].phrase()).await;
+        let peers_1 = vec![external_xpub_for_testnet(mnemonics[1].phrase()).await];
+        let set_2 = vec![own_xpub, external_xpub_for_testnet(mnemonics[2].phrase()).await];
+
+        let first = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 1, peers_1, false)
+                .await
+                .unwrap(),
+        );
+        // The second distinct group proves the same embedded seat through the
+        // identification form and auto-lands at the next free slot.
+        let second = imported_account(
+            wallet.import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 1, set_2, false).await.unwrap(),
+        );
+        assert_eq!(first.clone().as_derivation_capable().unwrap().account_index(), 0, "first imported group lands in slot 0");
+        assert_eq!(second.clone().as_derivation_capable().unwrap().account_index(), 1, "second imported group lands in the next slot");
+        assert_eq!(
+            first.xpub_keys().unwrap()[0].attrs().child_number.index(),
+            0,
+            "the embedded derivation seat remains the imported xpub's seat"
+        );
+    }
+
+    /// The explicit import form is the SDK landing-slot capability: the
+    /// caller-chosen index is both the own-xpub derivation index and the
+    /// wallet-local slot the account lands at.
+    #[tokio::test]
+    async fn multisig_explicit_import_index_lands_at_that_slot() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peer = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(7), 2, vec![peer], false)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(account.clone().as_derivation_capable().unwrap().account_index(), 7, "the explicit index is the landing slot");
+        assert!(
+            account.xpub_keys().unwrap().iter().any(|x| x.attrs().child_number.index() == 7),
+            "the own xpub derives at the same explicit index",
+        );
+    }
+
+    #[tokio::test]
+    async fn multisig_public_guarded_import_distinct_group_reuses_embedded_seat_with_new_slot() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let own_xpub = external_xpub_for_testnet(mnemonics[0].phrase()).await;
+        let peer_1 = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let peer_2 = external_xpub_for_testnet(mnemonics[2].phrase()).await;
+
+        let first = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(
+                    &wallet_secret,
+                    (mnemonics[0].clone(), None),
+                    None,
+                    2,
+                    vec![own_xpub.clone(), peer_1],
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+        let second = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 2, vec![own_xpub, peer_2], false)
+                .await
+                .unwrap(),
+        );
+
+        let stored_accounts =
+            wallet.store().as_account_store().unwrap().iter(None).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(stored_accounts.len(), 2, "distinct groups sharing an embedded seat coexist in separate wallet slots");
+        assert_eq!(first.clone().as_derivation_capable().unwrap().account_index(), 0);
+        assert_eq!(second.clone().as_derivation_capable().unwrap().account_index(), 1);
+    }
+
+    #[tokio::test]
+    async fn multisig_public_guarded_import_rejects_duplicate_group_without_storing_key() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let own_xpub = external_xpub_for_testnet(mnemonics[0].phrase()).await;
+        let peer_1 = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        imported_account(
+            wallet
+                .import_multisig_with_mnemonic(
+                    &wallet_secret,
+                    (mnemonics[0].clone(), None),
+                    None,
+                    2,
+                    vec![own_xpub.clone(), peer_1.clone()],
+                    false,
+                )
+                .await
+                .unwrap(),
+        );
+        let result = wallet
+            .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 2, vec![own_xpub, peer_1], false)
+            .await;
+        match result {
+            Err(Error::MultisigGroupAlreadyExists { .. }) => {}
+            Ok(_) => panic!("public guarded import must reject an already-registered multisig group"),
+            Err(other) => panic!("expected MultisigGroupAlreadyExists, got {other:?}"),
+        }
+
+        let stored_accounts =
+            wallet.store().as_account_store().unwrap().iter(None).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(stored_accounts.len(), 1, "duplicate-group rejection must not store a second account");
+    }
+
+    /// Create-path mirror of the guarded-import duplicate-group rejection:
+    /// registering the same (xpub set, K, curve) group twice through
+    /// `create_account_multisig` rejects with the error naming the existing
+    /// account and stores nothing on the second attempt.
+    #[tokio::test]
+    async fn multisig_create_rejects_duplicate_group_without_storing_account() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let own = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_id = own.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, own).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(own_id, None)],
+                vec![peer.clone()],
+                None,
+                2,
+                false,
+                Some(0),
+            )
+            .await
+            .unwrap();
+        let result = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(own_id, None)], vec![peer], None, 2, false, Some(0))
+            .await;
+        match result {
+            Err(Error::MultisigGroupAlreadyExists { .. }) => {}
+            Ok(_) => panic!("create must reject an already-registered multisig group"),
+            Err(other) => panic!("expected MultisigGroupAlreadyExists, got {other:?}"),
+        }
+
+        let stored_accounts =
+            wallet.store().as_account_store().unwrap().iter(None).await.unwrap().try_collect::<Vec<_>>().await.unwrap();
+        assert_eq!(stored_accounts.len(), 1, "create-path duplicate-group rejection must not store a second account");
+    }
+
+    /// The seat auto-assign scan enumerates the embedded indexes of the
+    /// key's stored own xpubs, never the wallet-local slot values: two
+    /// groups backed by the same key at embedded index 0 occupy slots
+    /// {0, 1}, yet the next free derivation index is 1, not 2.
+    #[tokio::test]
+    async fn multisig_next_seat_scan_reads_xpub_seats_not_slots() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let own_xpub = external_xpub_for_testnet(mnemonics[0].phrase()).await;
+        let peer_1 = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let set_2 = vec![own_xpub, external_xpub_for_testnet(mnemonics[2].phrase()).await];
+
+        let first = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 1, vec![peer_1], false)
+                .await
+                .unwrap(),
+        );
+        // Second group at the same embedded index through the identification
+        // form: the slot auto-assigns to 1 while the seat stays 0.
+        let second = imported_account(
+            wallet.import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), None, 1, set_2, false).await.unwrap(),
+        );
+        assert_eq!(first.clone().as_derivation_capable().unwrap().account_index(), 0, "first group lands in slot 0");
+        assert_eq!(second.clone().as_derivation_capable().unwrap().account_index(), 1, "second group lands in slot 1");
+
+        let prv_key_data =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let used = wallet.used_multisig_seat_indexes_for_key(&prv_key_data, None).await.unwrap();
+        assert_eq!(used, HashSet::from([0]), "both groups are backed by embedded index 0");
+        let next_seat = wallet.next_multisig_seat_index_for_key(&prv_key_data, None).await.unwrap();
+        assert_eq!(next_seat, 1, "seat auto-assign skips only the embedded index, not the occupied slots");
+    }
+
     /// Import-path mirror of `multisig_create_rejects_pub_key_count_above_consensus_max`.
     /// One local mnemonic plus `MAX_PUB_KEYS_PER_MUTLTISIG` external xpubs
     /// lifts the merged cosigner count one above the consensus
@@ -3714,8 +4105,8 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, externals, false).await;
+        let mnemonics_with_secrets = (mnemonics[0].clone(), None);
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 2, externals, false).await;
         let cap = max_multisig_cosigners(2, MultisigCurve::Schnorr);
         match result {
             Err(Error::MultisigCosignerCountExceedsStandardness { count, max, curve }) => {
@@ -3738,8 +4129,8 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 3, externals, false).await;
+        let mnemonics_with_secrets = (mnemonics[0].clone(), None);
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 3, externals, false).await;
         match result {
             Err(Error::MultisigInvalidThreshold { k, n }) => {
                 assert_eq!(k, 3, "rejection names the supplied K");
@@ -3763,8 +4154,8 @@ mod multisig_tests {
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 1, externals, false).await;
+        let mnemonics_with_secrets = (mnemonics[0].clone(), None);
+        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, Some(0), 1, externals, false).await;
         // The curve-aware standardness guard fires
         // BEFORE the lower-level element-size guard. Cap=15 for Schnorr
         // K=1 today; N=16 is the boundary `cap+1` value.
@@ -3780,13 +4171,10 @@ mod multisig_tests {
         }
     }
 
-    /// Import-path mirror of `multisig_create_rejects_duplicate_xpubs`. A
-    /// mnemonic and an external xpub that re-derives the same key (the
-    /// canonical form of the mnemonic's multisig xpub, re-prefixed to
-    /// KTUB so it passes the cross-network gate) collapse to the same
-    /// redeem-script slot after canonicalization. The wallet import API
-    /// must reject so a single signer cannot satisfy K of those slots and
-    /// silently weaken the K-of-N threshold guarantee.
+    /// Import-path mirror of `multisig_create_rejects_duplicate_xpubs`.
+    /// The import API accepts a submitted xpub that re-derives the mnemonic's
+    /// own multisig xpub, treating it as the own entry instead of a duplicate.
+    /// It still rejects duplicates among distinct peer xpubs.
     #[tokio::test]
     async fn multisig_import_rejects_duplicate_xpubs() {
         let mnemonic = make_local_mnemonics(1).await.pop().unwrap();
@@ -3795,16 +4183,40 @@ mod multisig_tests {
         let canonical = generated_xpub.to_string(Some(KeyPrefix::XPUB));
         let mut reprefixed = ExtendedKey::from_str(&canonical).unwrap();
         reprefixed.prefix = KeyPrefix::KTUB;
-        let external = reprefixed.to_string();
+        let own_external = reprefixed.to_string();
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let result = wallet.import_multisig_with_mnemonic(&wallet_secret, vec![(mnemonic, None)], 1, vec![external], false).await;
+        let accounts = wallet
+            .import_multisig_with_mnemonic(&wallet_secret, (mnemonic.clone(), None), Some(0), 1, vec![own_external], false)
+            .await
+            .expect("own-entry xpub in the submitted set must import");
+        assert_eq!(accounts.len(), 1, "own-entry xpub registers one local account");
+        let account = accounts.into_iter().next().unwrap();
+        assert_eq!(account.clone().as_derivation_capable().unwrap().account_index(), 0, "own-entry account index is preserved");
+        assert_eq!(account.xpub_keys().map(|keys| keys.len()), Some(1), "own-entry xpub is stored once");
+
+        let peer_canonical = xpub_from_mnemonic_phrase(&reference_phrase_12(0x00)).await;
+        let mut peer_reprefixed = ExtendedKey::from_str(&peer_canonical).unwrap();
+        peer_reprefixed.prefix = KeyPrefix::KTUB;
+        let peer_external = peer_reprefixed.to_string();
+
+        let wallet = test_wallet().await;
+        let result = wallet
+            .import_multisig_with_mnemonic(
+                &wallet_secret,
+                (mnemonic, None),
+                Some(0),
+                1,
+                vec![peer_external.clone(), peer_external],
+                false,
+            )
+            .await;
         match result {
             Err(Error::MultisigDuplicateXpub { xpub: dup }) => {
-                assert_eq!(dup, canonical, "rejection names the duplicate xpub in canonical XPUB form");
+                assert_eq!(dup, peer_canonical, "rejection names the distinct duplicate peer xpub in canonical XPUB form");
             }
-            Ok(_) => panic!("import with duplicate xpub must reject"),
+            Ok(_) => panic!("import with distinct duplicate peer xpub must reject"),
             Err(other) => panic!("expected MultisigDuplicateXpub, got {other:?}"),
         }
     }
@@ -3953,25 +4365,27 @@ mod multisig_tests {
     /// Finalizer's `Some` branch assembles a consensus-clean P2SH-multisig
     /// `script_sig`, and `extract_tx` returns `Ok`.
     #[tokio::test]
-    async fn multisig_send_extract_via_pskt_generator_2_of_3_mixed_external() {
+    async fn multisig_send_extract_via_pskt_generator_1_of_3_mixed_external() {
         use crate::account::variants::multisig::build_multisig_signed_bundle;
         use crate::tx::{Fees, GeneratorSettings, PaymentDestination, PaymentOutputs};
         use crate::utils::kaspa_to_sompi;
         use crate::utxo::UtxoEntryReference;
 
+        // One own seed + two peer xpubs form a 1-of-3
+        // group, so the local seat's single signature completes the spend
+        // and the production PSKT-conversion path is driven end-to-end through
+        // extract.
         let mnemonics = make_local_mnemonics(3).await;
-        let local_a = mnemonics[0].clone();
-        let local_b = mnemonics[1].clone();
-        let external_xpub = external_xpub_for_testnet(mnemonics[2].phrase()).await;
+        let own = mnemonics[0].clone();
+        let peer_b = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let peer_c = external_xpub_for_testnet(mnemonics[2].phrase()).await;
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = vec![(local_a, None), (local_b, None)];
-        let account =
-            wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![external_xpub], false).await.unwrap();
+        let account = imported_account(
+            wallet.import_multisig_with_mnemonic(&wallet_secret, (own, None), Some(0), 1, vec![peer_b, peer_c], false).await.unwrap(),
+        );
 
-        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
-        let prv_key_data_ids: Vec<PrvKeyDataId> = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").as_ref().clone();
         let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
         let xpub_keys_strings: Vec<String> = xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
         let network_id = wallet.network_id().unwrap();
@@ -3999,7 +4413,7 @@ mod multisig_tests {
             network_id,
             multiplexer: None,
             sig_op_count: xpub_keys.len() as u8,
-            minimum_signatures: 2,
+            minimum_signatures: 1,
             change_address: receive_address.clone(),
             utxo_iterator: utxo_iter,
             source_utxo_context: None,
@@ -4012,19 +4426,10 @@ mod multisig_tests {
         };
 
         let abortable = Abortable::default();
-        let (bundle, _summary) = build_multisig_signed_bundle(
-            account.clone(),
-            xpub_keys_strings,
-            prv_key_data_ids,
-            2,
-            settings,
-            wallet_secret,
-            None,
-            &abortable,
-            None,
-        )
-        .await
-        .expect("build_multisig_signed_bundle: signed bundle through production conversion path");
+        let (bundle, _summary) =
+            build_multisig_signed_bundle(account.clone(), xpub_keys_strings, 1, settings, wallet_secret, None, &abortable, None)
+                .await
+                .expect("build_multisig_signed_bundle: signed bundle through production conversion path");
 
         assert!(!bundle.0.is_empty(), "bundle has at least one PSKT");
         for pskt_inner in bundle.0.iter() {
@@ -4033,7 +4438,7 @@ mod multisig_tests {
                     input.redeem_script.is_some(),
                     "every input populates redeem_script via the population block in build_multisig_signed_bundle",
                 );
-                assert_eq!(input.partial_sigs.len(), 2, "exactly K=2 signatures per input");
+                assert_eq!(input.partial_sigs.len(), 1, "exactly K=1 signature per input (single local master seat)");
             }
         }
 
@@ -4139,19 +4544,10 @@ mod multisig_tests {
         };
 
         let abortable = Abortable::default();
-        let (bundle, _summary) = build_multisig_signed_bundle(
-            account.clone(),
-            xpub_keys_strings,
-            prv_key_data_ids,
-            k,
-            settings,
-            wallet_secret,
-            None,
-            &abortable,
-            None,
-        )
-        .await
-        .expect("build_multisig_signed_bundle: L<K cosigner-split topology returns Ok with a partial bundle");
+        let (bundle, _summary) =
+            build_multisig_signed_bundle(account.clone(), xpub_keys_strings, k, settings, wallet_secret, None, &abortable, None)
+                .await
+                .expect("build_multisig_signed_bundle: L<K cosigner-split topology returns Ok with a partial bundle");
 
         assert!(!bundle.0.is_empty(), "partial bundle has at least one PSKT");
         for pskt_inner in bundle.0.iter() {
@@ -4179,14 +4575,230 @@ mod multisig_tests {
     /// for a multisig imported with unencrypted local cosigner keys.
     #[tokio::test]
     async fn multisig_account_encryption_query_returns_unencrypted() {
+        // Registered one-seat shape: one own seed + one peer xpub. The encryption
+        // query iterates the local seat set (length one here).
         let mnemonics = make_local_mnemonics(2).await;
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, vec![peer_xpub], false)
+                .await
+                .unwrap(),
+        );
 
         let result = wallet.is_account_key_encrypted(&account).await.expect("multi-id account encryption query succeeds");
         assert_eq!(result, Some(false), "unencrypted local cosigner keys yield Some(false)");
+    }
+
+    /// A multisig account's local cosigner seat references the imported
+    /// key's own `PrvKeyDataId`. Importing one own mnemonic + a peer xpub
+    /// records exactly one local seat, and it equals the id derived from
+    /// the imported mnemonic.
+    #[tokio::test]
+    async fn multisig_local_seat_references_imported_key() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peer = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let expected_id =
+            PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, wallet.store().encryption_kind().unwrap()).unwrap().id;
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, vec![peer], false)
+                .await
+                .unwrap(),
+        );
+        let multisig: Arc<MultiSig> = account.downcast_arc().expect("account is multisig");
+        let local_seat = multisig.prv_key_data_ids().as_ref().expect("local seat present").as_ref();
+        assert_eq!(local_seat.len(), 1, "a registered multisig account carries exactly one local seat");
+        assert_eq!(local_seat[0], expected_id, "the local cosigner seat is the imported key's own PrvKeyDataId");
+    }
+
+    /// A watch-only multisig account (all external cosigner xpubs, no
+    /// own seed) carries no local seat and reports the `multisig-watch`
+    /// feature.
+    #[tokio::test]
+    async fn multisig_watch_only_has_no_local_seat() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let externals = external_xpubs_for_testnet(2).await;
+        let account = wallet.create_account_multisig(&wallet_secret, vec![], externals, None, 2, false, None).await.unwrap();
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        assert!(multisig.prv_key_data_ids().is_none(), "a watch-only multisig holds no local seat");
+        assert_eq!(account.feature(), Some("multisig-watch".to_string()), "watch-only multisig reports the multisig-watch feature");
+    }
+
+    /// The multisig signing path sources the local cosigner key from the
+    /// account's own seat. A 1-of-N group (one own key + N-1 peer xpubs,
+    /// K=1) signs a synthetic PSKT; the produced partial signature's pubkey
+    /// is the own key's slot pubkey derived at the multisig leaf path.
+    #[tokio::test]
+    async fn multisig_send_signs_from_local_seat() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peer = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        // K=1 so the single local seat alone closes the quorum.
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 1, vec![peer], false)
+                .await
+                .unwrap(),
+        );
+
+        // Synthetic single-input PSKT at the multisig's receive[0] address.
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0x5a; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let bundle = Bundle::from(pskt_creator.constructor().input(input));
+
+        let signed = account.clone().pskb_sign(&bundle, wallet_secret.clone(), None, None).await.unwrap();
+        let signed_input = &signed.as_ref()[0].inputs[0];
+        assert_eq!(signed_input.partial_sigs.len(), 1, "K=1 group closes with the single local-seat signature");
+        let signing_pubkey = *signed_input.partial_sigs.keys().next().unwrap();
+
+        // The expected signing key is the imported own key derived at the
+        // multisig slot path; confirm the signature came from that key.
+        let own_key =
+            PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, wallet.store().encryption_kind().unwrap()).unwrap();
+        let cosigner_index = account.clone().as_derivation_capable().unwrap().cosigner_index();
+        let own_xpub = own_key.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let own_slot_pubkey = *own_xpub
+            .derive_child(ChildNumber::new(cosigner_index, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(0, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(0, false).unwrap())
+            .unwrap()
+            .public_key();
+        assert_eq!(signing_pubkey, own_slot_pubkey, "the multisig signature is produced by the own key's derived slot pubkey");
+    }
+
+    /// Importing one own mnemonic + peer xpubs registers the full
+    /// cosigner set with exactly one local seat (the operator's own key).
+    #[tokio::test]
+    async fn import_multisig_single_mnemonic_plus_peer_xpubs() {
+        let mnemonics = make_local_mnemonics(1).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peers = external_xpubs_for_testnet(2).await;
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, peers, false)
+                .await
+                .unwrap(),
+        );
+        assert_eq!(account.xpub_keys().expect("multisig xpubs").len(), 3, "1 own + 2 peers = 3 cosigners");
+        let multisig: Arc<MultiSig> = account.downcast_arc().expect("account is multisig");
+        assert_eq!(multisig.prv_key_data_ids().as_ref().expect("local seat").len(), 1, "exactly one local seat (the own key)");
+    }
+
+    /// The imported own mnemonic is stored as its own separately-encrypted
+    /// wallet key entry, and the account's local seat references it.
+    #[tokio::test]
+    async fn import_multisig_stores_own_key() {
+        let mnemonics = make_local_mnemonics(1).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peers = external_xpubs_for_testnet(1).await;
+        let expected_id =
+            PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, wallet.store().encryption_kind().unwrap()).unwrap().id;
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, peers, false)
+                .await
+                .unwrap(),
+        );
+        let stored = wallet.store().as_prv_key_data_store().unwrap().load_key_data(&wallet_secret, &expected_id).await.unwrap();
+        assert!(stored.is_some(), "the imported own mnemonic is stored under its own PrvKeyDataId");
+        let multisig: Arc<MultiSig> = account.downcast_arc().expect("account is multisig");
+        assert_eq!(
+            multisig.prv_key_data_ids().as_ref().expect("local seat")[0],
+            expected_id,
+            "the account's local seat references the stored key",
+        );
+    }
+
+    /// Importing a SECOND DISTINCT own key into an existing wallet
+    /// succeeds: the wallet is a multi-key container, and each registered
+    /// multisig group references its own separately-encrypted key entry.
+    #[tokio::test]
+    async fn import_multisig_second_distinct_key_accepted() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peers_a = external_xpubs_for_testnet(1).await;
+        let account_a = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, peers_a, false)
+                .await
+                .unwrap(),
+        );
+        // A different own mnemonic = a second distinct key entry -> accepted.
+        let peers_b = external_xpubs_for_testnet(1).await;
+        let account_b = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[1].clone(), None), Some(0), 2, peers_b, false)
+                .await
+                .unwrap(),
+        );
+        assert_ne!(account_a.id(), account_b.id(), "the two groups are distinct accounts");
+        let seat = |account: Arc<dyn Account>| {
+            let multisig: Arc<MultiSig> = account.downcast_arc().expect("account is multisig");
+            multisig.prv_key_data_ids().as_ref().expect("local seat")[0]
+        };
+        assert_ne!(seat(account_a), seat(account_b), "each group references its own distinct key entry");
+    }
+
+    /// Re-importing the SAME own key (a second cosigner group from the
+    /// same seed) is idempotent on the key entry -- it succeeds, the key is
+    /// reused rather than re-stored, and the two groups share one backing
+    /// key.
+    #[tokio::test]
+    async fn import_multisig_same_key_reimport_idempotent() {
+        let mnemonics = make_local_mnemonics(1).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peers_1 = external_xpubs_for_testnet(1).await;
+        let account_1 = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, peers_1, false)
+                .await
+                .unwrap(),
+        );
+
+        // Same own key, a different cosigner group (distinct peers) -> succeeds.
+        let peers_2 = external_xpubs_for_testnet(1).await;
+        let account_2 = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, peers_2, false)
+                .await
+                .unwrap(),
+        );
+        let seat = |account: Arc<dyn Account>| {
+            let multisig: Arc<MultiSig> = account.downcast_arc().expect("account is multisig");
+            multisig.prv_key_data_ids().as_ref().expect("local seat")[0]
+        };
+        assert_eq!(seat(account_1.clone()), seat(account_2.clone()), "both groups reference the same reused key entry");
+        assert_ne!(account_1.id(), account_2.id(), "the two groups are distinct accounts (distinct cosigner sets / account_index)");
     }
 
     /// A 1-of-1 multisig account (1 cosigner xpub, 1 local mnemonic, Schnorr)
@@ -4232,17 +4844,22 @@ mod multisig_tests {
     /// family the local wallet itself sits at.
     #[tokio::test]
     async fn multisig_pskt_per_input_derivation_path_attribution() {
-        // Operator-Send 2-of-2 (all-local) so the funded family equals the
-        // local family at the LOCAL receive address. The attribution path's
-        // load-bearing invariant is the structural shape, not which family
-        // index lands in the path slot; the cross-family path slot is
-        // exercised by the round-trip test below against a peer-family
-        // synthetic UTXO.
+        // One-seat 2-of-2 (one own seed + one peer xpub) funding the
+        // LOCAL receive address, so the funded family equals the local
+        // cosigner's family. The attribution path's load-bearing invariant is
+        // the structural shape, not which family index lands in the path slot;
+        // the cross-family path slot is exercised by the round-trip test below
+        // against a peer-family synthetic UTXO.
         let mnemonics = make_local_mnemonics(2).await;
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, vec![peer_xpub], false)
+                .await
+                .unwrap(),
+        );
 
         let receive_address = account.receive_address().unwrap();
         let script_public_key = pay_to_address_script(&receive_address);
@@ -4275,11 +4892,10 @@ mod multisig_tests {
         crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut bundle, 2).await.unwrap();
 
         let populated = &bundle.as_ref()[0].inputs[0].bip32_derivations;
-        assert_eq!(populated.len(), 1, "populate_multisig_redeem_scripts writes exactly one bip32_derivations entry per input");
+        assert!(!populated.is_empty(), "populate_multisig_redeem_scripts records bip32_derivations attribution");
 
         let derivation_capable = account.clone().as_derivation_capable().unwrap();
         let local_cosigner_index = derivation_capable.cosigner_index();
-        let account_index = derivation_capable.account_index();
         let funded_family_index = derivation_capable.derivation().address_family_index(&receive_address).unwrap();
         assert_eq!(
             funded_family_index.0, local_cosigner_index,
@@ -4298,15 +4914,16 @@ mod multisig_tests {
             .derive_child(ChildNumber::new(funded_family_index.2, false).unwrap())
             .unwrap()
             .public_key();
-        let (recorded_pubkey, recorded_key_source) = populated.iter().next().unwrap();
-        assert_eq!(*recorded_pubkey, local_slot_pubkey, "bip32_derivations key equals the local cosigner's slot pubkey");
+        let recorded_key_source =
+            populated.get(&local_slot_pubkey).expect("bip32_derivations includes the local cosigner slot pubkey");
 
         let key_source = recorded_key_source.as_ref().expect("KeySource attribution is present");
         let expected_fingerprint = local_xpub.fingerprint();
         assert_eq!(key_source.key_fingerprint, expected_fingerprint, "key_fingerprint matches the local xpub fingerprint");
 
+        let seat_index = local_xpub.attrs().child_number.index();
         let expected_path: kaspa_bip32::DerivationPath = format!(
-            "m/45'/111111'/{account_index}'/{}/{}/{}",
+            "m/45'/111111'/{seat_index}'/{}/{}/{}",
             funded_family_index.0,
             funded_family_index.1.index(),
             funded_family_index.2
@@ -4316,118 +4933,14 @@ mod multisig_tests {
         assert_eq!(key_source.derivation_path, expected_path, "derivation_path encodes the funded family's leaf");
     }
 
-    /// Two-of-three cosigner-split round-trip against a peer-cosigner-prefix
-    /// family address. The local wallet holds all three seeds (operator-Send
-    /// shape) so the test can drive every cosigner's signature in-process,
-    /// but funds a *non-local* family's receive[0] (`cosigner_index != local
-    /// MinimumCosignerIndex`) to force the cross-family code path. The
-    /// signer derives each cosigner's xprv at the per-input
-    /// `bip32_derivations.derivation_path` (the funded family's leaf), and
-    /// the resulting K-of-N script-sig must extract under
-    /// `TxScriptEngine`. Without the family-aware lookup and per-input
-    /// derivation, the redeem-script's slot pubkeys would be derived at the
-    /// local cosigner_index path and the script would `EvalFalse` at
-    /// consensus extract.
-    #[tokio::test]
-    async fn multisig_pskb_sign_cosigner_split_two_of_three_round_trip() {
-        let mnemonics = make_local_mnemonics(3).await;
-        let wallet = test_wallet().await;
-        let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let k: u16 = 2;
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, k, vec![], false).await.unwrap();
-
-        // Pick a peer-family index distinct from the local cosigner_index so
-        // the test exercises the cross-family path. With three xpubs sorted
-        // lexicographically, the local MinimumCosignerIndex is one of {0,1,2};
-        // every other index in [0,3) is a peer family.
-        let derivation_capable = account.clone().as_derivation_capable().unwrap();
-        let derivation = derivation_capable.derivation();
-        let families = derivation.address_manager_families();
-        assert_eq!(families.len(), 3, "2-of-3 multisig exposes three cosigner-prefix families");
-        let local_cosigner_index = derivation_capable.cosigner_index();
-        let peer_family = families.iter().find(|f| f.cosigner_index != local_cosigner_index).expect("at least one peer family");
-        let peer_receive_address = peer_family.receive.current_address().unwrap();
-        assert_ne!(peer_receive_address, account.receive_address().unwrap(), "peer family's receive address differs from local");
-
-        // Synthetic UTXO at the peer family's receive[0]. The funded-address
-        // P2SH script_public_key commits to a redeem-script the helper
-        // builds from the peer family's path.
-        let script_public_key = pay_to_address_script(&peer_receive_address);
-        let utxo = kaspa_consensus_core::tx::UtxoEntry {
-            amount: 100_000_000,
-            script_public_key,
-            block_daa_score: 1,
-            is_coinbase: false,
-            covenant_id: None,
-        };
-        let input = InputBuilder::default()
-            .utxo_entry(utxo)
-            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
-                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xfe; 32]),
-                index: 0,
-            })
-            .sig_op_count(3)
-            .build()
-            .unwrap();
-        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
-        let pskt_inner = pskt_creator.constructor().input(input);
-        let mut accumulator = Bundle::from(pskt_inner);
-
-        // Populate redeem_script + bip32_derivations using the peer family's
-        // derivation path -- the field the per-cosigner signer below
-        // consumes for per-input xprv derivation.
-        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut accumulator, k).await.unwrap();
-
-        // Sign with each local cosigner; the K-cap break-out gate exits
-        // after K=2 partial signatures land on the input.
-        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
-        let prv_key_data_ids = multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").clone();
-        let network_id = wallet.network_id().unwrap();
-        let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-        let k_usize = k as usize;
-        for prv_key_data_id in prv_key_data_ids.iter() {
-            let all_full = accumulator.iter().all(|p| p.inputs.iter().all(|i| i.partial_sigs.len() >= k_usize));
-            if all_full {
-                break;
-            }
-            let prv_key_data = prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await.unwrap().expect("prv_key_data");
-            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
-                &accumulator,
-                account.clone(),
-                &prv_key_data,
-                None,
-                local_cosigner_index,
-                network_id,
-            )
-            .await
-            .unwrap();
-            for (pskt_idx, signed_pskt_inner) in per_cosigner_bundle.0.into_iter().enumerate() {
-                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
-                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
-                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
-                }
-            }
-        }
-        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k_usize, "exactly K=2 partial signatures landed on the input");
-
-        // Finalize + extract: the extractor runs `TxScriptEngine::execute()`
-        // per input against the peer-family redeem-script. Per-cosigner
-        // signing keys derived at the local cosigner_index path would
-        // `EvalFalse` here; the per-input attribution makes the script
-        // verify.
-        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
-            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
-        let finalizer_pskt = signer_pskt.finalizer();
-        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
-        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
-        let params = Params::from(network_id);
-        let extract_result = extractor.extract_tx(&params);
-        assert!(
-            extract_result.is_ok(),
-            "cosigner-split 2-of-3 cross-family extract_tx must succeed under consensus script verify; got {extract_result:?}",
-        );
-    }
+    // Removed: `multisig_pskb_sign_cosigner_split_two_of_three_round_trip`. It
+    // held all three cosigner seeds in one wallet to drive a cross-family
+    // K-of-N extract in-process -- the all-seeds-local topology the
+    // registered one-seat-per-account model removes. The production multi-wallet exchange (one
+    // seat per wallet) is covered by the L=1 round-trip below; the
+    // cross-family redeem-script derivation is covered by the per-input
+    // attribution test above; cross-family extract on a live network is the
+    // Validator's cross-binary acceptance matrix.
 
     /// Production-topology cosigner-split round-trip: three independent
     /// wallets each holding exactly ONE local seed (`L = 1`, `K = 2`,
@@ -4768,59 +5281,6 @@ mod multisig_tests {
                 );
             }
         }
-    }
-
-    /// Operator-Send byte-identity gate. A multisig account whose local
-    /// cosigner set is all of the N seeds (no externals) places
-    /// `MinimumCosignerIndex` at the smallest sorted position of the local
-    /// xpubs, which is also 0 for the all-local set. The derivation path
-    /// applies that same index step to every cosigner's xpub when
-    /// assembling the redeem-script, producing a byte-identical P2SH
-    /// address. Pins the derivation-rule NO-CHANGE invariant against an
-    /// independently-computed canonical xpub-walk reference.
-    #[tokio::test]
-    async fn multisig_operator_send_canonical_byte_identity() {
-        // Deterministic constant-fill 24-word mnemonics reproducible across runs.
-        let mnemonics = [mnemonic_24_from_fill(0xa1), mnemonic_24_from_fill(0xb2)];
-        let wallet = test_wallet().await;
-        let wallet_secret = Secret::new(vec![]);
-        let mnemonics_with_secrets: Vec<(Mnemonic, Option<Secret>)> = mnemonics.iter().cloned().map(|m| (m, None)).collect();
-        let account = wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_with_secrets, 2, vec![], false).await.unwrap();
-
-        // Operator-Send invariant: with all seeds local the smallest
-        // sorted-position across local xpubs equals 0.
-        let derivation_capable = account.clone().as_derivation_capable().unwrap();
-        let local_cosigner_index = derivation_capable.cosigner_index();
-        assert_eq!(local_cosigner_index, 0, "operator-Send (all seeds local) sets MinimumCosignerIndex to 0 by construction");
-
-        // Independently rebuild the receive[0] script_public_key from the
-        // canonical xpub-walk using the derivation rule
-        // (`derive_child(0).derive_child(receive=0).derive_child(0)` on
-        // each cosigner xpub). Any divergence at the derivation layer
-        // would surface here as an address mismatch against the canonical
-        // externally-built P2SH script.
-        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
-        let mut slot_pubkeys: Vec<secp256k1::PublicKey> = Vec::with_capacity(xpub_keys.len());
-        for xpub in xpub_keys.iter() {
-            let derived = xpub
-                .clone()
-                .derive_child(ChildNumber::new(0, false).unwrap())
-                .unwrap()
-                .derive_child(ChildNumber::new(0, false).unwrap())
-                .unwrap()
-                .derive_child(ChildNumber::new(0, false).unwrap())
-                .unwrap();
-            slot_pubkeys.push(*derived.public_key());
-        }
-        let redeem_script = multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), 2).unwrap();
-        let expected_script = pay_to_script_hash_script(redeem_script.as_slice());
-
-        let receive_address = account.receive_address().unwrap();
-        let actual_script = pay_to_address_script(&receive_address);
-        assert_eq!(
-            expected_script, actual_script,
-            "operator-Send receive[0] script_public_key must match the canonical xpub-walk's P2SH commitment byte-for-byte",
-        );
     }
 
     /// A 1-of-1 multisig account with `ecdsa=true` derives a P2PK-ECDSA
@@ -5165,29 +5625,33 @@ mod multisig_tests {
     /// verbatim.
     #[tokio::test]
     async fn multisig_account_index_auto_assign_monotonic() {
-        async fn create_with_auto_assign(wallet: &Arc<Wallet>, wallet_secret: &Secret) -> Arc<dyn Account> {
-            let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-            let mut prv_key_data_args: Vec<PrvKeyDataArgs> = Vec::with_capacity(2);
-            for mnemonic in make_local_mnemonics(2).await {
-                let prv_key_data = PrvKeyData::try_new_from_mnemonic(mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap();
-                let id = prv_key_data.id;
-                prv_key_data_store.store(wallet_secret, prv_key_data).await.unwrap();
-                prv_key_data_args.push(PrvKeyDataArgs::new(id, None));
-            }
-            wallet.inner.store.commit(wallet_secret).await.unwrap();
-            wallet.create_account_multisig(wallet_secret, prv_key_data_args, vec![], None, 2, false, None).await.unwrap()
+        // One local key backs every group: each multisig account reuses the
+        // same own key at a distinct auto-assigned account_index,
+        // each paired with a fresh peer xpub.
+        async fn create_with_auto_assign(wallet: &Arc<Wallet>, wallet_secret: &Secret, master_id: PrvKeyDataId) -> Arc<dyn Account> {
+            let peer = external_xpubs_for_testnet(1).await.remove(0);
+            wallet
+                .create_account_multisig(wallet_secret, vec![PrvKeyDataArgs::new(master_id, None)], vec![peer], None, 2, false, None)
+                .await
+                .unwrap()
         }
 
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
-        let account_a = create_with_auto_assign(&wallet, &wallet_secret).await;
+        let master =
+            PrvKeyData::try_new_from_mnemonic(make_local_mnemonics(1).await.remove(0), None, EncryptionKind::XChaCha20Poly1305)
+                .unwrap();
+        let master_id = master.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, master).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let account_a = create_with_auto_assign(&wallet, &wallet_secret, master_id).await;
         assert_eq!(
             account_a.clone().as_derivation_capable().unwrap().account_index(),
             0,
             "first multisig account auto-assigns to account_index=0",
         );
 
-        let account_b = create_with_auto_assign(&wallet, &wallet_secret).await;
+        let account_b = create_with_auto_assign(&wallet, &wallet_secret, master_id).await;
         assert_eq!(
             account_b.clone().as_derivation_capable().unwrap().account_index(),
             1,
@@ -5243,23 +5707,26 @@ mod multisig_tests {
         let wallet = test_wallet().await;
         let wallet_secret = Secret::new(vec![]);
 
-        let mnemonics = make_local_mnemonics(2).await;
+        // One own key + one peer xpub; the two
+        // accounts differ only by auto-assigned account_index.
         let prv_key_data_store = wallet.store().as_prv_key_data_store().unwrap();
-        let prv_key_data_a = PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
-        let prv_key_data_b = PrvKeyData::try_new_from_mnemonic(mnemonics[1].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
-        let id_a = prv_key_data_a.id;
-        let id_b = prv_key_data_b.id;
-        prv_key_data_store.store(&wallet_secret, prv_key_data_a.clone()).await.unwrap();
-        prv_key_data_store.store(&wallet_secret, prv_key_data_b.clone()).await.unwrap();
+        let master =
+            PrvKeyData::try_new_from_mnemonic(make_local_mnemonics(1).await.remove(0), None, EncryptionKind::XChaCha20Poly1305)
+                .unwrap();
+        let master_id = master.id;
+        prv_key_data_store.store(&wallet_secret, master.clone()).await.unwrap();
         wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer = external_xpubs_for_testnet(1).await.remove(0);
 
-        let create_args = vec![PrvKeyDataArgs::new(id_a, None), PrvKeyDataArgs::new(id_b, None)];
-        let account_0 =
-            wallet.create_account_multisig(&wallet_secret, create_args.clone(), vec![], None, 2, false, None).await.unwrap();
+        let create_args = vec![PrvKeyDataArgs::new(master_id, None)];
+        let account_0 = wallet
+            .create_account_multisig(&wallet_secret, create_args.clone(), vec![peer.clone()], None, 2, false, None)
+            .await
+            .unwrap();
         let derivation_capable_0 = account_0.clone().as_derivation_capable().unwrap();
         assert_eq!(derivation_capable_0.account_index(), 0, "first multisig account is at account_index=0");
 
-        let account_1 = wallet.create_account_multisig(&wallet_secret, create_args, vec![], None, 2, false, None).await.unwrap();
+        let account_1 = wallet.create_account_multisig(&wallet_secret, create_args, vec![peer], None, 2, false, None).await.unwrap();
         let derivation_capable_1 = account_1.clone().as_derivation_capable().unwrap();
         assert_eq!(derivation_capable_1.account_index(), 1, "second multisig account auto-assigns to account_index=1");
 
@@ -5276,8 +5743,8 @@ mod multisig_tests {
         // property: knowledge of the xpub at account_index=0 does not yield
         // the xpub at account_index=1 because the hardened step at
         // `account_index'` consumes the parent xprv (not the parent xpub).
-        let parent_xpub_at_0 = prv_key_data_a.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
-        let parent_xpub_at_1 = prv_key_data_a.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 1).await.unwrap();
+        let parent_xpub_at_0 = master.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap();
+        let parent_xpub_at_1 = master.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 1).await.unwrap();
         assert_ne!(
             parent_xpub_at_0.to_string(Some(KeyPrefix::XPUB)),
             parent_xpub_at_1.to_string(Some(KeyPrefix::XPUB)),
@@ -5530,9 +5997,829 @@ mod multisig_tests {
         assert!(summary_line.contains("1 had non-zero balance"), "summary names the accurate non-zero count: {summary_line}");
     }
 
+    // ----- account_index as the per-cosigner private group selector -----
+
+    /// One local key joins two independent cosigner groups (distinct peer
+    /// sets). Each group auto-assigns its own `account_index`; the two groups
+    /// derive distinct addresses though they share the one local seed -- the
+    /// BIP-87 one-seed-many-groups capability, with no key reuse across
+    /// groups (the hardened `account_index'` step isolates them).
+    #[tokio::test]
+    async fn multisig_two_groups_distinct_account_index_one_seed() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let master =
+            PrvKeyData::try_new_from_mnemonic(make_local_mnemonics(1).await.remove(0), None, EncryptionKind::XChaCha20Poly1305)
+                .unwrap();
+        let master_id = master.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, master).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // Two DISTINCT peer groups, each from fresh peer xpubs.
+        let group_a_peers = external_xpubs_for_testnet(1).await;
+        let group_b_peers = external_xpubs_for_testnet(1).await;
+
+        let group_a = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(master_id, None)], group_a_peers, None, 2, false, None)
+            .await
+            .unwrap();
+        let group_b = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(master_id, None)], group_b_peers, None, 2, false, None)
+            .await
+            .unwrap();
+
+        assert_eq!(group_a.clone().as_derivation_capable().unwrap().account_index(), 0, "first group auto-assigns account_index=0");
+        assert_eq!(
+            group_b.clone().as_derivation_capable().unwrap().account_index(),
+            1,
+            "second group auto-assigns account_index=1 -- one seed, distinct private group selectors",
+        );
+
+        assert_ne!(
+            group_a.receive_address().unwrap(),
+            group_b.receive_address().unwrap(),
+            "the two groups derive distinct addresses though they share the one local key",
+        );
+
+        // Both groups reference exactly the SAME single local key (no
+        // second key entry is introduced by joining a second group).
+        let ms_a: Arc<MultiSig> = group_a.downcast_arc().expect("group a is multisig");
+        let ms_b: Arc<MultiSig> = group_b.downcast_arc().expect("group b is multisig");
+        assert_eq!(ms_a.prv_key_data_ids().as_ref().expect("local seat").as_ref(), &[master_id]);
+        assert_eq!(ms_b.prv_key_data_ids().as_ref().expect("local seat").as_ref(), &[master_id]);
+    }
+
+    /// One wallet can hold every local key of a single multisig group by
+    /// registering one account per own key: each account carries one
+    /// local seat plus the peer xpub set, both accounts pin the same
+    /// account index, and the byte-identical shared address falls out of
+    /// the sorted cosigner-xpub set. Each account then contributes its
+    /// seat's signature to one PSKB, so a K-of-N exchange can complete
+    /// entirely inside the wallet with no cross-wallet transfer --
+    /// capability parity with an all-keys-local keyfile wallet, expressed
+    /// through the one-seat-per-account model.
+    #[tokio::test]
+    async fn multisig_two_local_seats_via_one_account_reach_threshold() {
+        // A 2-of-3 group where one wallet owns TWO of the three cosigner
+        // keys; the third cosigner is external (xpub only).
+        let mnemonics = make_local_mnemonics(3).await;
+        let k: u16 = 2;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let own_a = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_b = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[1].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_a_id = own_a.id;
+        let own_b_id = own_b.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, own_a).await.unwrap();
+        store.store(&wallet_secret, own_b).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let xpub_peer = external_xpub_for_testnet(mnemonics[2].phrase()).await;
+
+        // One account owns two local cosigner seats and one peer xpub. The
+        // duplicate-group guard rejects "one account per local seat"; the
+        // supported representation for L=2 is one group account carrying
+        // both local key ids.
+        let account = wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(own_a_id, None), PrvKeyDataArgs::new(own_b_id, None)],
+                vec![xpub_peer],
+                None,
+                k,
+                false,
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        assert_eq!(
+            multisig.prv_key_data_ids().as_ref().expect("local seats").as_ref(),
+            &[own_a_id, own_b_id],
+            "one group account carries both local cosigner seats",
+        );
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs");
+        let prv_store = wallet.store().as_prv_key_data_store().unwrap();
+        let prv_a = prv_store.load_key_data(&wallet_secret, &own_a_id).await.unwrap().expect("seat a prv_key_data");
+        let prv_b = prv_store.load_key_data(&wallet_secret, &own_b_id).await.unwrap().expect("seat b prv_key_data");
+        let derived_a = prv_a.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap().to_string(Some(KeyPrefix::XPUB));
+        let derived_b = prv_b.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await.unwrap().to_string(Some(KeyPrefix::XPUB));
+        let cosigner_index_a =
+            xpub_keys.iter().position(|xpub| xpub.to_string(Some(KeyPrefix::XPUB)) == derived_a).expect("seat a xpub is in group")
+                as u32;
+        let cosigner_index_b =
+            xpub_keys.iter().position(|xpub| xpub.to_string(Some(KeyPrefix::XPUB)) == derived_b).expect("seat b xpub is in group")
+                as u32;
+        assert_ne!(cosigner_index_a, cosigner_index_b, "each local key resolves its own distinct cosigner slot");
+
+        let derivation = account.clone().as_derivation_capable().unwrap().derivation();
+        let mut family_addresses = Vec::new();
+        for family in derivation.address_manager_families() {
+            family_addresses.push(family.receive.current_address().unwrap());
+        }
+        assert_eq!(family_addresses.len(), 3, "a 2-of-3 group exposes one address family per cosigner slot");
+
+        // Fund the originating seat's family receive address; the other
+        // seat recovers the funded family path from the bundle.
+        let shared_address = account.receive_address().unwrap();
+        assert!(family_addresses.contains(&shared_address), "the funded receive address is one of the group's family addresses",);
+
+        // Synthetic UTXO at the shared address.
+        let script_public_key = pay_to_address_script(&shared_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xa7; 32]),
+                index: 0,
+            })
+            .sig_op_count(3)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut accumulator, k).await.unwrap();
+
+        // Both seats sign the one PSKB from the one wallet; the partial
+        // signature count walks 1 -> K with no cross-wallet exchange.
+        let network_id = wallet.network_id().unwrap();
+        for (seat_index, (prv, cosigner_index, expected_sigs)) in
+            [(prv_a, cosigner_index_a, 1usize), (prv_b, cosigner_index_b, k as usize)].into_iter().enumerate()
+        {
+            let signed = pskb_signer_for_multisig_cosigner(&accumulator, account.clone(), &prv, None, cosigner_index, network_id)
+                .await
+                .unwrap();
+            for (pskt_idx, signed_pskt_inner) in signed.0.into_iter().enumerate() {
+                for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                    let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                    accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+                }
+            }
+            assert_eq!(
+                accumulator.0[0].inputs[0].partial_sigs.len(),
+                expected_sigs,
+                "seat {seat_index} lands its signature; the in-wallet bundle accumulates toward the threshold",
+            );
+        }
+
+        // Finalize + extract under consensus script verification: the
+        // threshold gathered inside one wallet closes the K-of-N spend.
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
+            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let params = Params::from(network_id);
+        let extract_result = extractor.extract_tx(&params);
+        assert!(
+            extract_result.is_ok(),
+            "two local seats via one account reach the K=2 threshold in one wallet; got {extract_result:?}",
+        );
+    }
+
+    /// `Wallet::next_multisig_account_index` resolves the next wallet-local
+    /// slot (no operator coordination): an empty wallet auto-assigns to `0`,
+    /// and the next group advances to `1`. This pins the slot assignment
+    /// used by watch-only multisig creation and by the import landing path;
+    /// the create wizard's `<enter>` branch resolves the derivation index
+    /// through the per-key scan instead.
+    #[tokio::test]
+    async fn multisig_wizard_auto_assigns_account_index() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let master =
+            PrvKeyData::try_new_from_mnemonic(make_local_mnemonics(1).await.remove(0), None, EncryptionKind::XChaCha20Poly1305)
+                .unwrap();
+        let master_id = master.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, master).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // Empty wallet: the auto-assign resolves to 0 (the wizard's <enter> path).
+        assert_eq!(wallet.next_multisig_account_index().await.unwrap(), 0, "first multisig group auto-assigns to account_index=0");
+
+        let peer = external_xpubs_for_testnet(1).await.remove(0);
+        let account = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(master_id, None)], vec![peer], None, 2, false, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            account.clone().as_derivation_capable().unwrap().account_index(),
+            0,
+            "auto-assigned first group lands at account_index=0"
+        );
+
+        // After one group exists, the next auto-assign advances to 1 (cosigners
+        // never agree on this integer out of band).
+        assert_eq!(wallet.next_multisig_account_index().await.unwrap(), 1, "next multisig group auto-assigns to account_index=1");
+    }
+
+    /// `account_index` is the cosigner's PRIVATE per-group selector: it sets
+    /// the BIP-32 account level at which the wallet derives its own contributed
+    /// xpub, but it does NOT enter the shared group derivation (redeem script /
+    /// address), which depends only on the agreed cosigner-xpub set + the
+    /// cosigner_index/child path. Two watch-only registrations of the SAME
+    /// cosigner-xpub set therefore derive the SAME group address regardless of
+    /// the `account_index` each carries -- so cosigners need not coordinate it.
+    #[tokio::test]
+    async fn multisig_account_index_is_private_not_coordinated() {
+        let wallet_secret = Secret::new(vec![]);
+        // A fixed, shared cosigner-xpub set (3 peers); no local seat
+        // (watch-only), so the registered set is exactly these strings --
+        // independent of any account_index.
+        let shared_xpubs = external_xpubs_for_testnet(3).await;
+
+        // Two INDEPENDENT wallets register the SAME cosigner-xpub set as a
+        // watch-only multisig group, but at DIFFERENT account_index values.
+        // Separate wallets avoid the account-id collision that two
+        // same-cosigner-set accounts in one wallet would hit -- itself
+        // evidence that account_index is not a coordinated group parameter.
+        let wallet_a = test_wallet().await;
+        let group_at_index_0 =
+            wallet_a.create_account_multisig(&wallet_secret, vec![], shared_xpubs.clone(), None, 2, false, Some(0)).await.unwrap();
+        let wallet_b = test_wallet().await;
+        let group_at_index_7 =
+            wallet_b.create_account_multisig(&wallet_secret, vec![], shared_xpubs.clone(), None, 2, false, Some(7)).await.unwrap();
+
+        assert_eq!(group_at_index_0.clone().as_derivation_capable().unwrap().account_index(), 0);
+        assert_eq!(group_at_index_7.clone().as_derivation_capable().unwrap().account_index(), 7);
+
+        assert_eq!(
+            group_at_index_0.receive_address().unwrap(),
+            group_at_index_7.receive_address().unwrap(),
+            "the shared group address depends only on the cosigner-xpub set + cosigner_index/child path -- NOT on the private per-cosigner account_index",
+        );
+    }
+
+    // ----- ECDSA multisig redeem-script shape -----
+
+    /// The ECDSA multisig spending redeem script byte-matches the canonical
+    /// `OpCheckMultiSigECDSA` + 33-byte-compressed-pubkey builder.
+    /// Hardcoding the 32-byte
+    /// Schnorr builder for every account would mismatch an
+    /// ECDSA-derived P2SH address and produce an EvalFalse at extract; the
+    /// negative control below pins that the ECDSA script is NOT the Schnorr
+    /// shape.
+    #[tokio::test]
+    async fn ecdsa_multisig_redeem_script_matches_go() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let prv_key_data =
+            storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer_xpub = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        let k: u16 = 2;
+        let account = wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(prv_key_data.id, None)],
+                vec![peer_xpub],
+                None,
+                k,
+                true,
+                None,
+            )
+            .await
+            .unwrap();
+        assert!(account.ecdsa(), "precondition: ECDSA multisig account");
+
+        let receive_address = account.receive_address().unwrap();
+        assert_eq!(receive_address.version, kaspa_addresses::Version::ScriptHash, "2-of-2 ECDSA multisig derives a P2SH address",);
+
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xec; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut bundle = Bundle::from(pskt_inner);
+
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut bundle, k).await.unwrap();
+        let redeem_script = bundle.as_ref()[0].inputs[0].redeem_script.clone().expect("redeem script populated");
+
+        // Recompute the slot pubkeys at the funded family path and rebuild the
+        // canonical ECDSA redeem script; assert byte-equality with what the
+        // account's spending path emitted.
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        let (funded_cosigner_index, address_type, address_index) =
+            derivation_capable.derivation().address_family_index(&receive_address).unwrap();
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let mut slot_pubkeys = Vec::with_capacity(xpub_keys.len());
+        for xpub in xpub_keys.iter() {
+            let derived = xpub
+                .clone()
+                .derive_child(ChildNumber::new(funded_cosigner_index, false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(address_type.index(), false).unwrap())
+                .unwrap()
+                .derive_child(ChildNumber::new(address_index, false).unwrap())
+                .unwrap();
+            slot_pubkeys.push(*derived.public_key());
+        }
+        for pk in slot_pubkeys.iter() {
+            assert_eq!(pk.serialize().len(), 33, "ECDSA cosigner pubkey serializes to 33 compressed bytes");
+        }
+        let expected = multisig_redeem_script_ecdsa(slot_pubkeys.iter().map(|pk| pk.serialize()), k as usize).unwrap();
+        assert_eq!(
+            redeem_script, expected,
+            "ECDSA multisig redeem script matches the canonical OpCheckMultiSigECDSA + 33-byte-pubkey builder",
+        );
+
+        // Negative control: the 32-byte x-only Schnorr builder over the same
+        // slots produces a DIFFERENT script -- the exact mismatch a
+        // hardcoded-Schnorr path produces against an ECDSA-derived P2SH address.
+        let schnorr_shape =
+            multisig_redeem_script(slot_pubkeys.iter().map(|pk| pk.x_only_public_key().0.serialize()), k as usize).unwrap();
+        assert_ne!(redeem_script, schnorr_shape, "ECDSA redeem script must not equal the 32-byte Schnorr shape");
+    }
+
+    /// Funds-path round-trip: a 2-of-2 ECDSA multisig group formed by two
+    /// independent single-seat wallets derives a P2SH address, and a K-of-N
+    /// spend of that address finalizes + extracts under consensus script
+    /// verification. This is the end-to-end guarantee that the ECDSA spending
+    /// redeem script byte-matches the ECDSA-derived P2SH address -- the
+    /// property a hardcoded-Schnorr redeem script would break (EvalFalse).
+    #[tokio::test]
+    async fn ecdsa_multisig_address_round_trip() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let k: u16 = 2;
+        let wallet_secret = Secret::new(vec![]);
+
+        let mut wallets_and_accounts: Vec<(Arc<Wallet>, Arc<dyn Account>)> = Vec::with_capacity(2);
+        for i in 0..2 {
+            let mut peers = Vec::with_capacity(1);
+            for (j, peer_mnemonic) in mnemonics.iter().enumerate() {
+                if j == i {
+                    continue;
+                }
+                peers.push(external_xpub_for_testnet(peer_mnemonic.phrase()).await);
+            }
+            let wallet = test_wallet().await;
+            let prv_key_data =
+                storage::PrvKeyData::try_new_from_mnemonic(mnemonics[i].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+            let store = wallet.store().as_prv_key_data_store().unwrap();
+            store.store(&wallet_secret, prv_key_data.clone()).await.unwrap();
+            wallet.inner.store.commit(&wallet_secret).await.unwrap();
+            let account = wallet
+                .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(prv_key_data.id, None)], peers, None, k, true, None)
+                .await
+                .unwrap();
+            assert!(account.ecdsa(), "wallet {i} account is ECDSA");
+            wallets_and_accounts.push((wallet, account));
+        }
+
+        for (_, account) in wallets_and_accounts.iter() {
+            let derivation = account.clone().as_derivation_capable().unwrap().derivation();
+            for family in derivation.address_manager_families() {
+                let _ = family.receive.current_address().unwrap();
+            }
+        }
+
+        let (alice_wallet, alice_account) = (wallets_and_accounts[0].0.clone(), wallets_and_accounts[0].1.clone());
+        let alice_address = alice_account.receive_address().unwrap();
+        assert_eq!(alice_address.version, kaspa_addresses::Version::ScriptHash, "2-of-2 ECDSA multisig derives a P2SH address",);
+        let alice_cosigner_index = alice_account.clone().as_derivation_capable().unwrap().cosigner_index();
+
+        let script_public_key = pay_to_address_script(&alice_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xe2; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut accumulator = Bundle::from(pskt_inner);
+
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(alice_account.clone(), &mut accumulator, k)
+            .await
+            .unwrap();
+
+        let network_id = alice_wallet.network_id().unwrap();
+        let alice_multisig: Arc<MultiSig> = alice_account.clone().downcast_arc().expect("alice account is multisig");
+        let alice_prv_id = alice_multisig.prv_key_data_ids().as_ref().expect("alice local ids").as_ref()[0];
+        let alice_prv = alice_wallet
+            .store()
+            .as_prv_key_data_store()
+            .unwrap()
+            .load_key_data(&wallet_secret, &alice_prv_id)
+            .await
+            .unwrap()
+            .expect("alice prv_key_data");
+        let alice_signed =
+            pskb_signer_for_multisig_cosigner(&accumulator, alice_account.clone(), &alice_prv, None, alice_cosigner_index, network_id)
+                .await
+                .unwrap();
+        for (pskt_idx, signed_pskt_inner) in alice_signed.0.into_iter().enumerate() {
+            for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+            }
+        }
+
+        let (bob_wallet, bob_account) = (wallets_and_accounts[1].0.clone(), wallets_and_accounts[1].1.clone());
+        let bob_cosigner_index = bob_account.clone().as_derivation_capable().unwrap().cosigner_index();
+        let bob_multisig: Arc<MultiSig> = bob_account.clone().downcast_arc().expect("bob account is multisig");
+        let bob_prv_id = bob_multisig.prv_key_data_ids().as_ref().expect("bob local ids").as_ref()[0];
+        let bob_prv = bob_wallet
+            .store()
+            .as_prv_key_data_store()
+            .unwrap()
+            .load_key_data(&wallet_secret, &bob_prv_id)
+            .await
+            .unwrap()
+            .expect("bob prv_key_data");
+        let bob_signed =
+            pskb_signer_for_multisig_cosigner(&accumulator, bob_account.clone(), &bob_prv, None, bob_cosigner_index, network_id)
+                .await
+                .unwrap();
+        for (pskt_idx, signed_pskt_inner) in bob_signed.0.into_iter().enumerate() {
+            for (input_idx, signed_input) in signed_pskt_inner.inputs.into_iter().enumerate() {
+                let accum_input = std::mem::take(&mut accumulator.0[pskt_idx].inputs[input_idx]);
+                accumulator.0[pskt_idx].inputs[input_idx] = (accum_input + signed_input).unwrap();
+            }
+        }
+        assert_eq!(accumulator.0[0].inputs[0].partial_sigs.len(), k as usize, "both ECDSA cosigners signed -> K=2 quorum");
+
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> =
+            PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(accumulator.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let params = Params::from(network_id);
+        let extract_result = extractor.extract_tx(&params);
+        assert!(
+            extract_result.is_ok(),
+            "2-of-2 ECDSA multisig extract_tx must succeed under consensus script verify; got {extract_result:?}",
+        );
+    }
+
+    // ----- cosigner sort + account_index=0 + open guard -----
+
+    /// kaspa normalizes every cosigner xpub to the canonical XPUB prefix
+    /// before sorting, so a full-string sort and a prefix-stripped-body sort
+    /// produce the SAME cosigner ordering. Equal ordering => equal
+    /// cosigner_index => equal redeem-script slot assignment => identical
+    /// group addresses (the cross-binary sort burden; the live cross-check
+    /// is the Validator's cross-binary round-trip).
+    #[tokio::test]
+    async fn cosigner_sort_matches_go_wallet() {
+        // Distinct constant fills give deterministic, distinct xpubs.
+        let fills: [u8; 4] = [0x4d, 0x1e, 0x36, 0x27];
+        let mut generated = Vec::with_capacity(fills.len());
+        for fill in fills {
+            generated.push(xpub_from_mnemonic_phrase(mnemonic_24_from_fill(fill).phrase()).await);
+        }
+        generated.sort_unstable();
+
+        // kaspa's normalize + full-string sort over the XPUB-canonical set.
+        let kaspa_order = normalize_and_merge_xpubs(Vec::new(), &generated, 2, MultisigCurve::Schnorr, NetworkType::Testnet).unwrap();
+
+        // Reference comparator: sort by the prefix-stripped body.
+        let mut go_order = kaspa_order.clone();
+        go_order.sort_unstable_by(|l, r| l.split_at(kaspa_bip32::Prefix::LENGTH).1.cmp(r.split_at(kaspa_bip32::Prefix::LENGTH).1));
+
+        assert_eq!(kaspa_order, go_order, "kaspa cosigner ordering matches the prefix-stripped-body sort for the shared key set");
+
+        // Every entry shares one canonical prefix -- the property that makes
+        // the full-string and body sorts coincide within kaspa.
+        let first_prefix = kaspa_order[0].split_at(kaspa_bip32::Prefix::LENGTH).0.to_string();
+        assert!(
+            kaspa_order.iter().all(|x| x.split_at(kaspa_bip32::Prefix::LENGTH).0 == first_prefix),
+            "every cosigner xpub is normalized to one canonical prefix before sorting",
+        );
+    }
+
+    /// At `account_index = 0`, kaspa's multisig derivation uses the default
+    /// path `m/45'/111111'/0'` (MultiSigPurpose = 45, CoinType = 111111,
+    /// account hardcoded `0'`). This pins the path-level cross-binary
+    /// contract in-tree; the empirical byte-identity of the derived ADDRESS
+    /// against the peer binary's output is the Validator's live cross-binary
+    /// round-trip, since the peer ships no in-tree golden-address vector at
+    /// the unit layer.
+    #[tokio::test]
+    async fn multisig_account_index_zero_byte_identical_to_go() {
+        let mnemonics = make_local_mnemonics(2).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let peer = external_xpub_for_testnet(mnemonics[1].phrase()).await;
+
+        // Auto-assign on the first multisig account resolves to 0 (go's
+        // hardcoded account `0'`).
+        let account = imported_account(
+            wallet
+                .import_multisig_with_mnemonic(&wallet_secret, (mnemonics[0].clone(), None), Some(0), 2, vec![peer], false)
+                .await
+                .unwrap(),
+        );
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        assert_eq!(
+            derivation_capable.account_index(),
+            0,
+            "first multisig account is at account_index=0 (go defaultPath account level)"
+        );
+
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0x45; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let mut bundle = Bundle::from(pskt_inner);
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut bundle, 2).await.unwrap();
+
+        let (funded_cosigner_index, address_type, address_index) =
+            derivation_capable.derivation().address_family_index(&receive_address).unwrap();
+        let (_pubkey, key_source) = bundle.as_ref()[0].inputs[0].bip32_derivations.iter().next().expect("a derivation entry");
+        let key_source = key_source.as_ref().expect("KeySource present");
+        let expected_path: kaspa_bip32::DerivationPath =
+            format!("m/45'/111111'/0'/{funded_cosigner_index}/{}/{address_index}", address_type.index()).parse().unwrap();
+        assert_eq!(key_source.derivation_path, expected_path, "account_index=0 derivation path uses account level m/45'/111111'/0'",);
+
+        // Determinism: re-deriving the receive address yields identical bytes.
+        assert_eq!(account.receive_address().unwrap(), receive_address, "account_index=0 derivation is deterministic");
+    }
+
+    /// The multisig on-disk format carries no private-key material: the
+    /// `AccountStorage.prv_key_data_ids` wrapper persists the account's
+    /// local seat -- `Multiple([own_id])` for a
+    /// local-seat account, `None` for watch-only. The Borsh `AccountStorage`
+    /// round-trips byte-stably.
+    #[tokio::test]
+    async fn multisig_storage_unchanged_on_disk_format() {
+        use crate::storage::AccountStorage;
+        use crate::storage::keydata::AssocPrvKeyDataIds;
+
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let master =
+            PrvKeyData::try_new_from_mnemonic(make_local_mnemonics(1).await.remove(0), None, EncryptionKind::XChaCha20Poly1305)
+                .unwrap();
+        let master_id = master.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, master).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        // Local-seat account: wrapper persists as Multiple([own_id]).
+        let peer = external_xpubs_for_testnet(1).await.remove(0);
+        let local = wallet
+            .create_account_multisig(&wallet_secret, vec![PrvKeyDataArgs::new(master_id, None)], vec![peer], None, 2, false, None)
+            .await
+            .unwrap();
+        let local_storage = local.to_storage().unwrap();
+        match &local_storage.prv_key_data_ids {
+            AssocPrvKeyDataIds::Multiple(ids) => {
+                assert_eq!(ids.as_ref(), &vec![master_id], "local-seat wrapper persists the account's own key id")
+            }
+            other => panic!("local-seat multisig wrapper must be Multiple with the own key id, got {other:?}"),
+        }
+        // Borsh round-trip the AccountStorage; bytes survive serialize/deserialize.
+        let bytes = borsh::to_vec(&local_storage).unwrap();
+        let restored = <AccountStorage as borsh::BorshDeserialize>::try_from_slice(&bytes).unwrap();
+        let rebytes = borsh::to_vec(&restored).unwrap();
+        assert_eq!(bytes, rebytes, "AccountStorage Borsh round-trip is byte-stable");
+
+        // Watch-only account (no local seat): wrapper is None.
+        let watch_peers = external_xpubs_for_testnet(2).await;
+        let watch = wallet.create_account_multisig(&wallet_secret, vec![], watch_peers, None, 2, false, None).await.unwrap();
+        let watch_storage = watch.to_storage().unwrap();
+        assert!(matches!(watch_storage.prv_key_data_ids, AssocPrvKeyDataIds::None), "watch-only multisig wrapper is None");
+    }
+
+    // ----- multi-key wallet container: account-level mnemonic import -----
+
+    /// A wallet holds many separately-encrypted keys: importing a SECOND
+    /// DISTINCT mnemonic as a single-sig account succeeds and stores a
+    /// second key entry alongside the first.
+    #[tokio::test]
+    async fn import_with_mnemonic_second_distinct_key_creates_second_account() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonics = make_local_mnemonics(2).await;
+
+        let account_a =
+            wallet.import_with_mnemonic(&wallet_secret, None, mnemonics[0].clone(), BIP32_ACCOUNT_KIND.into(), false).await.unwrap();
+        let account_b =
+            wallet.import_with_mnemonic(&wallet_secret, None, mnemonics[1].clone(), BIP32_ACCOUNT_KIND.into(), false).await.unwrap();
+        assert_ne!(account_a.id(), account_b.id(), "two distinct keys yield two distinct accounts");
+
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        for mnemonic in mnemonics {
+            let id = PrvKeyData::try_new_from_mnemonic(mnemonic, None, wallet.store().encryption_kind().unwrap()).unwrap().id;
+            assert!(store.load_key_data(&wallet_secret, &id).await.unwrap().is_some(), "each imported key is stored under its own id");
+        }
+    }
+
+    /// The engine import path accepts a 12-word seed: both word counts the
+    /// wallet's mnemonic codec supports import as single-sig accounts, store
+    /// their key entries, and derive a receive address.
+    #[tokio::test]
+    async fn import_with_mnemonic_accepts_twelve_word_seed() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let twelve = Mnemonic::random(kaspa_bip32::WordCount::Words12, Language::English).unwrap();
+        assert_eq!(twelve.phrase().split_whitespace().count(), 12, "generator yields a 12-word phrase");
+
+        let account =
+            wallet.import_with_mnemonic(&wallet_secret, None, twelve.clone(), BIP32_ACCOUNT_KIND.into(), false).await.unwrap();
+        let address = account.receive_address().unwrap();
+        assert!(!address.to_string().is_empty(), "12-word import derives a receive address");
+
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        let id = PrvKeyData::try_new_from_mnemonic(twelve, None, wallet.store().encryption_kind().unwrap()).unwrap().id;
+        assert!(store.load_key_data(&wallet_secret, &id).await.unwrap().is_some(), "the 12-word key is stored under its own id");
+    }
+
+    /// An account imported from a mnemonic derives the same first receive
+    /// address as an account created from the same stored key, so import
+    /// and create are two routes to one derivation contract.
+    #[tokio::test]
+    async fn import_with_mnemonic_address_matches_create_from_same_key() {
+        let mnemonic = make_local_mnemonics(1).await.remove(0);
+        let wallet_secret = Secret::new(vec![]);
+
+        let wallet_import = test_wallet().await;
+        let imported = wallet_import
+            .import_with_mnemonic(&wallet_secret, None, mnemonic.clone(), BIP32_ACCOUNT_KIND.into(), false)
+            .await
+            .unwrap();
+
+        let wallet_create = test_wallet().await;
+        let prv_key_data =
+            PrvKeyData::try_new_from_mnemonic(mnemonic, None, wallet_create.store().encryption_kind().unwrap()).unwrap();
+        let prv_key_data_id = prv_key_data.id;
+        wallet_create.store().as_prv_key_data_store().unwrap().store(&wallet_secret, prv_key_data).await.unwrap();
+        wallet_create.inner.store.commit(&wallet_secret).await.unwrap();
+        let args = crate::wallet::args::AccountCreateArgsBip32::new(None, Some(0), false);
+        let created = wallet_create.create_account_bip32(&wallet_secret, prv_key_data_id, None, args).await.unwrap();
+
+        assert_eq!(
+            imported.receive_address().unwrap(),
+            created.receive_address().unwrap(),
+            "import-from-mnemonic and create-from-same-key derive the same first receive address",
+        );
+    }
+
+    /// The legacy (12-word KDX) variant restores a legacy-kind account.
+    #[tokio::test]
+    async fn import_with_mnemonic_legacy_restores_account() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = Mnemonic::random(kaspa_bip32::WordCount::Words12, Language::English).unwrap();
+        let account = wallet.import_with_mnemonic(&wallet_secret, None, mnemonic, LEGACY_ACCOUNT_KIND.into(), false).await.unwrap();
+        assert_eq!(account.account_kind().as_ref(), LEGACY_ACCOUNT_KIND, "legacy import yields a legacy-kind account");
+    }
+
+    /// Re-importing the SAME mnemonic reuses the existing key entry and
+    /// reconstructs the same account -- idempotent, not a duplicate and not
+    /// an error.
+    #[tokio::test]
+    async fn import_with_mnemonic_same_key_reimport_reuses_entry() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = make_local_mnemonics(1).await.remove(0);
+
+        let first =
+            wallet.import_with_mnemonic(&wallet_secret, None, mnemonic.clone(), BIP32_ACCOUNT_KIND.into(), false).await.unwrap();
+        let second = wallet.import_with_mnemonic(&wallet_secret, None, mnemonic, BIP32_ACCOUNT_KIND.into(), false).await.unwrap();
+        assert_eq!(first.id(), second.id(), "the same key reconstructs the same account (no duplicate)");
+
+        let account_store = wallet.inner.store.as_account_store().unwrap();
+        let count = account_store.iter(None).await.unwrap().try_collect::<Vec<_>>().await.unwrap().len();
+        assert_eq!(count, 1, "the re-import reconstructs the one imported account; no duplicate is stored");
+    }
+
     // ----- mechanism-shape invariants (internal-generator replacements for
     //       the removed recorded-vector fixtures; cross-binary parity is
     //       validation-side evidence, never committed fixtures) -----
+
+    /// Per-input derivation attribution emits the canonical multisig path
+    /// template byte-for-byte:
+    /// `m/45'/111111'/<account_index>'/<cosigner_index>/<address_type>/<address_index>`,
+    /// including a non-zero hardened `account_index` slot.
+    #[tokio::test]
+    async fn multisig_derivation_path_format_canonical() {
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let own_key = PrvKeyData::try_new_from_mnemonic(mnemonic_24_from_fill(0x61), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_id = own_key.id;
+        wallet.store().as_prv_key_data_store().unwrap().store(&wallet_secret, own_key).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+        let peer = external_xpub_for_testnet(mnemonic_24_from_fill(0x62).phrase()).await;
+
+        // Explicit non-zero account_index pins the hardened account slot of
+        // the template, not just the default-zero shape.
+        let account_index: u64 = 7;
+        let account = wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(own_id, None)],
+                vec![peer],
+                None,
+                2,
+                false,
+                Some(account_index),
+            )
+            .await
+            .unwrap();
+
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0x3c; 32]),
+                index: 0,
+            })
+            .sig_op_count(2)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let mut bundle = Bundle::from(pskt_creator.constructor().input(input));
+        crate::account::variants::multisig::populate_multisig_redeem_scripts(account.clone(), &mut bundle, 2).await.unwrap();
+
+        let derivation_capable = account.clone().as_derivation_capable().unwrap();
+        let (funded_cosigner_index, address_type, address_index) =
+            derivation_capable.derivation().address_family_index(&receive_address).unwrap();
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs");
+        let local_xpub = &xpub_keys[account.clone().as_derivation_capable().unwrap().cosigner_index() as usize];
+        let local_pubkey = *local_xpub
+            .clone()
+            .derive_child(ChildNumber::new(funded_cosigner_index, false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(address_type.index(), false).unwrap())
+            .unwrap()
+            .derive_child(ChildNumber::new(address_index, false).unwrap())
+            .unwrap()
+            .public_key();
+        let key_source = bundle.as_ref()[0].inputs[0].bip32_derivations.get(&local_pubkey).expect("local cosigner derivation entry");
+        let key_source = key_source.as_ref().expect("KeySource present");
+        let seat_index = local_xpub.attrs().child_number.index();
+        let expected_path: kaspa_bip32::DerivationPath =
+            format!("m/45'/111111'/{seat_index}'/{funded_cosigner_index}/{}/{address_index}", address_type.index()).parse().unwrap();
+        assert_eq!(
+            key_source.derivation_path, expected_path,
+            "derivation attribution follows the canonical multisig path template at embedded seat={seat_index}",
+        );
+    }
 
     /// `normalize_and_merge_xpubs` orders the cosigner set by plain Base58
     /// string order: the merged output equals `sort_unstable()` over the
@@ -5599,5 +6886,36 @@ mod multisig_tests {
             assert_eq!(redeem_script[redeem_script.len() - 2], OpTrue + (n as u8 - 1), "({k},{n}): penultimate byte is OP_N");
             assert_eq!(redeem_script[redeem_script.len() - 1], OpCheckMultiSig, "({k},{n}): final byte is OpCheckMultiSig");
         }
+    }
+
+    /// The multisig derivation chain is deterministic: the same inputs (one
+    /// constant-fill own mnemonic + the same peer xpubs + the same K and
+    /// auto-assigned account index) re-derive byte-identical first-five
+    /// receive addresses in a fresh wallet.
+    #[tokio::test]
+    async fn multisig_derivation_deterministic_round_trip() {
+        const ROUND_TRIP_ADDRESS_COUNT: u32 = 5;
+
+        async fn derive_first_addresses() -> Vec<kaspa_addresses::Address> {
+            let wallet = test_wallet().await;
+            let wallet_secret = Secret::new(vec![]);
+            let peers = vec![
+                external_xpub_for_testnet(mnemonic_24_from_fill(0x71).phrase()).await,
+                external_xpub_for_testnet(mnemonic_24_from_fill(0x72).phrase()).await,
+            ];
+            let account = imported_account(
+                wallet
+                    .import_multisig_with_mnemonic(&wallet_secret, (mnemonic_24_from_fill(0x73), None), Some(0), 2, peers, false)
+                    .await
+                    .unwrap(),
+            );
+            let derivation_capable = account.clone().as_derivation_capable().unwrap();
+            derivation_capable.derivation().receive_address_manager().get_range(0..ROUND_TRIP_ADDRESS_COUNT).unwrap()
+        }
+
+        let first = derive_first_addresses().await;
+        let second = derive_first_addresses().await;
+        assert_eq!(first.len(), ROUND_TRIP_ADDRESS_COUNT as usize, "five receive addresses derived");
+        assert_eq!(first, second, "re-derivation from the same inputs is byte-identical");
     }
 }

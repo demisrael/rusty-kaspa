@@ -143,13 +143,15 @@ impl AddressManager {
         }
 
         let mut addresses = vec![];
-        for key_index in indexes.clone() {
+        for key_offset in 0..indexes.len() {
             let mut keys = vec![];
-            for i in 0..manager_length {
-                let Some(k) = manager_keys.get(i).unwrap().get(key_index as usize) else { continue };
+            for key_set in manager_keys.iter() {
+                let Some(k) = key_set.get(key_offset) else {
+                    continue;
+                };
                 keys.push(*k);
             }
-            if keys.is_empty() {
+            if keys.len() != manager_length {
                 continue;
             }
             addresses.push(self.create_address(keys)?);

@@ -135,6 +135,130 @@ mod test {
         );
     }
 
+    /// A canonical kaspawallet multisig keyfile carries exactly ONE own
+    /// encrypted mnemonic (NumPrivateKeys default 1) + the peer cosigner
+    /// xpubs. It imports cleanly: the own mnemonic is stored as the account's
+    /// local cosigner key and the peer xpubs register the cosigner group (cross-binary interop
+    /// preserved). The own encrypted mnemonic here is a genuine go-encrypted
+    /// fixture (the same cipher the single-wallet decrypt test exercises),
+    /// decrypted under the multisig v1 thread count.
+    #[tokio::test]
+    async fn golang_multisig_file_canonical_imports() {
+        use crate::account::variants::multisig::MULTISIG_ACCOUNT_KIND;
+        use kaspa_bip32::{Language, Mnemonic};
+
+        let own_cipher = hex!(
+            "2022041df1a5bdcc26445952c53f96518641118bf0f990a01747d631d4607e5b53af3c9f4c07d6e3b84bc766445191b13d1f1fdf7ac96eae9c8859a9add660ac15b938356f936fdf614640d89627d368c57b22cf62844b1e1bcf3feceecbc6bf655df9519d7e3cfede6fe19d87a49e5709211b0b95c8d68781c70c4722bd8e25361492ef38d5cca21664a7f0838e4a1e2994d30c6d4b81d1397169570375ce56608439ae00e84c1f6acdd805f0ee22d4ba7b354c7f7cd4b2d18ce4fd6b8af785f95ed2a69361f318bc"
+        );
+        let own_salt = hex!("044f5b890e48af4a7dcd7e7766af9380");
+
+        // Recover the own mnemonic's PrvKeyData id so we can assert the
+        // account's local seat references it after import.
+        let decrypted =
+            decrypt_mnemonic(8, EncryptedMnemonic { cipher: own_cipher.as_slice(), salt: own_salt.as_slice() }, b"").unwrap();
+        let own_mnemonic = Mnemonic::new(decrypted.trim(), Language::English).unwrap();
+        let own_id = PrvKeyData::try_new_from_mnemonic(own_mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap().id;
+
+        let resident_store = Wallet::resident_store().unwrap();
+        let wallet = Arc::new(Wallet::try_new(resident_store, None, Some(NetworkId::new(NetworkType::Mainnet))).unwrap());
+        let wallet_secret = Secret::new(vec![]);
+        wallet
+            .create_wallet(
+                &wallet_secret,
+                WalletCreateArgs {
+                    title: None,
+                    filename: None,
+                    encryption_kind: EncryptionKind::XChaCha20Poly1305,
+                    user_hint: None,
+                    overwrite_wallet_storage: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let file = MultisigWalletFileV1 {
+            encrypted_mnemonics: vec![EncryptedMnemonic { cipher: own_cipher.as_slice(), salt: own_salt.as_slice() }],
+            xpublic_keys: vec![
+                "kpub2J937qL9n85s7HrhYyYYdMkzq1kaMiAf9PAcJzRW3jV7NgntNfGGrNgut7ZxcVrJqH42BCT2WyjfnxJh3SBDjLhXHe3UC2RJUu5tcjsViuK",
+                "kpub2Jtuqt6WJWZv3fQUnKhuEaCxbAyzLsFn3UEEaM4g7CXa2LZjQZH4o6tpj83tFaewMEyX56qrAF4Q64uqunVyBayuuRNwjru5DWchDEcq5vz",
+            ],
+            required_signatures: 2,
+            cosigner_index: 0,
+            ecdsa: false,
+        };
+        let import_secret = Secret::new(vec![]);
+
+        let acc = wallet.import_kaspawallet_golang_multisig_v1(&import_secret, &wallet_secret, file).await.unwrap();
+        assert_eq!(acc.account_kind(), MULTISIG_ACCOUNT_KIND, "import yields a multisig account");
+        let multisig: Arc<crate::account::variants::multisig::MultiSig> = acc.clone().downcast_arc().expect("account is multisig");
+        assert_eq!(
+            multisig.prv_key_data_ids().as_ref().expect("local seat")[0],
+            own_id,
+            "the keyfile's single own mnemonic backs the account's local seat",
+        );
+        assert_eq!(acc.xpub_keys().map(|x| x.len()), Some(3), "the cosigner set registers own + the two peer xpubs (2-of-3)");
+    }
+
+    /// A canonical ECDSA multisig keyfile (one own encrypted mnemonic + peer
+    /// xpubs, `ecdsa: true`) imports cleanly: the v1-importer ECDSA hard-error
+    /// is gone, the own mnemonic is stored as the account's local cosigner
+    /// key, and the resulting
+    /// account reports the ECDSA curve. Cross-binary ECDSA interop preserved.
+    #[tokio::test]
+    async fn golang_multisig_file_ecdsa_imports() {
+        use crate::account::variants::multisig::MULTISIG_ACCOUNT_KIND;
+        use kaspa_bip32::{Language, Mnemonic};
+
+        let own_cipher = hex!(
+            "2022041df1a5bdcc26445952c53f96518641118bf0f990a01747d631d4607e5b53af3c9f4c07d6e3b84bc766445191b13d1f1fdf7ac96eae9c8859a9add660ac15b938356f936fdf614640d89627d368c57b22cf62844b1e1bcf3feceecbc6bf655df9519d7e3cfede6fe19d87a49e5709211b0b95c8d68781c70c4722bd8e25361492ef38d5cca21664a7f0838e4a1e2994d30c6d4b81d1397169570375ce56608439ae00e84c1f6acdd805f0ee22d4ba7b354c7f7cd4b2d18ce4fd6b8af785f95ed2a69361f318bc"
+        );
+        let own_salt = hex!("044f5b890e48af4a7dcd7e7766af9380");
+
+        let decrypted =
+            decrypt_mnemonic(8, EncryptedMnemonic { cipher: own_cipher.as_slice(), salt: own_salt.as_slice() }, b"").unwrap();
+        let own_mnemonic = Mnemonic::new(decrypted.trim(), Language::English).unwrap();
+        let own_id = PrvKeyData::try_new_from_mnemonic(own_mnemonic, None, EncryptionKind::XChaCha20Poly1305).unwrap().id;
+
+        let resident_store = Wallet::resident_store().unwrap();
+        let wallet = Arc::new(Wallet::try_new(resident_store, None, Some(NetworkId::new(NetworkType::Mainnet))).unwrap());
+        let wallet_secret = Secret::new(vec![]);
+        wallet
+            .create_wallet(
+                &wallet_secret,
+                WalletCreateArgs {
+                    title: None,
+                    filename: None,
+                    encryption_kind: EncryptionKind::XChaCha20Poly1305,
+                    user_hint: None,
+                    overwrite_wallet_storage: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let file = MultisigWalletFileV1 {
+            encrypted_mnemonics: vec![EncryptedMnemonic { cipher: own_cipher.as_slice(), salt: own_salt.as_slice() }],
+            xpublic_keys: vec![
+                "kpub2JZg9pofE54nqvkhFRRx18pAMhYDPL2CpYqBx2AkzvsEknCh8V4rtez9ZYeab3HCW1Xsm9f4d6J5dfJVg9NADWN7rtqNft21batcii1SjXy",
+                "kpub2HuRXjAmhs3KwQ9WpHVaiHRjBP37TQUiUGFQBTwp7cdbArCo5s2MT6415nd3ZYaELvNbZ4qTJjCGTavExv514tWftaGQzCK8gQz6BQJNySp",
+            ],
+            required_signatures: 2,
+            cosigner_index: 0,
+            ecdsa: true,
+        };
+        let import_secret = Secret::new(vec![]);
+
+        let acc = wallet.import_kaspawallet_golang_multisig_v1(&import_secret, &wallet_secret, file).await.unwrap();
+        assert_eq!(acc.account_kind(), MULTISIG_ACCOUNT_KIND, "ECDSA import yields a multisig account");
+        assert!(acc.ecdsa(), "the imported account reports the ECDSA curve");
+        let multisig: Arc<crate::account::variants::multisig::MultiSig> = acc.clone().downcast_arc().expect("account is multisig");
+        assert_eq!(
+            multisig.prv_key_data_ids().as_ref().expect("local seat")[0],
+            own_id,
+            "the ECDSA keyfile's single own mnemonic backs the account's local seat",
+        );
+    }
+
     #[test]
     fn deser_golang_wallet_test() {
         #[allow(dead_code)]

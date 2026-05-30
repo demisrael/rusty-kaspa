@@ -59,16 +59,17 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
     let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
     let account_index_answer = term.ask(false, "Enter the account index (press <enter> for auto-assign): ").await?;
-    let account_index: u64 = match account_index_answer.trim() {
-        "" => {
-            return Err(Error::Custom(
-                "Multisig setup requires an explicit account index. All cosigners must use the same integer for this multisig group; coordinate it with your peers (use 0 for the first multisig in this wallet).".to_string(),
-            ));
-        }
-        s => s.parse()?,
-    };
 
     let ecdsa = ask_curve(&term).await?;
+    let payment_secret = if prv_key_data_info.is_encrypted() {
+        let payment_secret = Secret::new(term.ask(true, "Enter payment password: ").await?.trim().as_bytes().to_vec());
+        if payment_secret.as_ref().is_empty() {
+            return Err(Error::PaymentSecretRequired);
+        }
+        Some(payment_secret)
+    } else {
+        None
+    };
 
     // Reuse the wallet's single mnemonic; the multisig account is one more
     // hardened child of the same seed that owns every other account in this
@@ -80,15 +81,35 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
         .await?
         .ok_or_else(|| WalletError::PrivateKeyNotFound(prv_key_data_info.id))?;
 
+    // The index is private per-cosigner bookkeeping: it is baked into the
+    // xpub each cosigner shares and never re-enters the joint redeem-script
+    // derivation, so cosigners do not coordinate it. One seed can join many
+    // groups, each under its own locally-chosen index. Empty input
+    // auto-assigns the lowest index not yet backing a group on the selected
+    // key, enumerated from the embedded indexes of its stored xpubs, so each
+    // auto-assigned group derives a fresh xpub.
+    let used_indexes = wallet.used_multisig_seat_indexes_for_key(&prv_key_data, payment_secret.as_ref()).await?;
+    let account_index: u64 = match account_index_answer.trim() {
+        "" => wallet.next_multisig_seat_index_for_key(&prv_key_data, payment_secret.as_ref()).await?,
+        s => s.parse()?,
+    };
+    if used_indexes.contains(&account_index) {
+        tprintln!(
+            ctx,
+            "\nnote: this index already backs another multisig group on this key; \
+            those groups share one extended public key, so they are publicly linkable.\n"
+        );
+    }
+
     // Print the wallet's xpub at the chosen account_index before blocking on
     // peer xpubs, so the operator can copy it into their out-of-band channel
     // while the wizard is still waiting for input.
-    let xpub_key = derive_multisig_xpub_from_wallet_key(&prv_key_data, account_index).await?;
+    let xpub_key = derive_multisig_xpub_from_wallet_key(&prv_key_data, payment_secret.as_ref(), account_index).await?;
     let curve_name = if ecdsa { "ecdsa" } else { "schnorr" };
     tprintln!(ctx, "\nextended public key (account_index={account_index}, curve={curve_name}):\n");
     tprintln!(ctx, "{}\n", wallet.network_format_xpub(&xpub_key));
 
-    let prv_key_data_args = vec![PrvKeyDataArgs::new(prv_key_data_info.id, None)];
+    let prv_key_data_args = vec![PrvKeyDataArgs::new(prv_key_data_info.id, payment_secret)];
 
     let additional_xpub_keys_len: usize = term.ask(false, "Enter the number of additional extended public keys: ").await?.parse()?;
     let total_cosigners = additional_xpub_keys_len + 1;
@@ -132,9 +153,10 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
 /// future spec adds one, this call must thread it through.
 async fn derive_multisig_xpub_from_wallet_key(
     prv_key_data: &PrvKeyData,
+    payment_secret: Option<&Secret>,
     account_index: u64,
 ) -> Result<kaspa_bip32::ExtendedPublicKey<kaspa_bip32::secp256k1::PublicKey>> {
-    Ok(prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), account_index).await?)
+    Ok(prv_key_data.create_xpub(payment_secret, MULTISIG_ACCOUNT_KIND.into(), account_index).await?)
 }
 
 /// Prompt the operator for the account signing curve and return the
@@ -308,7 +330,7 @@ mod tests {
     #[tokio::test]
     async fn derive_multisig_xpub_from_wallet_key_is_byte_equal_to_create_xpub() {
         let prv_key_data = make_prv_key_data();
-        let derived = derive_multisig_xpub_from_wallet_key(&prv_key_data, ACCOUNT_INDEX).await.unwrap();
+        let derived = derive_multisig_xpub_from_wallet_key(&prv_key_data, None, ACCOUNT_INDEX).await.unwrap();
         let direct = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), ACCOUNT_INDEX).await.unwrap();
         assert_eq!(
             derived.to_string(Some(kaspa_bip32::Prefix::XPUB)),
@@ -326,7 +348,7 @@ mod tests {
     #[tokio::test]
     async fn derive_multisig_xpub_from_wallet_key_matches_create_account_multisig_internal_derivation() {
         let (wallet, wallet_secret, prv_key_data) = make_seeded_test_wallet().await;
-        let wizard_xpub = derive_multisig_xpub_from_wallet_key(&prv_key_data, ACCOUNT_INDEX).await.unwrap();
+        let wizard_xpub = derive_multisig_xpub_from_wallet_key(&prv_key_data, None, ACCOUNT_INDEX).await.unwrap();
         let wizard_xpub_str = wallet.network_format_xpub(&wizard_xpub);
 
         let prv_key_data_args = vec![PrvKeyDataArgs::new(prv_key_data.id, None)];

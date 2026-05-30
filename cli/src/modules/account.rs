@@ -105,7 +105,7 @@ impl Account {
                             ),
                             (
                                 "account import mnemonic multisig [additional keys]",
-                                "Import mnemonic and additional keys for a multisig account",
+                                "Import mnemonic and the full cosigner xpub set for a multisig account",
                             ),
                         ],
                         None,

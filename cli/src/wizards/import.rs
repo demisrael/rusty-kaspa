@@ -92,45 +92,54 @@ pub(crate) async fn import_with_mnemonic(ctx: &Arc<KaspaCli>, account_kind: Acco
     let mnemonic = mnemonic.join(" ");
     let mnemonic = Mnemonic::new(mnemonic.trim(), Language::English)?;
 
-    let account = if account_kind != MULTISIG_ACCOUNT_KIND {
-        wallet.import_with_mnemonic(&wallet_secret, payment_secret.as_ref(), mnemonic, account_kind).await?
+    let accounts = if account_kind != MULTISIG_ACCOUNT_KIND {
+        vec![
+            wallet
+                .import_with_mnemonic(
+                    &wallet_secret,
+                    payment_secret.as_ref(),
+                    mnemonic,
+                    account_kind,
+                    mnemonic_import_ecdsa(&account_kind),
+                )
+                .await?,
+        ]
     } else {
-        let mut mnemonics_secrets = vec![(mnemonic, payment_secret)];
-        while matches!(
-            term.ask(false, "Do you want to add more mnemonics (type 'y' to approve)?: ").await?.trim(),
-            "y" | "Y" | "YES" | "yes"
-        ) {
-            tprintln!(ctx);
-            let mnemonic = prompt_for_mnemonic(&term).await?;
-            tprintln!(ctx);
-            let payment_secret = term.ask(true, "Enter payment password (optional): ").await?;
-            let payment_secret = payment_secret.trim().is_not_empty().then(|| Secret::new(payment_secret.trim().as_bytes().to_vec()));
-            let mnemonic = mnemonic.join(" ");
-            let mnemonic = Mnemonic::new(mnemonic.trim(), Language::English)?;
-
-            mnemonics_secrets.push((mnemonic, payment_secret));
-        }
-
-        let mut additional_xpubs = additional_xpubs.to_vec();
-        if additional_xpubs.is_empty() {
+        // Registered multisig: the operator contributes one own mnemonic;
+        // the operator supplies the full cosigner set so wallet-core can
+        // identify the imported seed before storing anything.
+        let mut xpubs = additional_xpubs.to_vec();
+        if xpubs.is_empty() {
             loop {
-                let xpub_key = term.ask(false, "Enter extended public key: (empty to skip or stop)").await?;
+                let xpub_key = term.ask(false, "Enter cosigner extended public key, including your own: (empty to stop)").await?;
                 if xpub_key.is_empty() {
                     break;
                 }
-                additional_xpubs.push(xpub_key.trim().to_owned());
+                xpubs.push(xpub_key.trim().to_owned());
             }
         }
         let n_required: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
         let ecdsa = crate::wizards::account::ask_curve(&term).await?;
+        crate::wizards::account::check_cosigner_count_under_curve_cap(
+            xpubs.len(),
+            n_required,
+            kaspa_wallet_core::wallet::MultisigCurve::from_ecdsa_bool(ecdsa),
+        )?;
 
-        wallet.import_multisig_with_mnemonic(&wallet_secret, mnemonics_secrets, n_required, additional_xpubs, ecdsa).await?
+        wallet.import_multisig_with_mnemonic(&wallet_secret, (mnemonic, payment_secret), None, n_required, xpubs, ecdsa).await?
     };
 
-    tprintln!(ctx, "\naccount imported: {}\n", account.get_list_string()?);
-    wallet.select(Some(&account)).await?;
+    for account in accounts.iter() {
+        tprintln!(ctx, "\naccount imported: {}\n", account.get_list_string()?);
+    }
+    let account = accounts.last().ok_or(kaspa_wallet_core::error::Error::MultisigOwnXpubNotFound)?;
+    wallet.select(Some(account)).await?;
     Ok(())
+}
+
+pub(crate) fn mnemonic_import_ecdsa(_account_kind: &AccountKind) -> bool {
+    false
 }
 
 #[cfg(test)]
@@ -158,5 +167,11 @@ mod tests {
             assert!(validate_mnemonic_word_count(&multisig, rejected).is_err(), "multisig rejects {rejected} words");
         }
         assert!(validate_mnemonic_word_count(&AccountKind::from("hello world"), 12).is_err(), "unsupported kind rejected");
+    }
+
+    #[test]
+    fn mnemonic_import_cli_single_sig_arms_stay_schnorr() {
+        assert!(!mnemonic_import_ecdsa(&BIP32_ACCOUNT_KIND.into()));
+        assert!(!mnemonic_import_ecdsa(&LEGACY_ACCOUNT_KIND.into()));
     }
 }
