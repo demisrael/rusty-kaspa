@@ -158,6 +158,7 @@ pub enum AccountCreateArgs {
         name: Option<String>,
         minimum_signatures: u16,
         ecdsa: bool,
+        account_index: Option<u64>,
     },
     Bip32Watch {
         account_args: AccountCreateArgsBip32Watch,
@@ -196,7 +197,8 @@ impl AccountCreateArgs {
         name: Option<String>,
         minimum_signatures: u16,
         ecdsa: bool,
+        account_index: Option<u64>,
     ) -> Self {
-        AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures, ecdsa }
+        AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures, ecdsa, account_index }
     }
 }

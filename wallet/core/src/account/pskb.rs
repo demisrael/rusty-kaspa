@@ -439,7 +439,6 @@ pub async fn pskb_signer_for_multisig_cosigner(
 
     let derivation_capable = account.clone().as_derivation_capable()?;
     let derivation = derivation_capable.derivation();
-    let account_index = derivation_capable.account_index();
 
     // Per-account curve selection: ECDSA-bearing multisig accounts
     // (`account.ecdsa()` returns `true`) sign with
@@ -469,18 +468,40 @@ pub async fn pskb_signer_for_multisig_cosigner(
         // fail to combine on `bip32_derivations` conflict at accumulate.
         type InputKey = (secp256k1::SecretKey, secp256k1::PublicKey, Option<kaspa_wallet_pskt::prelude::KeySource>);
         let mut input_keys: Vec<InputKey> = Vec::with_capacity(pskt_inner.inputs.len());
+        // The requested cosigner position selects WHICH recorded attribution
+        // entry to sign with: one key can back several cosigner positions
+        // (several of its hardened children registered in one group), and
+        // every such entry's path is derivable from the same xprv, so
+        // matching by derivability alone would always re-sign the first
+        // entry. The position's xpub fingerprint pins the entry.
+        let position_fingerprint =
+            account.xpub_keys().and_then(|xpubs| xpubs.get(default_cosigner_index as usize)).map(|xpub| xpub.fingerprint());
         for (input_idx, input) in pskt_inner.inputs.iter().enumerate() {
-            let derivation_path_opt: Option<kaspa_bip32::DerivationPath> =
-                input.bip32_derivations.values().find_map(|key_source| key_source.as_ref().map(|ks| ks.derivation_path.clone()));
-
-            let secret_key = if let Some(path) = derivation_path_opt {
-                // Per-input path: walk this cosigner's xprv to the recorded
-                // funded-family leaf and use the resulting scalar.
+            let mut derived_from_key_source = None;
+            for (recorded_pubkey, key_source) in input.bip32_derivations.iter() {
+                let Some(key_source) = key_source else {
+                    continue;
+                };
+                if let Some(expected_fingerprint) = position_fingerprint
+                    && key_source.key_fingerprint != expected_fingerprint
+                {
+                    continue;
+                }
                 let mut current = xkey.clone();
-                for child in path.as_ref() {
+                for child in key_source.derivation_path.as_ref() {
                     current = current.derive_child(*child)?;
                 }
-                *current.private_key()
+                let secret_key = *current.private_key();
+                let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())?;
+                let pub_key = keypair.public_key();
+                if pub_key == *recorded_pubkey {
+                    derived_from_key_source = Some((secret_key, pub_key, Some(key_source.clone())));
+                    break;
+                }
+            }
+
+            let (secret_key, pub_key, existing_key_source) = if let Some(input_key) = derived_from_key_source {
+                input_key
             } else {
                 // Fallback: build the receive/change vectors from the input's
                 // UTXO address and derive a single key using the
@@ -491,27 +512,31 @@ pub async fn pskb_signer_for_multisig_cosigner(
                     input.utxo_entry.as_ref().ok_or_else(|| Error::custom(format!("No utxo_entry for input {input_idx}")))?;
                 let address = extract_script_pub_key_address(&utxo_entry.script_public_key, network_id.into())?;
                 let (receive, change) = derivation.addresses_indexes(&[&address])?;
+                let fallback_account_index = account
+                    .xpub_keys()
+                    .and_then(|xpubs| xpubs.get(default_cosigner_index as usize))
+                    .map(|xpub| xpub.attrs().child_number.index() as u64)
+                    .unwrap_or_else(|| derivation_capable.account_index());
                 let private_keys = crate::account::create_private_keys(
                     &MULTISIG_ACCOUNT_KIND.into(),
                     default_cosigner_index,
-                    account_index,
+                    fallback_account_index,
                     &xkey,
                     &receive,
                     &change,
                 )?;
-                private_keys
+                let secret_key = private_keys
                     .into_iter()
                     .next()
                     .map(|(_, sk)| sk)
-                    .ok_or_else(|| Error::custom(format!("No private key derived for input {input_idx}")))?
+                    .ok_or_else(|| Error::custom(format!("No private key derived for input {input_idx}")))?;
+                let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())?;
+                (secret_key, keypair.public_key(), None)
             };
 
-            let keypair = secp256k1::Keypair::from_seckey_slice(secp256k1::SECP256K1, secret_key.as_ref())?;
-            let pub_key = keypair.public_key();
             if input.partial_sigs.contains_key(&pub_key) {
                 return Err(Error::MultisigDuplicateCosignerSignature { cosigner_index: default_cosigner_index, pub_key });
             }
-            let existing_key_source = input.bip32_derivations.get(&pub_key).cloned().flatten();
             input_keys.push((secret_key, pub_key, existing_key_source));
         }
 
@@ -550,6 +575,29 @@ pub async fn pskb_signer_for_multisig_cosigner(
 }
 
 pub fn finalize_pskt_one_or_more_sig_and_redeem_script(pskt: PSKT<Finalizer>) -> Result<PSKT<Finalizer>, Error> {
+    // A multisig `script_sig` carries exactly the threshold number of
+    // signatures by construction: the emission below collates one signature
+    // per redeem-script slot up to the threshold. An input that presents more
+    // partial signatures than its redeem-script threshold is therefore
+    // malformed for collation and is declined before emission. This applies
+    // only to multisig redeem scripts (`OP_M <pubkeys> OP_N OpCheckMultiSig`);
+    // a non-multisig redeem script (e.g. a commit-reveal envelope) carries no
+    // threshold and is left untouched.
+    for (input_index, input) in pskt.inputs.iter().enumerate() {
+        if let Some(redeem_script) = input.redeem_script.as_ref()
+            && parse_redeem_script_pubkeys(redeem_script.as_slice()).is_ok()
+        {
+            let (threshold, _) = decode_multisig_script_int(redeem_script.as_slice())?;
+            if input.partial_sigs.len() > threshold {
+                return Err(Error::FinalizerExcessSignatures {
+                    found: input.partial_sigs.len(),
+                    allowed: threshold as u16,
+                    input_index,
+                });
+            }
+        }
+    }
+
     let result = pskt.finalize_sync(|inner: &Inner| -> Result<Vec<Vec<u8>>, String> {
         inner
             .inputs
@@ -906,7 +954,7 @@ mod tests {
     use super::*;
     use kaspa_consensus_core::tx::{TransactionId, TransactionOutpoint, UtxoEntry};
     use kaspa_hashes::HASH_SIZE;
-    use kaspa_txscript::opcodes::codes::{Op2, Op3};
+    use kaspa_txscript::opcodes::codes::{Op1, Op2, Op3};
     use kaspa_txscript::{multisig_redeem_script, multisig_redeem_script_ecdsa, pay_to_script_hash_script};
     use kaspa_wallet_pskt::input::InputBuilder;
     use kaspa_wallet_pskt::pskt::Creator;
@@ -1343,6 +1391,107 @@ mod tests {
                     "({k}-of-{n}, ecdsa={is_ecdsa}): unordered (map iteration order) script_sig must fail TxScriptEngine::execute",
                 );
             }
+        }
+    }
+
+    /// An input whose `partial_sigs` count exceeds its redeem-script threshold
+    /// is declined by the Finalizer with `FinalizerExcessSignatures` rather
+    /// than collated into an over-long signature stack. Here a 2-of-3 redeem
+    /// script (threshold 2) carries three partial signatures.
+    #[test]
+    fn test_finalizer_excess_signatures_error() {
+        let secp = Secp256k1::new();
+        let kp_a = Keypair::new(&secp, &mut thread_rng());
+        let kp_b = Keypair::new(&secp, &mut thread_rng());
+        let kp_c = Keypair::new(&secp, &mut thread_rng());
+
+        let x_a = kp_a.x_only_public_key().0.serialize();
+        let x_b = kp_b.x_only_public_key().0.serialize();
+        let x_c = kp_c.x_only_public_key().0.serialize();
+        let threshold = 2usize;
+        let redeem_script = multisig_redeem_script([x_a, x_b, x_c].into_iter(), threshold).expect("redeem script");
+
+        let msg = secp256k1::Message::from_digest_slice(&[0xcd; HASH_SIZE]).expect("msg");
+        let mut partial_sigs = kaspa_wallet_pskt::pskt::PartialSigs::new();
+        partial_sigs.insert(kp_a.public_key(), Signature::Schnorr(kp_a.sign_schnorr(msg)));
+        partial_sigs.insert(kp_b.public_key(), Signature::Schnorr(kp_b.sign_schnorr(msg)));
+        partial_sigs.insert(kp_c.public_key(), Signature::Schnorr(kp_c.sign_schnorr(msg)));
+
+        let utxo = UtxoEntry {
+            amount: 1_000_000,
+            script_public_key: pay_to_script_hash_script(redeem_script.as_slice()),
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let mut input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0; HASH_SIZE]), index: 0 })
+            .sig_op_count(threshold as u8)
+            .redeem_script(redeem_script.clone())
+            .build()
+            .expect("input");
+        input.partial_sigs = partial_sigs;
+
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_finalizer = pskt_creator.constructor().input(input).updater().signer().finalizer();
+
+        match finalize_pskt_one_or_more_sig_and_redeem_script(pskt_finalizer) {
+            Err(Error::FinalizerExcessSignatures { found, allowed, input_index }) => {
+                assert_eq!(found, 3, "three partial signatures present");
+                assert_eq!(allowed, threshold as u16, "redeem-script threshold");
+                assert_eq!(input_index, 0, "violating input index");
+            }
+            Ok(_) => panic!("expected FinalizerExcessSignatures, got a finalized PSKT"),
+            Err(other) => panic!("expected FinalizerExcessSignatures, got {other:?}"),
+        }
+    }
+
+    /// The excess-signature guard applies only to multisig redeem scripts. A
+    /// non-multisig redeem script (here a single `OP_1` envelope) carrying more
+    /// signatures than its leading small-int would imply must NOT be rejected
+    /// with `FinalizerExcessSignatures` -- the guard skips it so the
+    /// commit-reveal / non-multisig finalize path is left untouched.
+    #[test]
+    fn test_finalizer_excess_guard_skips_non_multisig_redeem() {
+        let secp = Secp256k1::new();
+        let kp_a = Keypair::new(&secp, &mut thread_rng());
+        let kp_b = Keypair::new(&secp, &mut thread_rng());
+
+        // OP_1 envelope: a valid script integer (decodes to 1) but NOT a
+        // multisig redeem script (no pubkeys, no OpCheckMultiSig trailer).
+        let redeem_script = vec![Op1];
+
+        let msg = secp256k1::Message::from_digest_slice(&[0xef; HASH_SIZE]).expect("msg");
+        let mut partial_sigs = kaspa_wallet_pskt::pskt::PartialSigs::new();
+        partial_sigs.insert(kp_a.public_key(), Signature::Schnorr(kp_a.sign_schnorr(msg)));
+        partial_sigs.insert(kp_b.public_key(), Signature::Schnorr(kp_b.sign_schnorr(msg)));
+
+        let utxo = UtxoEntry {
+            amount: 1_000_000,
+            script_public_key: pay_to_script_hash_script(redeem_script.as_slice()),
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let mut input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(TransactionOutpoint { transaction_id: TransactionId::from_slice(&[0; HASH_SIZE]), index: 0 })
+            .sig_op_count(1)
+            .redeem_script(redeem_script.clone())
+            .build()
+            .expect("input");
+        input.partial_sigs = partial_sigs;
+
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_finalizer = pskt_creator.constructor().input(input).updater().signer().finalizer();
+
+        // The guard must not fire for a non-multisig redeem. (Finalization of a
+        // non-multisig redeem may still fail downstream in the emission loop --
+        // that is a separate, pre-existing concern -- but it must never be
+        // `FinalizerExcessSignatures`.)
+        if let Err(Error::FinalizerExcessSignatures { .. }) = finalize_pskt_one_or_more_sig_and_redeem_script(pskt_finalizer) {
+            panic!("excess-signature guard must skip non-multisig redeem scripts");
         }
     }
 }

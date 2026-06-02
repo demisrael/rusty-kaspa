@@ -411,6 +411,9 @@ pub enum Error {
 
     #[error("Multisig user-supplied xpub uses prefix {supplied_prefix:?} which is not valid for wallet network {wallet_network:?}")]
     MultisigXpubNetworkMismatch { supplied_prefix: KeyPrefix, wallet_network: NetworkType },
+
+    #[error("finalizer input {input_index} carries {found} signatures but the redeem script threshold allows {allowed}")]
+    FinalizerExcessSignatures { found: usize, allowed: u16, input_index: usize },
 }
 
 impl From<Aborted> for Error {

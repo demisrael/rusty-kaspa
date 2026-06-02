@@ -7,7 +7,7 @@ use crate::account::pskb::{PSKBSigner, PSKTGenerator, bundle_from_pskt_generator
 use crate::account::{Fees, GenerationNotifier, PaymentDestination};
 use crate::derivation::{AddressDerivationManager, AddressDerivationManagerTrait};
 use crate::imports::*;
-use crate::tx::{Generator, GeneratorSettings, GeneratorSummary, Signer};
+use crate::tx::{Generator, GeneratorSettings, GeneratorSummary, PaymentOutput, Signer};
 use kaspa_bip32::{ChildNumber, DerivationPath, Prefix as KeyPrefix};
 use kaspa_txscript::{extract_script_pub_key_address, multisig_redeem_script, multisig_redeem_script_ecdsa};
 use kaspa_wallet_pskt::bundle::Bundle;
@@ -17,6 +17,11 @@ pub const MULTISIG_ACCOUNT_KIND: &str = "kaspa-multisig-standard";
 
 pub(crate) fn xpub_seat_index(xpub: &ExtendedPublicKeySecp256k1) -> u64 {
     xpub.attrs().child_number.index() as u64
+}
+
+fn xpub_seat_for_derivation(xpub_keys: &ExtendedPublicKeys, cosigner_index: Option<u8>) -> u64 {
+    let index = cosigner_index.map(|index| index as usize).unwrap_or(0);
+    xpub_keys.get(index).or_else(|| xpub_keys.first()).map(xpub_seat_index).unwrap_or(0)
 }
 
 pub struct Ctor {}
@@ -123,13 +128,12 @@ impl BorshDeserialize for Payload {
 pub struct MultiSig {
     inner: Arc<Inner>,
     xpub_keys: ExtendedPublicKeys,
-    // The local cosigner seat. A registered multisig account is either
-    // watch-only (`None`: no local key among the cosigners) or holds the
-    // operator's own cosigner key at slot `cosigner_index`
-    // (`Some([key_id])`, length one by construction). The vector form
-    // matches the on-disk `AccountStorage.prv_key_data_ids` wrapper and the
-    // account-id hash input; the signing paths resolve the key through the
-    // `Account::prv_key_data` store lookup on the sole entry.
+    // The local cosigner seats. A registered multisig account is either
+    // watch-only (`None`: no local key among the cosigners) or holds one or
+    // more local cosigner keys. The vector form matches the on-disk
+    // `AccountStorage.prv_key_data_ids` wrapper and the account-id hash
+    // input; K-of-N signing paths consume every stored local seat until the
+    // threshold is reached.
     prv_key_data_ids: Option<Arc<Vec<PrvKeyDataId>>>,
     cosigner_index: Option<u8>,
     minimum_signatures: u16,
@@ -159,7 +163,7 @@ impl MultiSig {
             MULTISIG_ACCOUNT_KIND.into(),
             &xpub_keys,
             ecdsa,
-            account_index,
+            xpub_seat_for_derivation(&xpub_keys, cosigner_index),
             cosigner_index.map(|v| v as u32),
             minimum_signatures,
             Default::default(),
@@ -182,7 +186,7 @@ impl MultiSig {
             MULTISIG_ACCOUNT_KIND.into(),
             &xpub_keys,
             ecdsa,
-            account_index,
+            xpub_seat_for_derivation(&xpub_keys, cosigner_index),
             cosigner_index.map(|v| v as u32),
             minimum_signatures,
             address_derivation_indexes,
@@ -202,8 +206,42 @@ impl MultiSig {
         self.minimum_signatures
     }
 
+    pub fn seat_indexes(&self) -> Vec<u64> {
+        self.xpub_keys.iter().map(xpub_seat_index).collect()
+    }
+
     fn watch_only(&self) -> bool {
         self.prv_key_data_ids.is_none()
+    }
+
+    /// Count the cosigner positions the stored local keys can sign. Every
+    /// stored own xpub backed by a local key is one seat; one key backs
+    /// several seats when several of its hardened children are registered
+    /// in the same group. Watch-only accounts count zero.
+    async fn matched_local_seat_count(self: &Arc<Self>, wallet_secret: &Secret, payment_secret: Option<&Secret>) -> Result<usize> {
+        if self.prv_key_data_ids.is_none() {
+            return Ok(0);
+        }
+        let mut seats = 0;
+        for prv_key_data in self.load_local_cosigner_keydata(wallet_secret).await? {
+            seats += multisig_cosigner_indexes(self.clone().as_dyn_arc(), &prv_key_data, payment_secret).await?.len();
+        }
+        Ok(seats)
+    }
+
+    async fn load_local_cosigner_keydata(&self, wallet_secret: &Secret) -> Result<Vec<PrvKeyData>> {
+        let prv_key_data_ids = self.prv_key_data_ids.as_ref().ok_or(Error::AccountKindFeature)?;
+        let prv_key_data_store = self.wallet().store().as_prv_key_data_store()?;
+        let mut keydata = Vec::with_capacity(prv_key_data_ids.len());
+        for prv_key_data_id in prv_key_data_ids.iter() {
+            keydata.push(
+                prv_key_data_store
+                    .load_key_data(wallet_secret, prv_key_data_id)
+                    .await?
+                    .ok_or(Error::PrivateKeyNotFound(*prv_key_data_id))?,
+            );
+        }
+        Ok(keydata)
     }
 
     /// Whether send/sweep/pskb_from_send_generator should route through the
@@ -236,9 +274,8 @@ impl MultiSig {
     }
 
     /// Load the local cosigner's key data for the P2PK send routing branch.
-    /// The key resolves through the account's own sole `prv_key_data_id`
-    /// store entry. Precondition: `route_as_single_sig` returned `true`,
-    /// which guarantees this account holds a local seat.
+    /// Precondition: `route_as_single_sig` returned `true`, which guarantees
+    /// this account holds exactly one local seat.
     async fn load_sole_cosigner_keydata(&self, wallet_secret: &Secret) -> Result<PrvKeyData> {
         self.prv_key_data(wallet_secret.clone()).await
     }
@@ -270,9 +307,9 @@ impl Account for MultiSig {
     }
 
     fn prv_key_data_id(&self) -> Result<&PrvKeyDataId> {
-        // The operator's sole local cosigner seat; watch-only accounts carry
-        // no local key and surface the account-kind-feature error the
-        // trait-default signing path expects.
+        // Trait-default single-key paths only support one local key. The
+        // multisig K-of-N paths use `prv_key_data_ids` directly so multi-seat
+        // accounts can consume every local cosigner.
         self.prv_key_data_ids.as_ref().and_then(|ids| ids.first()).ok_or(Error::AccountKindFeature)
     }
 
@@ -329,6 +366,7 @@ impl Account for MultiSig {
             None,
         )
         .with_property(AccountDescriptorProperty::AccountIndex, self.account_index.into())
+        .with_property(AccountDescriptorProperty::Other("Seat Indexes".to_string()), format!("{:?}", self.seat_indexes()).into())
         .with_property(AccountDescriptorProperty::XpubKeys, self.xpub_keys.clone().into())
         .with_property(AccountDescriptorProperty::Ecdsa, self.ecdsa.into())
         .with_property(AccountDescriptorProperty::DerivationMeta, self.derivation.address_derivation_meta().into());
@@ -345,7 +383,7 @@ impl Account for MultiSig {
         let balance = self.balance_as_strings(None)?;
         let mature_utxo_size = self.utxo_context().mature_utxo_size();
         let pending_utxo_size = self.utxo_context().pending_utxo_size();
-        let index_suffix = format!("[account_index={}]", self.account_index);
+        let index_suffix = format!("[slot={} seats={:?}]", self.account_index, self.seat_indexes());
         let info = match (mature_utxo_size, pending_utxo_size) {
             (0, 0) => index_suffix,
             (_, 0) => format!("{} UTXOs {}", mature_utxo_size.separated_string(), index_suffix),
@@ -410,15 +448,11 @@ impl Account for MultiSig {
 
         let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
         // Broadcast path: a partial bundle is rejected at consensus
-        // `OpCheckMultiSig` extract. The local seat is the single wallet
-        // master, so the operator contributes at most one signature; reject
-        // when that cannot reach the K quorum (watch-only -> 0, or any
-        // `K >= 2` group) so the operator sees the same
-        // `MultisigInsufficientCosignerMaterial` diagnostic the PSKB
-        // exchange flow would have produced. A `K >= 2` spend routes through
-        // `pskb_from_send_generator` + downstream `pskb_sign` rounds instead,
-        // completing the partial bundle before broadcast.
-        let local_seats = if self.watch_only() { 0 } else { 1 };
+        // `OpCheckMultiSig` extract. Reject only when the cosigner positions
+        // the stored local keys can sign cannot reach the K quorum;
+        // otherwise the bundle builder signs per matched position until the
+        // threshold is reached.
+        let local_seats = self.matched_local_seat_count(&wallet_secret, payment_secret.as_ref()).await?;
         if local_seats < self.minimum_signatures as usize {
             return Err(Error::MultisigInsufficientCosignerMaterial { local: local_seats, required: self.minimum_signatures });
         }
@@ -485,11 +519,8 @@ impl Account for MultiSig {
         }
 
         let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
-        // Broadcast path: same quorum reject as `send`. The account holds at
-        // most one local cosigner seat, so a watch-only account (0 seats) or
-        // any `K >= 2` group cannot reach quorum on its own and must route
-        // through `pskb_from_send_generator` + downstream `pskb_sign` exchange.
-        let local_seats = if self.watch_only() { 0 } else { 1 };
+        // Broadcast path: same quorum reject as `send`.
+        let local_seats = self.matched_local_seat_count(&wallet_secret, payment_secret.as_ref()).await?;
         if local_seats < self.minimum_signatures as usize {
             return Err(Error::MultisigInsufficientCosignerMaterial { local: local_seats, required: self.minimum_signatures });
         }
@@ -552,9 +583,10 @@ impl Account for MultiSig {
 
         let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
         // A watch-only account holds no local seat and cannot produce even a
-        // partial signature. A local-seat account contributes the wallet
-        // master's single signature; the returned bundle is partial for a
-        // `K >= 2` group and completes through downstream `pskb_sign` rounds.
+        // partial signature. A local-seat account contributes every stored
+        // local cosigner signature up to the threshold; the returned bundle is
+        // partial when local material is insufficient and completes through
+        // downstream `pskb_sign` rounds.
         if self.watch_only() {
             return Err(Error::MultisigInsufficientCosignerMaterial { local: 0, required: self.minimum_signatures });
         }
@@ -588,7 +620,8 @@ impl Account for MultiSig {
     ///    transaction. The shared helper applies the population step
     ///    idempotently (an upstream cosigner's contribution is preserved).
     /// 2. **Per-cosigner key derivation uses the multisig path**
-    ///    `m/45'/111111'/account_index'/<cosigner_index>/<address_type>/<address_index>`,
+    ///    `m/45'/111111'/<seat>'/<cosigner_index>/<address_type>/<address_index>`
+    ///    (the hardened seat read from the signing key's own xpub),
     ///    not the BIP-32 single-sig path. Routing through
     ///    `pskb_signer_for_multisig_cosigner` enforces this; the
     ///    trait-default path routes through `pskb_signer_for_address` whose
@@ -596,9 +629,9 @@ impl Account for MultiSig {
     ///    do not match any redeem-script slot.
     ///
     /// This round loads the operator's own cosigner key data, signs every
-    /// PSKT input whose redeem-script slot that key can satisfy, and merges
-    /// the resulting partial signatures into
-    /// the accumulator. K-of-N completion across independent cosigner
+    /// PSKT input whose redeem-script slot those keys can satisfy, and merges
+    /// the resulting partial signatures into the accumulator until K is
+    /// reached. K-of-N completion across independent cosigner
     /// wallets proceeds by exchanging the partial bundle to the next
     /// cosigner's `pskb_sign` round; the per-input `K`-cap gate (here, the
     /// already-fully-signed short-circuit) keeps the bundle at no more than
@@ -617,29 +650,112 @@ impl Account for MultiSig {
 
         let k = self.minimum_signatures;
         let network_id = self.wallet().clone().network_id()?;
-        let multisig_derivation_index = self.cosigner_index();
 
         let account_dyn = self.clone().as_dyn_arc();
         let mut accumulator = Bundle(bundle.0.clone());
         populate_multisig_redeem_scripts(account_dyn.clone(), &mut accumulator, k).await?;
 
-        let already_fully_signed =
-            accumulator.iter().all(|pskt_inner| pskt_inner.inputs.iter().all(|input| input.partial_sigs.len() >= k as usize));
-        if !already_fully_signed {
-            let prv_key_data = self.prv_key_data(wallet_secret.clone()).await?;
-            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
-                &accumulator,
-                account_dyn.clone(),
-                &prv_key_data,
-                payment_secret.as_ref(),
-                multisig_derivation_index,
-                network_id,
-            )
-            .await?;
-            merge_cosigner_bundle(&mut accumulator, per_cosigner_bundle)?;
+        if !bundle_reaches_threshold(&accumulator, k) {
+            for prv_key_data in self.load_local_cosigner_keydata(&wallet_secret).await? {
+                if bundle_reaches_threshold(&accumulator, k) {
+                    break;
+                }
+                for cosigner_index in multisig_cosigner_indexes(account_dyn.clone(), &prv_key_data, payment_secret.as_ref()).await? {
+                    if bundle_reaches_threshold(&accumulator, k) {
+                        break;
+                    }
+                    let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                        &accumulator,
+                        account_dyn.clone(),
+                        &prv_key_data,
+                        payment_secret.as_ref(),
+                        cosigner_index,
+                        network_id,
+                    )
+                    .await?;
+                    merge_cosigner_bundle(&mut accumulator, per_cosigner_bundle)?;
+                }
+            }
         }
 
         Ok(accumulator)
+    }
+
+    /// Transfer funds from this multisig account to another wallet account.
+    ///
+    /// Mirrors `MultiSig::send`'s routing: the `route_as_single_sig` P2PK seat
+    /// takes the single-signature `Signer` path; every other shape assembles
+    /// the K-of-N bundle via `build_multisig_signed_bundle` and broadcasts it.
+    /// The destination account's receive address and utxo context are resolved
+    /// exactly as the trait-default `transfer` does. A `K >= 2` group whose
+    /// local seat cannot reach the quorum surfaces
+    /// `MultisigInsufficientCosignerMaterial`, identical to `send` / `sweep`,
+    /// because a partial bundle is rejected at the consensus `OpCheckMultiSig`
+    /// extract.
+    async fn transfer(
+        self: Arc<Self>,
+        destination_account_id: AccountId,
+        transfer_amount_sompi: u64,
+        fee_rate: Option<f64>,
+        priority_fee_sompi: Fees,
+        wallet_secret: Secret,
+        payment_secret: Option<Secret>,
+        abortable: &Abortable,
+        notifier: Option<GenerationNotifier>,
+        guard: &WalletGuard,
+    ) -> Result<(GeneratorSummary, Vec<kaspa_hashes::Hash>)> {
+        let destination_account = self
+            .wallet()
+            .get_account_by_id(&destination_account_id, guard)
+            .await?
+            .ok_or(Error::AccountNotFound(destination_account_id))?;
+        let destination_address = destination_account.receive_address()?;
+        let destination = PaymentDestination::from(PaymentOutput::new(destination_address, transfer_amount_sompi));
+
+        let settings =
+            GeneratorSettings::try_new_with_account(self.clone().as_dyn_arc(), destination, fee_rate, priority_fee_sompi, None)?
+                .utxo_context_transfer(destination_account.utxo_context());
+
+        if self.route_as_single_sig() {
+            let keydata = self.load_sole_cosigner_keydata(&wallet_secret).await?;
+            let signer = Arc::new(Signer::new(self.clone().as_dyn_arc(), keydata, payment_secret));
+            let generator = Generator::try_new(settings, Some(signer), Some(abortable))?;
+
+            let mut stream = generator.stream();
+            let mut ids = vec![];
+            while let Some(transaction) = stream.try_next().await? {
+                transaction.try_sign()?;
+                ids.push(transaction.try_submit(&self.wallet().rpc_api()).await?);
+
+                if let Some(notifier) = notifier.as_ref() {
+                    notifier(&transaction);
+                }
+                yield_executor().await;
+            }
+
+            return Ok((generator.summary(), ids));
+        }
+
+        let local_seats = self.matched_local_seat_count(&wallet_secret, payment_secret.as_ref()).await?;
+        if local_seats < self.minimum_signatures as usize {
+            return Err(Error::MultisigInsufficientCosignerMaterial { local: local_seats, required: self.minimum_signatures });
+        }
+
+        let xpub_keys_strings: Vec<String> = self.xpub_keys.iter().map(|k| k.to_string(Some(KeyPrefix::XPUB))).collect();
+        let (bundle, summary) = build_multisig_signed_bundle(
+            self.clone().as_dyn_arc(),
+            xpub_keys_strings,
+            self.minimum_signatures,
+            settings,
+            wallet_secret,
+            payment_secret,
+            abortable,
+            notifier,
+        )
+        .await?;
+
+        let ids = self.clone().as_dyn_arc().pskb_broadcast(&bundle).await?;
+        Ok((summary, ids))
     }
 }
 
@@ -664,22 +780,72 @@ fn merge_cosigner_bundle(accumulator: &mut Bundle, per_cosigner_bundle: Bundle) 
     Ok(())
 }
 
-/// Build a PSKB carrying the local wallet's single cosigner signature.
+fn bundle_reaches_threshold(bundle: &Bundle, k: u16) -> bool {
+    bundle.iter().all(|pskt_inner| pskt_inner.inputs.iter().all(|input| input.partial_sigs.len() >= k as usize))
+}
+
+async fn load_account_local_cosigner_keydata(account: Arc<dyn Account>, wallet_secret: &Secret) -> Result<Vec<PrvKeyData>> {
+    let prv_key_data_ids: Vec<PrvKeyDataId> = (&account.to_storage()?.prv_key_data_ids).into_iter().collect();
+    if prv_key_data_ids.is_empty() {
+        return Err(Error::AccountKindFeature);
+    }
+
+    let prv_key_data_store = account.wallet().store().as_prv_key_data_store()?;
+    let mut keydata = Vec::with_capacity(prv_key_data_ids.len());
+    for prv_key_data_id in prv_key_data_ids {
+        keydata.push(
+            prv_key_data_store
+                .load_key_data(wallet_secret, &prv_key_data_id)
+                .await?
+                .ok_or(Error::PrivateKeyNotFound(prv_key_data_id))?,
+        );
+    }
+    Ok(keydata)
+}
+
+/// Resolve every cosigner position the given key backs: for each stored
+/// xpub, derive the key's xpub at that xpub's embedded seat and collect the
+/// positions whose full serialization matches. One key backs several
+/// positions when several of its hardened children are registered in the
+/// same group.
+async fn multisig_cosigner_indexes(
+    account: Arc<dyn Account>,
+    prv_key_data: &PrvKeyData,
+    payment_secret: Option<&Secret>,
+) -> Result<Vec<u32>> {
+    let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?;
+    let mut matched = Vec::new();
+    let mut last_derived_xpub = String::new();
+    for (index, xpub) in xpub_keys.iter().enumerate() {
+        let seat_index = xpub_seat_index(xpub);
+        let derived_xpub = prv_key_data.create_xpub(payment_secret, MULTISIG_ACCOUNT_KIND.into(), seat_index).await?;
+        let derived_xpub_string = derived_xpub.to_string(Some(KeyPrefix::XPUB));
+        if derived_xpub_string == xpub.to_string(Some(KeyPrefix::XPUB)) {
+            matched.push(index as u32);
+        } else {
+            last_derived_xpub = derived_xpub_string;
+        }
+    }
+    if matched.is_empty() {
+        return Err(Error::MultisigCosignerXpubNotFound { prv_key_data_id: prv_key_data.id, derived_xpub: last_derived_xpub });
+    }
+    Ok(matched)
+}
+
+/// Build a PSKB carrying the local wallet's cosigner signatures.
 ///
 /// Algorithm: build the empty PSKT bundle once via the standard PSKBSigner
 /// machinery (the placeholder signer is held but never invoked during stream
-/// polling), populate every input's redeem-script, then apply the local
-/// cosigner's signature once. The account holds one local signing seat, so
-/// the bundle carries exactly one partial signature per input.
+/// polling), populate every input's redeem-script, then apply local cosigner
+/// signatures until the threshold is reached or local material is exhausted.
 ///
-/// A 1-of-N group (or the 1-of-1 P2PK fast path handled by the caller) is
-/// complete and ready for broadcast. A K-of-N group with `K >= 2` is a
-/// partial bundle that completes the K-quorum through downstream `pskb_sign`
-/// exchange rounds across the independent cosigner wallets before broadcast.
-/// Callers that directly broadcast the returned bundle (e.g., `MultiSig::send`
-/// / `MultiSig::sweep`) MUST reject the partial (`K >= 2`) case themselves
-/// before invoking this helper, since a partial bundle is rejected at the
-/// consensus `OpCheckMultiSig` extract.
+/// A bundle whose local seat count reaches K is complete and ready for
+/// broadcast. A bundle with fewer local signatures remains partial and
+/// completes through downstream `pskb_sign` exchange rounds across other
+/// cosigner wallets before broadcast. Callers that directly broadcast the
+/// returned bundle (e.g., `MultiSig::send` / `MultiSig::sweep`) MUST reject
+/// the partial case themselves before invoking this helper, since a partial
+/// bundle is rejected at the consensus `OpCheckMultiSig` extract.
 #[allow(clippy::too_many_arguments)]
 pub(crate) async fn build_multisig_signed_bundle(
     account: Arc<dyn Account>,
@@ -694,26 +860,11 @@ pub(crate) async fn build_multisig_signed_bundle(
     let k = minimum_signatures;
 
     let network_id = account.wallet().clone().network_id()?;
-    let derivation_capable = account.clone().as_derivation_capable()?;
-    let account_index = derivation_capable.account_index();
-    // The local wallet's cosigner_index. Threaded through to
-    // `pskb_signer_for_multisig_cosigner` as the `default_cosigner_index`
-    // fallback for inputs whose `bip32_derivations` is empty (a synthetic
-    // primitive test fixture, for example). The primary signing path
-    // consumes the per-input `KeySource.derivation_path` populated by
-    // `populate_multisig_redeem_scripts` below, which encodes the funded
-    // cosigner-prefix family's leaf path -- the same path each cosigner
-    // derives its xprv at to produce the slot pubkey matching the
-    // redeem-script.
-    let multisig_derivation_index = derivation_capable.cosigner_index();
-
-    // The operator's own cosigner key, resolved through the account's sole
-    // local key-data id.
-    let prv_key_data = account.prv_key_data(wallet_secret.clone()).await?;
+    let local_keydata = load_account_local_cosigner_keydata(account.clone(), &wallet_secret).await?;
 
     // PSKTGenerator requires a PSKBSigner by construction but does not invoke
     // it during stream polling; the placeholder uses the local cosigner keydata.
-    let placeholder_signer = Arc::new(PSKBSigner::new(account.clone(), prv_key_data.clone(), payment_secret.clone()));
+    let placeholder_signer = Arc::new(PSKBSigner::new(account.clone(), local_keydata[0].clone(), payment_secret.clone()));
 
     let generator = Generator::try_new(settings, None, Some(abortable))?;
     let pskt_generator = PSKTGenerator::new(generator.clone(), placeholder_signer, account.wallet().address_prefix()?);
@@ -726,27 +877,35 @@ pub(crate) async fn build_multisig_signed_bundle(
     // extracted transaction with a P2SH-hash mismatch.
     populate_multisig_redeem_scripts(account.clone(), &mut accumulator, k).await?;
 
-    // Validate the master is a member of the cosigner set (defense-in-depth;
-    // a correctly-constructed local-seat account always derives a member xpub
-    // at its own account_index), then apply its single signature. The xpub is
-    // re-derived at this account's `account_index` so a multi-group wallet
-    // (distinct account_index per group) validates against the right group.
-    let this_xpub = prv_key_data.create_xpub(payment_secret.as_ref(), MULTISIG_ACCOUNT_KIND.into(), account_index).await?;
-    let this_xpub_string = this_xpub.to_string(Some(KeyPrefix::XPUB));
-    if !xpub_keys_strings.iter().any(|s| s == &this_xpub_string) {
-        return Err(Error::MultisigCosignerXpubNotFound { prv_key_data_id: prv_key_data.id, derived_xpub: this_xpub_string });
-    }
+    for prv_key_data in local_keydata.iter() {
+        if bundle_reaches_threshold(&accumulator, k) {
+            break;
+        }
 
-    let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
-        &accumulator,
-        account.clone(),
-        &prv_key_data,
-        payment_secret.as_ref(),
-        multisig_derivation_index,
-        network_id,
-    )
-    .await?;
-    merge_cosigner_bundle(&mut accumulator, per_cosigner_bundle)?;
+        for cosigner_index in multisig_cosigner_indexes(account.clone(), prv_key_data, payment_secret.as_ref()).await? {
+            if bundle_reaches_threshold(&accumulator, k) {
+                break;
+            }
+            let local_xpub_string = account
+                .xpub_keys()
+                .and_then(|xpubs| xpubs.get(cosigner_index as usize))
+                .map(|xpub| xpub.to_string(Some(KeyPrefix::XPUB)))
+                .ok_or_else(|| Error::custom("multisig account local cosigner_index out of xpub range"))?;
+            if !xpub_keys_strings.iter().any(|s| s == &local_xpub_string) {
+                return Err(Error::MultisigCosignerXpubNotFound { prv_key_data_id: prv_key_data.id, derived_xpub: local_xpub_string });
+            }
+            let per_cosigner_bundle = pskb_signer_for_multisig_cosigner(
+                &accumulator,
+                account.clone(),
+                prv_key_data,
+                payment_secret.as_ref(),
+                cosigner_index,
+                network_id,
+            )
+            .await?;
+            merge_cosigner_bundle(&mut accumulator, per_cosigner_bundle)?;
+        }
+    }
 
     Ok((accumulator, generator.summary()))
 }
@@ -776,7 +935,8 @@ pub(crate) async fn build_multisig_signed_bundle(
 /// redeem-script keyed to Y's derivation chain.
 ///
 /// **bip32 derivations.** The helper additionally records the funded address's
-/// derivation path (`m/45'/111111'/account_index'/<funded_cosigner_index>/<address_type>/<address_index>`)
+/// derivation path (`m/45'/111111'/<seat>'/<funded_cosigner_index>/<address_type>/<address_index>`,
+/// one entry per cosigner xpub, each at the hardened seat embedded in that xpub)
 /// on the PSKT input via `bip32_derivations`, keyed by the local cosigner's
 /// slot pubkey at that path. At sign time, every cosigner reads the recorded
 /// path, derives their own xprv at the same path, produces the cosigner's
@@ -793,15 +953,8 @@ pub(crate) async fn build_multisig_signed_bundle(
 pub(crate) async fn populate_multisig_redeem_scripts(account: Arc<dyn Account>, bundle: &mut Bundle, k: u16) -> Result<()> {
     let derivation_capable = account.clone().as_derivation_capable()?;
     let derivation = derivation_capable.derivation();
-    let local_cosigner_index = derivation_capable.cosigner_index();
-    let account_index = derivation_capable.account_index();
     let xpub_keys = account.xpub_keys().ok_or(Error::custom("multisig account missing xpub_keys"))?.clone();
     let network_id = account.wallet().clone().network_id()?;
-    let local_xpub = xpub_keys
-        .get(local_cosigner_index as usize)
-        .ok_or_else(|| Error::custom("multisig account local cosigner_index out of xpub range"))?
-        .clone();
-    let local_key_fingerprint = local_xpub.fingerprint();
 
     for pskt_inner in bundle.0.iter_mut() {
         for input in pskt_inner.inputs.iter_mut() {
@@ -840,19 +993,22 @@ pub(crate) async fn populate_multisig_redeem_scripts(account: Arc<dyn Account>, 
             }
 
             if needs_bip32_derivations {
-                let local_derived = local_xpub
-                    .clone()
-                    .derive_child(ChildNumber::new(funded_cosigner_index, false)?)?
-                    .derive_child(ChildNumber::new(address_type.index(), false)?)?
-                    .derive_child(ChildNumber::new(address_index, false)?)?;
-                let local_slot_pubkey = *local_derived.public_key();
-                let derivation_path: DerivationPath =
-                    format!("m/45'/111111'/{account_index}'/{funded_cosigner_index}/{}/{address_index}", address_type.index())
-                        .parse()
-                        .map_err(|e: kaspa_bip32::Error| Error::custom(format!("multisig derivation path parse failed: {e}")))?;
-                input
-                    .bip32_derivations
-                    .insert(local_slot_pubkey, Some(KeySource { key_fingerprint: local_key_fingerprint, derivation_path }));
+                for xpub in xpub_keys.iter() {
+                    let seat_index = xpub_seat_index(xpub);
+                    let derived = xpub
+                        .clone()
+                        .derive_child(ChildNumber::new(funded_cosigner_index, false)?)?
+                        .derive_child(ChildNumber::new(address_type.index(), false)?)?
+                        .derive_child(ChildNumber::new(address_index, false)?)?;
+                    let slot_pubkey = *derived.public_key();
+                    let derivation_path: DerivationPath =
+                        format!("m/45'/111111'/{seat_index}'/{funded_cosigner_index}/{}/{address_index}", address_type.index())
+                            .parse()
+                            .map_err(|e: kaspa_bip32::Error| Error::custom(format!("multisig derivation path parse failed: {e}")))?;
+                    input
+                        .bip32_derivations
+                        .insert(slot_pubkey, Some(KeySource { key_fingerprint: xpub.fingerprint(), derivation_path }));
+                }
             }
         }
     }
@@ -881,6 +1037,20 @@ impl DerivationCapableAccount for MultiSig {
     /// occupies, producing an `EvalFalse` consensus rejection at PSKT extract.
     fn cosigner_index(&self) -> u32 {
         self.cosigner_index.map(|v| v as u32).unwrap_or(0)
+    }
+
+    fn create_private_keys<'l>(
+        &self,
+        key_data: &PrvKeyData,
+        payment_secret: &Option<Secret>,
+        receive: &[(&'l Address, u32)],
+        change: &[(&'l Address, u32)],
+    ) -> Result<Vec<(&'l Address, secp256k1::SecretKey)>> {
+        let payload = key_data.payload.decrypt(payment_secret.as_ref())?;
+        let xkey = payload.get_xprv(payment_secret.as_ref())?;
+        let cosigner_index = self.cosigner_index();
+        let seat_index = xpub_seat_for_derivation(&self.xpub_keys, self.cosigner_index);
+        crate::account::create_private_keys(&self.account_kind(), cosigner_index, seat_index, &xkey, receive, change)
     }
 }
 
