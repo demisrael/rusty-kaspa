@@ -76,13 +76,16 @@ impl Account {
 
                 let account_name = account_name.as_deref();
                 match create_key_source(&account_kind, explicit_kind) {
-                    CreateKeySource::StoredOnly | CreateKeySource::FreshLegacy => {
+                    CreateKeySource::StoredOnly => {
                         let prv_key_data_info = ctx.select_private_key().await?;
                         wizards::account::create(&ctx, prv_key_data_info, account_kind, account_name).await?;
                     }
                     CreateKeySource::StoredOrGenerate => {
                         let prv_key_data_info = ctx.select_private_key_or_create().await?;
                         wizards::account::create(&ctx, prv_key_data_info, account_kind, account_name).await?;
+                    }
+                    CreateKeySource::FreshLegacy => {
+                        wizards::account::create_legacy(&ctx, account_name).await?;
                     }
                 };
             }

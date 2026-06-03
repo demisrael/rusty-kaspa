@@ -1782,6 +1782,11 @@ impl Wallet {
         // Ok(())
     }
 
+    /// Import a single-sig (BIP32 or legacy KDX) account from a mnemonic
+    /// into the open wallet. The key is stored as its own
+    /// separately-encrypted wallet entry; re-importing an already-present
+    /// key reuses the existing entry (idempotent) and reconstructs the same
+    /// account rather than storing a duplicate or rejecting.
     pub async fn import_with_mnemonic(
         self: &Arc<Wallet>,
         wallet_secret: &Secret,
@@ -1792,8 +1797,7 @@ impl Wallet {
     ) -> Result<Arc<dyn Account>> {
         let prv_key_data = storage::PrvKeyData::try_new_from_mnemonic(mnemonic, payment_secret, self.store().encryption_kind()?)?;
         let prv_key_data_store = self.store().as_prv_key_data_store()?;
-        let key_exists = prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_some();
-        // let mut is_legacy = false;
+        let key_is_new = prv_key_data_store.load_key_data(wallet_secret, &prv_key_data.id).await?.is_none();
         let account: Arc<dyn Account> = match account_kind.as_ref() {
             BIP32_ACCOUNT_KIND => {
                 let account_index = 0;
@@ -1819,7 +1823,7 @@ impl Wallet {
         }
 
         self.inner.store.batch().await?;
-        if !key_exists {
+        if key_is_new {
             prv_key_data_store.store(wallet_secret, prv_key_data).await?;
         }
         account_store.store_single(&account.to_storage()?, None).await?;
@@ -7181,6 +7185,39 @@ mod multisig_tests {
         let mnemonic = Mnemonic::random(kaspa_bip32::WordCount::Words12, Language::English).unwrap();
         let account = wallet.import_with_mnemonic(&wallet_secret, None, mnemonic, LEGACY_ACCOUNT_KIND.into(), false).await.unwrap();
         assert_eq!(account.account_kind().as_ref(), LEGACY_ACCOUNT_KIND, "legacy import yields a legacy-kind account");
+    }
+
+    #[tokio::test]
+    async fn create_account_legacy_from_twelve_word_key_round_trips_through_import() {
+        let wallet_secret = Secret::new(vec![]);
+        let mnemonic = Mnemonic::random(kaspa_bip32::WordCount::Words12, Language::English).unwrap();
+        assert_eq!(mnemonic.phrase().split_whitespace().count(), 12, "legacy create fixture uses a 12-word phrase");
+
+        let wallet_create = test_wallet().await;
+        let prv_key_data_id = wallet_create
+            .create_prv_key_data(
+                &wallet_secret,
+                PrvKeyDataCreateArgs::new(
+                    None,
+                    None,
+                    Secret::from(mnemonic.phrase_string()),
+                    storage::keydata::PrvKeyDataVariantKind::Mnemonic,
+                ),
+            )
+            .await
+            .unwrap();
+        let created = wallet_create.create_account_legacy(&wallet_secret, prv_key_data_id, None).await.unwrap();
+        assert_eq!(created.account_kind().as_ref(), LEGACY_ACCOUNT_KIND, "legacy create yields a legacy-kind account");
+
+        let wallet_import = test_wallet().await;
+        let imported =
+            wallet_import.import_with_mnemonic(&wallet_secret, None, mnemonic, LEGACY_ACCOUNT_KIND.into(), false).await.unwrap();
+        assert_eq!(created.id(), imported.id(), "legacy create and legacy import reconstruct the same account id");
+        assert_eq!(
+            created.receive_address().unwrap(),
+            imported.receive_address().unwrap(),
+            "legacy create and legacy import derive the same first receive address",
+        );
     }
 
     /// Re-importing the SAME mnemonic reuses the existing key entry and

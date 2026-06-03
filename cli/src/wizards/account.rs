@@ -1,9 +1,11 @@
 use crate::cli::KaspaCli;
 use crate::imports::*;
 use crate::result::Result;
-use kaspa_wallet_core::account::MULTISIG_ACCOUNT_KIND;
+use kaspa_bip32::{Language, Mnemonic, WordCount};
+use kaspa_wallet_core::account::{LEGACY_ACCOUNT_KIND, MULTISIG_ACCOUNT_KIND};
 use kaspa_wallet_core::error::Error as WalletError;
 use kaspa_wallet_core::storage::keydata::PrvKeyData;
+use kaspa_wallet_core::storage::keydata::PrvKeyDataVariantKind;
 use kaspa_wallet_core::wallet::{MultisigCurve, max_multisig_cosigners};
 
 pub(crate) async fn create(
@@ -15,11 +17,7 @@ pub(crate) async fn create(
     let term = ctx.term();
     let wallet = ctx.wallet();
 
-    let name = if let Some(name) = name {
-        Some(name.to_string())
-    } else {
-        Some(term.ask(false, "Please enter account name (optional, press <enter> to skip): ").await?.trim().to_string())
-    };
+    let name = ask_account_name(&term, name).await?;
 
     if account_kind == MULTISIG_ACCOUNT_KIND {
         return create_multisig(ctx, prv_key_data_info, name).await;
@@ -28,6 +26,10 @@ pub(crate) async fn create(
     let wallet_secret = Secret::new(term.ask(true, "Enter wallet password: ").await?.trim().as_bytes().to_vec());
     if wallet_secret.as_ref().is_empty() {
         return Err(Error::WalletSecretRequired);
+    }
+
+    if account_kind == LEGACY_ACCOUNT_KIND {
+        return Err(Error::Custom("account create legacy must use the dedicated legacy create path".to_string()));
     }
 
     let payment_secret = if prv_key_data_info.is_encrypted() {
@@ -50,6 +52,47 @@ pub(crate) async fn create(
     tprintln!(ctx, "\naccount created: {}\n", account.get_list_string()?);
     wallet.select(Some(&account)).await?;
     Ok(())
+}
+
+pub(crate) async fn create_legacy(ctx: &Arc<KaspaCli>, name: Option<&str>) -> Result<()> {
+    let term = ctx.term();
+    let wallet = ctx.wallet();
+    let name = ask_account_name(&term, name).await?;
+
+    let mnemonic = Mnemonic::random(WordCount::Words12, Language::default())?;
+    tprintln!(ctx, "");
+    tprintln!(ctx, "{}", style("IMPORTANT:").red());
+    tprintln!(ctx, "Back up this mnemonic before continuing. It controls the legacy account created from this key.");
+    tprintln!(ctx, "");
+    tprintln!(ctx, "{}", mnemonic.phrase());
+    tprintln!(ctx, "");
+    let confirm = term.ask(false, "Type 'yes' after you have backed it up: ").await?;
+    if confirm.trim() != "yes" {
+        return Err(Error::UserAbort);
+    }
+
+    let wallet_secret = Secret::new(term.ask(true, "Enter wallet password: ").await?.trim().as_bytes().to_vec());
+    if wallet_secret.as_ref().is_empty() {
+        return Err(Error::WalletSecretRequired);
+    }
+
+    let prv_key_data_id = wallet.create_prv_key_data(&wallet_secret, legacy_prv_key_data_args(&mnemonic)).await?;
+    let account = wallet.create_account_legacy(&wallet_secret, prv_key_data_id, name).await?;
+    tprintln!(ctx, "\naccount created: {}\n", account.get_list_string()?);
+    wallet.select(Some(&account)).await?;
+    Ok(())
+}
+
+async fn ask_account_name(term: &Arc<Terminal>, name: Option<&str>) -> Result<Option<String>> {
+    if let Some(name) = name {
+        Ok(Some(name.to_string()))
+    } else {
+        Ok(Some(term.ask(false, "Please enter account name (optional, press <enter> to skip): ").await?.trim().to_string()))
+    }
+}
+
+fn legacy_prv_key_data_args(mnemonic: &Mnemonic) -> PrvKeyDataCreateArgs {
+    PrvKeyDataCreateArgs::new(None, None, Secret::from(mnemonic.phrase_string()), PrvKeyDataVariantKind::Mnemonic)
 }
 
 async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataInfo>, account_name: Option<String>) -> Result<()> {
@@ -451,5 +494,15 @@ mod tests {
                 other => panic!("expected Error::Custom for {ans:?}, got {other:?}"),
             }
         }
+    }
+
+    #[test]
+    fn legacy_prv_key_data_args_use_plain_twelve_word_mnemonic() {
+        let mnemonic = Mnemonic::random(WordCount::Words12, Language::English).unwrap();
+        let args = legacy_prv_key_data_args(&mnemonic);
+
+        assert!(args.payment_secret.is_none(), "legacy create must not attach a BIP39 payment secret");
+        assert!(matches!(args.kind, PrvKeyDataVariantKind::Mnemonic), "legacy create stores mnemonic key data");
+        assert_eq!(args.secret.as_str().unwrap().split_whitespace().count(), 12, "legacy create must store exactly 12 words");
     }
 }
