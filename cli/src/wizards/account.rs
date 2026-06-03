@@ -95,13 +95,17 @@ fn legacy_prv_key_data_args(mnemonic: &Mnemonic) -> PrvKeyDataCreateArgs {
     PrvKeyDataCreateArgs::new(None, None, Secret::from(mnemonic.phrase_string()), PrvKeyDataVariantKind::Mnemonic)
 }
 
-async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataInfo>, account_name: Option<String>) -> Result<()> {
+pub(crate) async fn create_multisig(
+    ctx: &Arc<KaspaCli>,
+    prv_key_data_info: Arc<PrvKeyDataInfo>,
+    account_name: Option<String>,
+) -> Result<()> {
     let term = ctx.term();
     let wallet = ctx.wallet();
     let (wallet_secret, _) = ctx.ask_wallet_secret(None).await?;
     let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
-    let account_index_answer = term.ask(false, "Enter the account index (press <enter> for auto-assign): ").await?;
+    let account_index_answer = term.ask(false, "Enter the seat index (press <enter> for auto-assign): ").await?;
 
     let ecdsa = ask_curve(&term).await?;
     let payment_secret = if prv_key_data_info.is_encrypted() {
@@ -114,9 +118,8 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
         None
     };
 
-    // Reuse the wallet's single mnemonic; the multisig account is one more
-    // hardened child of the same seed that owns every other account in this
-    // wallet, mirroring the bip32 wizard above.
+    // Load the selected key; the multisig account is one more hardened
+    // child of that seed, mirroring the bip32 wizard above.
     let prv_key_data = wallet
         .store()
         .as_prv_key_data_store()?
@@ -124,13 +127,13 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
         .await?
         .ok_or_else(|| WalletError::PrivateKeyNotFound(prv_key_data_info.id))?;
 
-    // The index is private per-cosigner bookkeeping: it is baked into the
-    // xpub each cosigner shares and never re-enters the joint redeem-script
-    // derivation, so cosigners do not coordinate it. One seed can join many
-    // groups, each under its own locally-chosen index. Empty input
-    // auto-assigns the lowest index not yet backing a group on the selected
-    // key, enumerated from the embedded indexes of its stored xpubs, so each
-    // auto-assigned group derives a fresh xpub.
+    // The seat index is private per-cosigner bookkeeping: it is baked into
+    // the xpub each cosigner shares and never re-enters the joint
+    // redeem-script derivation, so cosigners do not coordinate it. One seed
+    // can join many groups, each under its own locally-chosen seat. Empty
+    // input auto-assigns the lowest seat not yet backing a group on the
+    // selected key, enumerated from the embedded indexes of its stored
+    // xpubs, so each auto-assigned group derives a fresh xpub.
     let used_indexes = wallet.used_multisig_seat_indexes_for_key(&prv_key_data, payment_secret.as_ref()).await?;
     let account_index: u64 = match account_index_answer.trim() {
         "" => wallet.next_multisig_seat_index_for_key(&prv_key_data, payment_secret.as_ref()).await?,
@@ -139,7 +142,7 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
     if used_indexes.contains(&account_index) {
         tprintln!(
             ctx,
-            "\nnote: this index already backs another multisig group on this key; \
+            "\nnote: this seat already backs another multisig group on this key; \
             those groups share one extended public key, so they are publicly linkable.\n"
         );
     }
@@ -149,7 +152,7 @@ async fn create_multisig(ctx: &Arc<KaspaCli>, prv_key_data_info: Arc<PrvKeyDataI
     // while the wizard is still waiting for input.
     let xpub_key = derive_multisig_xpub_from_wallet_key(&prv_key_data, payment_secret.as_ref(), account_index).await?;
     let curve_name = if ecdsa { "ecdsa" } else { "schnorr" };
-    tprintln!(ctx, "\nextended public key (account_index={account_index}, curve={curve_name}):\n");
+    tprintln!(ctx, "\nextended public key (seat={account_index}, curve={curve_name}):\n");
     tprintln!(ctx, "{}\n", wallet.network_format_xpub(&xpub_key));
 
     let prv_key_data_args = vec![PrvKeyDataArgs::new(prv_key_data_info.id, payment_secret)];
@@ -291,7 +294,7 @@ pub(crate) async fn multisig_watch(ctx: &Arc<KaspaCli>, name: Option<&str>) -> R
     let (wallet_secret, _) = ctx.ask_wallet_secret(None).await?;
     let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
 
-    let account_index_answer = term.ask(false, "Enter the account index (press <enter> for auto-assign): ").await?;
+    let account_index_answer = term.ask(false, "Enter the account slot (press <enter> for auto-assign): ").await?;
     let account_index: Option<u64> = match account_index_answer.trim() {
         "" => None,
         s => Some(s.parse()?),

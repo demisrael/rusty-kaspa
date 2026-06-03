@@ -3,6 +3,7 @@ use crate::imports::*;
 use crate::result::Result;
 use kaspa_bip32::{Language, Mnemonic, WordCount};
 use kaspa_wallet_core::error::Error as WalletError;
+use kaspa_wallet_core::storage::keydata::PrvKeyData;
 use kaspa_wallet_core::storage::keydata::PrvKeyDataVariantKind;
 use kaspa_wallet_core::{
     storage::{Hint, make_filename},
@@ -14,6 +15,7 @@ pub(crate) async fn create(
     wallet_guard: Option<WalletGuard<'_>>,
     name: Option<&str>,
     import_with_mnemonic: bool,
+    multisig: bool,
 ) -> Result<()> {
     let term = ctx.term();
     let wallet = ctx.wallet();
@@ -137,7 +139,32 @@ pub(crate) async fn create(
 
     let mnemonic_phrase = prv_key_data_args.secret.clone();
 
-    let ecdsa = crate::wizards::account::ask_curve(&term).await?;
+    let multisig_import_args = if import_with_mnemonic && multisig {
+        let mnemonic = Mnemonic::new(mnemonic_phrase.as_str()?.trim(), Language::English)?;
+        let prv_key_data =
+            PrvKeyData::try_new_from_mnemonic(mnemonic.clone(), payment_secret.as_ref(), EncryptionKind::XChaCha20Poly1305)?;
+        let mut xpubs = Vec::new();
+        loop {
+            let xpub_key = term.ask(false, "Enter cosigner extended public key, including your own: (empty to stop)").await?;
+            if xpub_key.is_empty() {
+                break;
+            }
+            xpubs.push(xpub_key.trim().to_owned());
+        }
+        let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
+        let multisig_ecdsa = crate::wizards::account::ask_curve(&term).await?;
+        crate::wizards::account::check_cosigner_count_under_curve_cap(
+            xpubs.len(),
+            minimum_signatures,
+            kaspa_wallet_core::wallet::MultisigCurve::from_ecdsa_bool(multisig_ecdsa),
+        )?;
+        wallet.identify_own_multisig_xpubs(&prv_key_data, payment_secret.as_ref(), &xpubs).await?;
+        Some((mnemonic, xpubs, minimum_signatures, multisig_ecdsa))
+    } else {
+        None
+    };
+
+    let ecdsa = if multisig_import_args.is_some() { false } else { crate::wizards::account::ask_curve(&term).await? };
 
     let notifier = ctx.notifier().show(Notification::Processing).await;
 
@@ -228,6 +255,25 @@ pub(crate) async fn create(
 
     wallet.open(&wallet_secret, name.map(String::from), WalletOpenArgs::default_with_legacy_accounts(), &guard).await?;
     wallet.activate_accounts(None, &guard).await?;
+
+    if let Some((mnemonic, xpubs, minimum_signatures, multisig_ecdsa)) = multisig_import_args {
+        let accounts = wallet
+            .import_multisig_with_mnemonic(
+                &wallet_secret,
+                (mnemonic, payment_secret.clone()),
+                None,
+                minimum_signatures,
+                xpubs,
+                multisig_ecdsa,
+            )
+            .await?;
+        for account in accounts.iter() {
+            tprintln!(ctx, "\nmultisig account imported: {}\n", account.get_list_string()?);
+        }
+        if let Some(account) = accounts.last() {
+            wallet.select(Some(account)).await?;
+        }
+    }
 
     Ok(())
 }
