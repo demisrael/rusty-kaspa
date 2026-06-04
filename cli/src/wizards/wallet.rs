@@ -278,6 +278,82 @@ pub(crate) async fn create(
     Ok(())
 }
 
+pub(crate) async fn create_container(
+    ctx: &Arc<KaspaCli>,
+    wallet_guard: Option<WalletGuard<'_>>,
+    name: Option<&str>,
+) -> Result<Secret> {
+    let term = ctx.term();
+    let wallet = ctx.wallet();
+    let local_guard = ctx.wallet().guard();
+
+    let guard = match wallet_guard {
+        Some(locked_guard) => locked_guard,
+        None => local_guard.lock().await,
+    };
+
+    if let Err(err) = wallet.network_id() {
+        tprintln!(ctx);
+        tprintln!(ctx, "Before creating a wallet, you need to select a Kaspa network.");
+        tprintln!(ctx, "Please use 'network <name>' command to select a network.");
+        tprintln!(ctx, "Currently available networks are 'mainnet', 'testnet-10' and 'testnet-11'");
+        tprintln!(ctx);
+        return Err(err.into());
+    }
+
+    let filename = make_filename(&name.map(String::from), &None);
+    if wallet.exists(Some(&filename)).await? {
+        tprintln!(ctx, "{}", style("WARNING - A previously created wallet already exists!").red().to_string());
+        tprintln!(ctx, "NOTE: You can create a differently named wallet by using 'wallet create --container <name>'");
+        tprintln!(ctx);
+
+        let overwrite =
+            term.ask(false, "Are you sure you want to overwrite it (type 'y' to approve)?: ").await?.trim().to_string().to_lowercase();
+        if overwrite.ne("y") {
+            return Err(Error::UserAbort);
+        }
+    }
+
+    tpara!(
+        ctx,
+        "\n\
+        \"Phishing hint\" is a secret word or a phrase that is displayed \
+        when you open your wallet. If you do not see the hint when opening \
+        your wallet, you may be accessing a fake wallet designed to steal \
+        your private key.\
+        \n\
+        ",
+    );
+
+    let hint = term.ask(false, "Create phishing hint (optional, press <enter> to skip): ").await?.trim().to_string();
+    let hint = hint.is_not_empty().then_some(hint).map(Hint::from);
+
+    let wallet_secret = Secret::new(term.ask(true, "Enter wallet encryption password: ").await?.trim().as_bytes().to_vec());
+    if wallet_secret.as_ref().is_empty() {
+        return Err(Error::WalletSecretRequired);
+    }
+    let wallet_secret_validate =
+        Secret::new(term.ask(true, "Re-enter wallet encryption password: ").await?.trim().as_bytes().to_vec());
+    if wallet_secret_validate.as_ref() != wallet_secret.as_ref() {
+        return Err(Error::WalletSecretMatch);
+    }
+
+    let notifier = ctx.notifier().show(Notification::Processing).await;
+    wallet.store().batch().await?;
+    let wallet_args = WalletCreateArgs::new(name.map(String::from), None, EncryptionKind::XChaCha20Poly1305, hint, true);
+    let (_wallet_descriptor, storage_descriptor) = wallet.create_wallet(&wallet_secret, wallet_args).await?;
+    wallet.store().flush(&wallet_secret).await?;
+    notifier.hide();
+
+    term.writeln("");
+    term.writeln(format!("Your wallet is stored in: {}", storage_descriptor));
+    term.writeln("");
+
+    wallet.open(&wallet_secret, name.map(String::from), WalletOpenArgs::default_with_legacy_accounts(), &guard).await?;
+    wallet.activate_accounts(None, &guard).await?;
+    Ok(wallet_secret)
+}
+
 /// Parse the operator's answer to the wallet-create mnemonic word-count
 /// prompt. Empty input (operator presses <enter>) yields the legacy
 /// 12-word default so the wizard's default behavior is unchanged from

@@ -4786,6 +4786,177 @@ mod multisig_tests {
         }
     }
 
+    /// Drives one 2-of-3 multisig account that holds two local cosigner keys
+    /// through the production PSKT-construction path. The direct broadcast
+    /// helper must consume both local seats so the bundle reaches K without a
+    /// cross-wallet PSKB exchange.
+    #[tokio::test]
+    async fn multisig_send_extract_via_pskt_generator_2_of_3_two_local_seats() {
+        use crate::account::variants::multisig::build_multisig_signed_bundle;
+        use crate::tx::{Fees, GeneratorSettings, PaymentDestination, PaymentOutputs};
+        use crate::utils::kaspa_to_sompi;
+        use crate::utxo::UtxoEntryReference;
+
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let own_a = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_b = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[1].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_a_id = own_a.id;
+        let own_b_id = own_b.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, own_a).await.unwrap();
+        store.store(&wallet_secret, own_b).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let peer_xpub = external_xpub_for_testnet(mnemonics[2].phrase()).await;
+        let k: u16 = 2;
+        let account = wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(own_a_id, None), PrvKeyDataArgs::new(own_b_id, None)],
+                vec![peer_xpub],
+                None,
+                k,
+                false,
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let multisig: Arc<MultiSig> = account.clone().downcast_arc().expect("account is multisig");
+        assert_eq!(
+            multisig.prv_key_data_ids().as_ref().expect("local cosigner ids").len(),
+            k as usize,
+            "single account stores both local seats needed for the quorum",
+        );
+
+        let xpub_keys = account.xpub_keys().expect("multisig xpubs").clone();
+        let xpub_keys_strings: Vec<String> = xpub_keys.iter().map(|xk| xk.to_string(Some(KeyPrefix::XPUB))).collect();
+        let network_id = wallet.network_id().unwrap();
+
+        let receive_address = account.receive_address().unwrap();
+        let amount: u64 = kaspa_to_sompi(10.0);
+        let utxo_entry = UtxoEntryReference::simulated_with_address(amount, &receive_address);
+        let destination_address =
+            Address::try_from("kaspatest:qqrewmx4gpuekvk8grenkvj2hp7xt0c35rxgq383f6gy223c4ud5s58ptm6er").unwrap();
+        let payment_outputs: PaymentOutputs = (&[(destination_address, kaspa_to_sompi(1.0))] as &[(Address, u64)]).into();
+        let final_destination: PaymentDestination = payment_outputs.into();
+
+        let utxo_iter: Box<dyn Iterator<Item = UtxoEntryReference> + Send + Sync + 'static> = Box::new(std::iter::once(utxo_entry));
+        let settings = GeneratorSettings {
+            network_id,
+            multiplexer: None,
+            sig_op_count: xpub_keys.len() as u8,
+            minimum_signatures: k,
+            change_address: receive_address.clone(),
+            utxo_iterator: utxo_iter,
+            source_utxo_context: None,
+            priority_utxo_entries: None,
+            destination_utxo_context: None,
+            fee_rate: None,
+            final_transaction_priority_fee: Fees::SenderPays(kaspa_to_sompi(0.001)),
+            final_transaction_destination: final_destination,
+            final_transaction_payload: None,
+        };
+
+        let abortable = Abortable::default();
+        let (bundle, _summary) =
+            build_multisig_signed_bundle(account.clone(), xpub_keys_strings, k, settings, wallet_secret, None, &abortable, None)
+                .await
+                .expect("build_multisig_signed_bundle: two local seats satisfy K=2");
+
+        assert!(!bundle.0.is_empty(), "signed bundle has at least one PSKT");
+        for pskt_inner in bundle.0.iter() {
+            for input in pskt_inner.inputs.iter() {
+                assert!(input.redeem_script.is_some(), "every input has redeem_script populated");
+                assert_eq!(input.partial_sigs.len(), k as usize, "both local seats sign each input");
+            }
+        }
+
+        let params = Params::from(network_id);
+        for pskt_inner in bundle.0.into_iter() {
+            let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> = PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(pskt_inner);
+            let finalizer_pskt = signer_pskt.finalizer();
+            let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+            let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+            let extract_result = extractor.extract_tx(&params);
+            assert!(
+                extract_result.is_ok(),
+                "two local seats must satisfy the K=2 spend through the production PSKT-conversion path; got {extract_result:?}",
+            );
+        }
+    }
+
+    /// Applies account-level PSKB signing to a 2-of-3 multisig account that
+    /// stores two local cosigner keys. The helper must consume both local
+    /// seats in one signing round so a restored multi-own account can satisfy
+    /// its quorum without a second wallet.
+    #[tokio::test]
+    async fn multisig_pskb_sign_2_of_3_two_local_seats_reaches_quorum() {
+        let mnemonics = make_local_mnemonics(3).await;
+        let wallet = test_wallet().await;
+        let wallet_secret = Secret::new(vec![]);
+
+        let own_a = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[0].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_b = storage::PrvKeyData::try_new_from_mnemonic(mnemonics[1].clone(), None, EncryptionKind::XChaCha20Poly1305).unwrap();
+        let own_a_id = own_a.id;
+        let own_b_id = own_b.id;
+        let store = wallet.store().as_prv_key_data_store().unwrap();
+        store.store(&wallet_secret, own_a).await.unwrap();
+        store.store(&wallet_secret, own_b).await.unwrap();
+        wallet.inner.store.commit(&wallet_secret).await.unwrap();
+
+        let peer_xpub = external_xpub_for_testnet(mnemonics[2].phrase()).await;
+        let k: u16 = 2;
+        let account = wallet
+            .create_account_multisig(
+                &wallet_secret,
+                vec![PrvKeyDataArgs::new(own_a_id, None), PrvKeyDataArgs::new(own_b_id, None)],
+                vec![peer_xpub],
+                None,
+                k,
+                false,
+                Some(0),
+            )
+            .await
+            .unwrap();
+
+        let receive_address = account.receive_address().unwrap();
+        let script_public_key = pay_to_address_script(&receive_address);
+        let utxo = kaspa_consensus_core::tx::UtxoEntry {
+            amount: 100_000_000,
+            script_public_key,
+            block_daa_score: 1,
+            is_coinbase: false,
+            covenant_id: None,
+        };
+        let input = InputBuilder::default()
+            .utxo_entry(utxo)
+            .previous_outpoint(kaspa_consensus_core::tx::TransactionOutpoint {
+                transaction_id: kaspa_consensus_core::tx::TransactionId::from_slice(&[0xb2; 32]),
+                index: 0,
+            })
+            .sig_op_count(3)
+            .build()
+            .unwrap();
+        let pskt_creator: PSKT<Creator> = PSKT::default().inputs_modifiable().outputs_modifiable();
+        let pskt_inner = pskt_creator.constructor().input(input);
+        let bundle = Bundle::from(pskt_inner);
+
+        let signed = account.clone().pskb_sign(&bundle, wallet_secret, None, None).await.unwrap();
+        assert_eq!(signed.0[0].inputs[0].partial_sigs.len(), k as usize, "both local seats sign the PSKB input");
+
+        let params = Params::from(wallet.network_id().unwrap());
+        let signer_pskt: PSKT<kaspa_wallet_pskt::pskt::Signer> = PSKT::<kaspa_wallet_pskt::pskt::Signer>::from(signed.0[0].clone());
+        let finalizer_pskt = signer_pskt.finalizer();
+        let finalized = finalize_pskt_one_or_more_sig_and_redeem_script(finalizer_pskt).expect("finalize");
+        let extractor = finalized.extractor().expect("extractor: finalized PSKT yields an extractor");
+        let extract_result = extractor.extract_tx(&params);
+        assert!(extract_result.is_ok(), "two local seats must satisfy the K=2 PSKB signing path; got {extract_result:?}");
+    }
+
     /// `build_multisig_signed_bundle` returns a partial bundle (`L < K`)
     /// on a cosigner-split wallet, exercising the relaxed precondition
     /// the REPL `pskb create` flow (`pskb_from_send_generator` ->
@@ -5283,11 +5454,10 @@ mod multisig_tests {
     /// signature, closing the `K = 2` quorum. The finalized K-of-N
     /// script-sig extracts under `TxScriptEngine`.
     ///
-    /// Pins the V-HIGH-1 fix at the cosigner-split topology depth: every
-    /// signing wallet has `L < K` (one local seed, two-of-three threshold)
-    /// by construction. The relaxed
-    /// `build_multisig_signed_bundle` guard allows this topology to flow
-    /// through `pskb_from_send_generator` on testnet; here, the synthetic
+    /// Pins the cosigner-split topology depth: every signing wallet has
+    /// `L < K` (one local seed, two-of-three threshold) by construction. The
+    /// relaxed `build_multisig_signed_bundle` guard allows this topology to
+    /// flow through `pskb_from_send_generator` on testnet; here, the synthetic
     /// PSKT bundle is built directly and walked through
     /// `pskb_signer_for_multisig_cosigner` per cosigner so the test does
     /// not require a live Generator or UtxoContext.

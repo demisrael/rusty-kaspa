@@ -110,6 +110,7 @@ impl Account {
                                 "account import mnemonic multisig [additional keys]",
                                 "Import mnemonic and the full cosigner xpub set for a multisig account",
                             ),
+                            ("account import go-data [<path>]", "Import a kaspawallet Go keyfile into the open wallet"),
                         ],
                         None,
                     )?;
@@ -201,9 +202,21 @@ impl Account {
 
                         return Ok(());
                     }
+                    "go-data" => {
+                        if argv.len() > 1 {
+                            tprintln!(ctx, "usage: 'account import go-data [<path>]'");
+                            tprintln!(ctx, "too many arguments: {}\r\n", argv.join(" "));
+                            return Ok(());
+                        }
+                        let path = argv.pop();
+                        let account = crate::wizards::go_data::import_into_open_wallet(&ctx, path, None).await?;
+                        tprintln!(ctx, "\naccount imported: {}\n", account.get_list_string()?);
+                        wallet.select(Some(&account)).await?;
+                        return Ok(());
+                    }
                     _ => {
                         tprintln!(ctx, "unknown account import type: '{import_kind}'");
-                        tprintln!(ctx, "supported import types are: 'mnemonic', 'legacy-data' or 'multisig-watch'\r\n");
+                        tprintln!(ctx, "supported import types are: 'mnemonic', 'legacy-data', 'go-data' or 'multisig-watch'\r\n");
                         return Ok(());
                     }
                 }
