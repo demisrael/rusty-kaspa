@@ -3,9 +3,12 @@
 //!
 
 use crate::imports::{AccountId, AccountKind, AssocPrvKeyDataIds, PrvKeyDataId};
+use crate::wallet::MultisigCurve;
 use base64::DecodeError;
 use downcast::DowncastError;
 use kaspa_bip32::Error as BIP32Error;
+use kaspa_bip32::Prefix as KeyPrefix;
+use kaspa_consensus_core::network::NetworkType;
 use kaspa_consensus_core::sign::Error as CoreSignError;
 use kaspa_rpc_core::RpcError as KaspaRpcError;
 use kaspa_wrpc_client::error::Error as KaspaWorkflowRpcError;
@@ -21,6 +24,7 @@ use workflow_wasm::printable::*;
 
 /// [`Error`](enum@Error) variants emitted by the wallet framework.
 #[derive(Debug, Error)]
+#[non_exhaustive]
 pub enum Error {
     #[error("{0}")]
     Custom(String),
@@ -168,6 +172,9 @@ pub enum Error {
 
     #[error("account {0} already exists")]
     AccountAlreadyExists(AccountId),
+
+    #[error("multisig group already exists as account {account_id}{account_name}")]
+    MultisigGroupAlreadyExists { account_id: AccountId, account_name: String },
 
     #[error("xprv key is not supported for this key type")]
     XPrvSupport,
@@ -374,6 +381,39 @@ pub enum Error {
 
     #[error("Failed to merge bundles")]
     CommitRevealBundleMergeError,
+
+    #[error("Multisig operator holds {local} local cosigner seeds; threshold requires {required}")]
+    MultisigInsufficientCosignerMaterial { local: usize, required: u16 },
+
+    #[error("Multisig cosigner key {prv_key_data_id} derives to xpub '{derived_xpub}' not present in the stored multisig xpub set")]
+    MultisigCosignerXpubNotFound { prv_key_data_id: PrvKeyDataId, derived_xpub: String },
+
+    #[error("None of the supplied multisig xpubs belong to the imported mnemonic")]
+    MultisigOwnXpubNotFound,
+
+    #[error("Multisig duplicate cosigner signature for cosigner_index={cosigner_index} pub_key={pub_key}")]
+    MultisigDuplicateCosignerSignature { cosigner_index: u32, pub_key: secp256k1::PublicKey },
+
+    #[error("Multisig cosigner count {count} exceeds consensus maximum {max}")]
+    MultisigPubKeyCountExceedsConsensus { count: usize, max: usize },
+
+    #[error("Multisig accounts with more than {max} cosigners are not supported for {} multisig at this network's P2SH script-element-size limit (got {count})", curve.display_name())]
+    MultisigCosignerCountExceedsStandardness { count: usize, max: usize, curve: MultisigCurve },
+
+    #[error("Multisig threshold K={k} is invalid for N={n} cosigners (K must be 1..=N)")]
+    MultisigInvalidThreshold { k: u16, n: usize },
+
+    #[error("Multisig redeem script of {size} bytes exceeds the consensus script-element size limit of {max} bytes")]
+    MultisigRedeemScriptExceedsElementSize { size: usize, max: usize },
+
+    #[error("Multisig cosigner set contains duplicate xpub: {xpub}")]
+    MultisigDuplicateXpub { xpub: String },
+
+    #[error("Multisig user-supplied xpub uses prefix {supplied_prefix:?} which is not valid for wallet network {wallet_network:?}")]
+    MultisigXpubNetworkMismatch { supplied_prefix: KeyPrefix, wallet_network: NetworkType },
+
+    #[error("finalizer input {input_index} carries {found} signatures but the redeem script threshold allows {allowed}")]
+    FinalizerExcessSignatures { found: usize, allowed: u16, input_index: usize },
 }
 
 impl From<Aborted> for Error {

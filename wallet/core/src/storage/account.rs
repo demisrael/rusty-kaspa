@@ -150,4 +150,49 @@ mod tests {
 
         Ok(())
     }
+
+    /// Positive control for the no-migration invariant: a v0-encoded
+    /// `AccountStorage` round-trips byte-identically through the
+    /// deserialize -> serialize path. `STORAGE_VERSION` stays at 0 and the
+    /// `prv_key_data_ids` field remains populated in both directions. Pins
+    /// the on-disk Borsh format UNCHANGED invariant.
+    #[test]
+    fn account_storage_unchanged_on_disk_format() -> Result<()> {
+        use borsh::BorshDeserialize;
+
+        let (id, storage_key) = make_account_hashes(from_data(&BIP32_ACCOUNT_KIND.into(), &[0xa1, 0xa2, 0xa3]));
+        let prv_key_data_id = PrvKeyDataId::new(0xface);
+        let storable = bip32::Payload::new(7, ExtendedPublicKeys::default(), false);
+        let storage_in = AccountStorage::try_new(
+            BIP32_ACCOUNT_KIND.into(),
+            &id,
+            &storage_key,
+            prv_key_data_id.into(),
+            AccountSettings::default(),
+            storable,
+        )?;
+
+        let bytes_in = borsh::to_vec(&storage_in)?;
+        let storage_out = AccountStorage::try_from_slice(&bytes_in)?;
+        let bytes_out = borsh::to_vec(&storage_out)?;
+
+        assert_eq!(bytes_in, bytes_out, "AccountStorage Borsh format must be byte-identical on round-trip (no version bump)");
+        assert_eq!(storage_out.kind, storage_in.kind);
+        assert_eq!(storage_out.id, storage_in.id);
+        assert_eq!(storage_out.storage_key, storage_in.storage_key);
+        assert_eq!(storage_out.serialized, storage_in.serialized);
+
+        let header_version = {
+            let mut cursor = std::io::Cursor::new(&bytes_in[..]);
+            let header = StorageHeader::deserialize_reader(&mut cursor)?;
+            header.version
+        };
+        assert_eq!(header_version, AccountStorage::STORAGE_VERSION);
+        assert_eq!(AccountStorage::STORAGE_VERSION, 0, "STORAGE_VERSION stays at 0 (no migration)");
+
+        let id_out: PrvKeyDataId = storage_out.prv_key_data_ids.clone().try_into()?;
+        assert_eq!(id_out, prv_key_data_id, "prv_key_data_ids field survives round-trip unchanged");
+
+        Ok(())
+    }
 }

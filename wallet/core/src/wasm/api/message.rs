@@ -1052,6 +1052,7 @@ declare! {
         accountIndex?:number;
         prvKeyDataId:string;
         paymentSecret?:string;
+        ecdsa?:boolean;
     } | {
         walletSecret: string;
         type: "kaspa-keypair-standard";
@@ -1087,6 +1088,7 @@ try_from! (args: IAccountsCreateRequest, AccountsCreateRequest, {
             let account_args = AccountCreateArgsBip32 {
                 account_name: args.try_get_string("accountName")?,
                 account_index: args.get_u64("accountIndex").ok(),
+                ecdsa: args.get_bool("ecdsa").unwrap_or(false),
             };
 
             AccountCreateArgs::Bip32 { prv_key_data_args, account_args }

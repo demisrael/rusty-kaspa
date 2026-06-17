@@ -37,6 +37,40 @@ impl Wallet {
                 }
             }
             "create" | "import" => {
+                let container = if let Some(position) = argv.iter().position(|arg| arg == "--container") {
+                    argv.remove(position);
+                    true
+                } else {
+                    false
+                };
+
+                if op.as_str() == "import" && argv.first().map(String::as_str) == Some("go-data") {
+                    argv.remove(0);
+                    if argv.len() > 2 {
+                        tprintln!(ctx, "usage: 'wallet import go-data [<path>] [<name>]'");
+                        tprintln!(ctx, "too many arguments: {}\r\n", argv.join(" "));
+                        return Ok(());
+                    }
+                    let keyfile_path = if argv.is_empty() { None } else { Some(argv.remove(0)) };
+                    let wallet_name = if argv.is_empty() {
+                        None
+                    } else {
+                        let name = argv.remove(0);
+                        let name = name.trim().to_string();
+                        if name.to_lowercase().as_str() == "wallet" {
+                            return Err(Error::custom("Wallet name cannot be 'wallet'"));
+                        }
+                        Some(name)
+                    };
+                    let wallet_secret = wizards::wallet::create_container(&ctx, Some(guard), wallet_name.as_deref()).await?;
+                    let account = wizards::go_data::import_into_open_wallet(&ctx, keyfile_path, Some(&wallet_secret)).await?;
+                    tprintln!(ctx, "\naccount imported: {}\n", account.get_list_string()?);
+                    ctx.wallet().select(Some(&account)).await?;
+                    return Ok(());
+                }
+
+                let multisig = take_multisig_import_alias(op.as_str(), &mut argv);
+
                 let wallet_name = if argv.is_empty() {
                     None
                 } else {
@@ -50,8 +84,15 @@ impl Wallet {
                 };
 
                 let wallet_name = wallet_name.as_deref();
+                if container {
+                    if op.as_str() != "create" {
+                        return Err(Error::custom("--container is supported with 'wallet create'"));
+                    }
+                    wizards::wallet::create_container(&ctx, Some(guard), wallet_name).await?;
+                    return Ok(());
+                }
                 let import_with_mnemonic = op.as_str() == "import";
-                wizards::wallet::create(&ctx, guard.into(), wallet_name, import_with_mnemonic).await?;
+                wizards::wallet::create(&ctx, guard.into(), wallet_name, import_with_mnemonic, multisig).await?;
             }
             "open" => {
                 let name = if let Some(name) = argv.first().cloned() {
@@ -105,14 +146,22 @@ impl Wallet {
         ctx.term().help(
             &[
                 ("list", "List available local wallet files"),
-                ("create [<name>]", "Create a new bip32 wallet"),
+                ("create [--container] [<name>]", "Create a new bip32 wallet, or an empty wallet container with --container"),
                 (
-                    "import [<name>]",
-                    "Create a wallet from an existing mnemonic (bip32 only). \r\n\r\n\
+                    "import [mnemonic] [<name>]",
+                    "Create a wallet from an existing mnemonic; single-sig bip32 accounts \
+                with a balance are discovered automatically. \r\n\r\n\
                 To import legacy wallets (KDX or kaspanet) please create \
                 a new bip32 wallet and use the 'account import' command. \
                 Legacy wallets can only be imported as accounts. \
                 \r\n",
+                ),
+                ("import go-data [<path>] [<name>]", "Create an empty wallet container and import a kaspawallet Go keyfile. \r\n"),
+                (
+                    "import multisig [<name>] / import mnemonic multisig [<name>]",
+                    "Create a wallet from an existing mnemonic and register a multisig \
+                account in one pass (prompts for the full cosigner extended public key set and \
+                the minimum number of signatures). \r\n",
                 ),
                 ("open [<name>]", "Open an existing wallet (shorthand: 'open [<name>]')"),
                 ("close", "Close an opened wallet (shorthand: 'close')"),
@@ -122,5 +171,50 @@ impl Wallet {
         )?;
 
         Ok(())
+    }
+}
+
+fn take_multisig_import_alias(op: &str, argv: &mut Vec<String>) -> bool {
+    if op != "import" {
+        return false;
+    }
+    if argv.first().map(String::as_str) == Some("multisig") {
+        argv.remove(0);
+        return true;
+    }
+    if argv.first().map(String::as_str) == Some("mnemonic") {
+        argv.remove(0);
+        if argv.first().map(String::as_str) == Some("multisig") {
+            argv.remove(0);
+            return true;
+        }
+    }
+    false
+}
+
+#[cfg(test)]
+mod tests {
+    use super::take_multisig_import_alias;
+
+    #[test]
+    fn wallet_import_multisig_aliases_route_to_guarded_import() {
+        let mut short = vec!["multisig".to_string(), "cosigner-a".to_string()];
+        assert!(take_multisig_import_alias("import", &mut short));
+        assert_eq!(short, vec!["cosigner-a".to_string()]);
+
+        let mut long = vec!["mnemonic".to_string(), "multisig".to_string(), "cosigner-a".to_string()];
+        assert!(take_multisig_import_alias("import", &mut long));
+        assert_eq!(long, vec!["cosigner-a".to_string()]);
+    }
+
+    #[test]
+    fn wallet_import_non_multisig_forms_keep_existing_arguments() {
+        let mut restore = vec!["mnemonic".to_string(), "cosigner-a".to_string()];
+        assert!(!take_multisig_import_alias("import", &mut restore));
+        assert_eq!(restore, vec!["cosigner-a".to_string()]);
+
+        let mut create = vec!["multisig".to_string(), "cosigner-a".to_string()];
+        assert!(!take_multisig_import_alias("create", &mut create));
+        assert_eq!(create, vec!["multisig".to_string(), "cosigner-a".to_string()]);
     }
 }

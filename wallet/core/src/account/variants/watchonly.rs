@@ -201,6 +201,10 @@ impl Account for WatchOnly {
         WATCH_ONLY_ACCOUNT_KIND.into()
     }
 
+    fn ecdsa(&self) -> bool {
+        self.ecdsa
+    }
+
     fn prv_key_data_id(&self) -> Result<&PrvKeyDataId> {
         Err(Error::WatchOnlyAccount)
     }

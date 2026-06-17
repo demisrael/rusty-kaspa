@@ -132,6 +132,15 @@ pub trait Account: AnySync + Send + Sync + 'static {
         None
     }
 
+    /// Whether this account signs with ECDSA rather than Schnorr. Default
+    /// `false` for accounts that have no curve-selection knob (resident
+    /// keypair-bearing variants always Schnorr). Variants that persist an
+    /// `ecdsa: bool` field on their on-disk payload override this to
+    /// expose the field through the trait.
+    fn ecdsa(&self) -> bool {
+        false
+    }
+
     fn name_or_id(&self) -> String {
         if let Some(name) = self.name() { if name.is_empty() { self.id().short() } else { name } } else { self.id().short() }
     }
@@ -214,22 +223,31 @@ pub trait Account: AnySync + Send + Sync + 'static {
                     None => ScanExtent::EmptyWindow,
                 };
 
-                let scans = [
-                    Scan::new_with_address_manager(
-                        derivation.receive_address_manager(),
+                // Enumerate every cosigner-prefix family's receive + change
+                // address managers. Non-multisig accounts expose a single
+                // family (length-1 vector) and the loop reduces to a scan
+                // of two AddressManagers. Multisig accounts expose N
+                // families so the wallet's UTXO scan covers every
+                // peer-cosigner-prefix address family on chain, not only
+                // the local family.
+                let families = derivation.address_manager_families();
+                let mut scans: Vec<Scan> = Vec::with_capacity(families.len() * 2);
+                for family in families.iter() {
+                    scans.push(Scan::new_with_address_manager(
+                        family.receive.clone(),
                         &balance,
                         current_daa_score,
                         window_size,
                         Some(extent),
-                    ),
-                    Scan::new_with_address_manager(
-                        derivation.change_address_manager(),
+                    ));
+                    scans.push(Scan::new_with_address_manager(
+                        family.change.clone(),
                         &balance,
                         current_daa_score,
                         window_size,
                         Some(extent),
-                    ),
-                ];
+                    ));
+                }
 
                 let futures = scans.iter().map(|scan| scan.scan(self.utxo_context())).collect::<Vec<_>>();
 

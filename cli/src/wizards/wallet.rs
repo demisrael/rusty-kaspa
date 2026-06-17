@@ -2,6 +2,8 @@ use crate::cli::KaspaCli;
 use crate::imports::*;
 use crate::result::Result;
 use kaspa_bip32::{Language, Mnemonic, WordCount};
+use kaspa_wallet_core::error::Error as WalletError;
+use kaspa_wallet_core::storage::keydata::PrvKeyData;
 use kaspa_wallet_core::storage::keydata::PrvKeyDataVariantKind;
 use kaspa_wallet_core::{
     storage::{Hint, make_filename},
@@ -13,6 +15,7 @@ pub(crate) async fn create(
     wallet_guard: Option<WalletGuard<'_>>,
     name: Option<&str>,
     import_with_mnemonic: bool,
+    multisig: bool,
 ) -> Result<()> {
     let term = ctx.term();
     let wallet = ctx.wallet();
@@ -22,8 +25,8 @@ pub(crate) async fn create(
         Some(locked_guard) => locked_guard,
         None => local_guard.lock().await,
     };
-    // TODO @aspect
-    let word_count = WordCount::Words12;
+    let word_count_answer = term.ask(false, "Mnemonic length in words (12 or 24, press <enter> for default 12): ").await?;
+    let word_count = parse_word_count_answer(word_count_answer.trim())?;
 
     if let Err(err) = wallet.network_id() {
         tprintln!(ctx);
@@ -136,6 +139,33 @@ pub(crate) async fn create(
 
     let mnemonic_phrase = prv_key_data_args.secret.clone();
 
+    let multisig_import_args = if import_with_mnemonic && multisig {
+        let mnemonic = Mnemonic::new(mnemonic_phrase.as_str()?.trim(), Language::English)?;
+        let prv_key_data =
+            PrvKeyData::try_new_from_mnemonic(mnemonic.clone(), payment_secret.as_ref(), EncryptionKind::XChaCha20Poly1305)?;
+        let mut xpubs = Vec::new();
+        loop {
+            let xpub_key = term.ask(false, "Enter cosigner extended public key, including your own: (empty to stop)").await?;
+            if xpub_key.is_empty() {
+                break;
+            }
+            xpubs.push(xpub_key.trim().to_owned());
+        }
+        let minimum_signatures: u16 = term.ask(false, "Enter the minimum number of signatures required: ").await?.parse()?;
+        let multisig_ecdsa = crate::wizards::account::ask_curve(&term).await?;
+        crate::wizards::account::check_cosigner_count_under_curve_cap(
+            xpubs.len(),
+            minimum_signatures,
+            kaspa_wallet_core::wallet::MultisigCurve::from_ecdsa_bool(multisig_ecdsa),
+        )?;
+        wallet.identify_own_multisig_xpubs(&prv_key_data, payment_secret.as_ref(), &xpubs).await?;
+        Some((mnemonic, xpubs, minimum_signatures, multisig_ecdsa))
+    } else {
+        None
+    };
+
+    let ecdsa = if multisig_import_args.is_some() { false } else { crate::wizards::account::ask_curve(&term).await? };
+
     let notifier = ctx.notifier().show(Notification::Processing).await;
 
     // suspend commits for multiple operations
@@ -145,8 +175,43 @@ pub(crate) async fn create(
     let (_wallet_descriptor, storage_descriptor) = ctx.wallet().create_wallet(&wallet_secret, wallet_args).await?;
     let prv_key_data_id = wallet.create_prv_key_data(&wallet_secret, prv_key_data_args).await?;
 
-    let account_args = AccountCreateArgsBip32::new(account_name, None);
-    let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, payment_secret.as_ref(), account_args).await?;
+    // Wallet restore via BIP-44 gap-limit auto-discovery: walk
+    // account_index = 0, 1, ... up to a 20-account empty gap; register
+    // every account with non-zero balance. The fresh-create path
+    // (plain `wallet create`, no mnemonic restore) skips the walk and
+    // creates only the canonical default account at account_index=0.
+    let (account, restore_summary) = if import_with_mnemonic {
+        let prv_key_data = wallet
+            .store()
+            .as_prv_key_data_store()?
+            .load_key_data(&wallet_secret, &prv_key_data_id)
+            .await?
+            .ok_or(WalletError::PrivateKeyNotFound(prv_key_data_id))?;
+        let summary = wallet
+            .restore_bip44_with_discovery(
+                &wallet_secret,
+                payment_secret.as_ref(),
+                &prv_key_data,
+                ecdsa,
+                kaspa_wallet_core::wallet::BIP44_DEFAULT_GAP,
+            )
+            .await?;
+        let default = summary
+            .accounts
+            .iter()
+            .find(|a| Arc::clone(*a).as_derivation_capable().ok().map(|d| d.account_index()) == Some(0))
+            .cloned()
+            .expect("restore_bip44_with_discovery guarantees account_index=0 is present");
+        (default, Some(summary))
+    } else {
+        let account_args = AccountCreateArgsBip32::new(account_name, None, ecdsa);
+        let account = wallet.create_account_bip32(&wallet_secret, prv_key_data_id, payment_secret.as_ref(), account_args).await?;
+        (account, None)
+    };
+
+    if let Some(summary) = restore_summary.as_ref() {
+        tprintln!(ctx, "Restored wallet with {} accounts; {} had non-zero balance.", summary.accounts.len(), summary.non_zero_count,);
+    }
 
     // flush data to storage
     wallet.store().flush(&wallet_secret).await?;
@@ -191,5 +256,141 @@ pub(crate) async fn create(
     wallet.open(&wallet_secret, name.map(String::from), WalletOpenArgs::default_with_legacy_accounts(), &guard).await?;
     wallet.activate_accounts(None, &guard).await?;
 
+    if let Some((mnemonic, xpubs, minimum_signatures, multisig_ecdsa)) = multisig_import_args {
+        let accounts = wallet
+            .import_multisig_with_mnemonic(
+                &wallet_secret,
+                (mnemonic, payment_secret.clone()),
+                None,
+                minimum_signatures,
+                xpubs,
+                multisig_ecdsa,
+            )
+            .await?;
+        for account in accounts.iter() {
+            tprintln!(ctx, "\nmultisig account imported: {}\n", account.get_list_string()?);
+        }
+        if let Some(account) = accounts.last() {
+            wallet.select(Some(account)).await?;
+        }
+    }
+
     Ok(())
+}
+
+pub(crate) async fn create_container(
+    ctx: &Arc<KaspaCli>,
+    wallet_guard: Option<WalletGuard<'_>>,
+    name: Option<&str>,
+) -> Result<Secret> {
+    let term = ctx.term();
+    let wallet = ctx.wallet();
+    let local_guard = ctx.wallet().guard();
+
+    let guard = match wallet_guard {
+        Some(locked_guard) => locked_guard,
+        None => local_guard.lock().await,
+    };
+
+    if let Err(err) = wallet.network_id() {
+        tprintln!(ctx);
+        tprintln!(ctx, "Before creating a wallet, you need to select a Kaspa network.");
+        tprintln!(ctx, "Please use 'network <name>' command to select a network.");
+        tprintln!(ctx, "Currently available networks are 'mainnet', 'testnet-10' and 'testnet-11'");
+        tprintln!(ctx);
+        return Err(err.into());
+    }
+
+    let filename = make_filename(&name.map(String::from), &None);
+    if wallet.exists(Some(&filename)).await? {
+        tprintln!(ctx, "{}", style("WARNING - A previously created wallet already exists!").red().to_string());
+        tprintln!(ctx, "NOTE: You can create a differently named wallet by using 'wallet create --container <name>'");
+        tprintln!(ctx);
+
+        let overwrite =
+            term.ask(false, "Are you sure you want to overwrite it (type 'y' to approve)?: ").await?.trim().to_string().to_lowercase();
+        if overwrite.ne("y") {
+            return Err(Error::UserAbort);
+        }
+    }
+
+    tpara!(
+        ctx,
+        "\n\
+        \"Phishing hint\" is a secret word or a phrase that is displayed \
+        when you open your wallet. If you do not see the hint when opening \
+        your wallet, you may be accessing a fake wallet designed to steal \
+        your private key.\
+        \n\
+        ",
+    );
+
+    let hint = term.ask(false, "Create phishing hint (optional, press <enter> to skip): ").await?.trim().to_string();
+    let hint = hint.is_not_empty().then_some(hint).map(Hint::from);
+
+    let wallet_secret = Secret::new(term.ask(true, "Enter wallet encryption password: ").await?.trim().as_bytes().to_vec());
+    if wallet_secret.as_ref().is_empty() {
+        return Err(Error::WalletSecretRequired);
+    }
+    let wallet_secret_validate =
+        Secret::new(term.ask(true, "Re-enter wallet encryption password: ").await?.trim().as_bytes().to_vec());
+    if wallet_secret_validate.as_ref() != wallet_secret.as_ref() {
+        return Err(Error::WalletSecretMatch);
+    }
+
+    let notifier = ctx.notifier().show(Notification::Processing).await;
+    wallet.store().batch().await?;
+    let wallet_args = WalletCreateArgs::new(name.map(String::from), None, EncryptionKind::XChaCha20Poly1305, hint, true);
+    let (_wallet_descriptor, storage_descriptor) = wallet.create_wallet(&wallet_secret, wallet_args).await?;
+    wallet.store().flush(&wallet_secret).await?;
+    notifier.hide();
+
+    term.writeln("");
+    term.writeln(format!("Your wallet is stored in: {}", storage_descriptor));
+    term.writeln("");
+
+    wallet.open(&wallet_secret, name.map(String::from), WalletOpenArgs::default_with_legacy_accounts(), &guard).await?;
+    wallet.activate_accounts(None, &guard).await?;
+    Ok(wallet_secret)
+}
+
+/// Parse the operator's answer to the wallet-create mnemonic word-count
+/// prompt. Empty input (operator presses <enter>) yields the legacy
+/// 12-word default so the wizard's default behavior is unchanged from
+/// the pre-prompt era. Explicit `12` and `24` map to the corresponding
+/// `WordCount`. Any other answer yields `WalletError::Custom(..)`
+/// naming the supplied value so the operator sees what they typed.
+/// Hoisted as a `pub(crate) fn` so the unit test
+/// `parse_word_count_answer_accepts_default_12_and_explicit_24` can
+/// exercise the contract without driving the interactive shell.
+pub(crate) fn parse_word_count_answer(s: &str) -> std::result::Result<WordCount, WalletError> {
+    match s {
+        "" | "12" => Ok(WordCount::Words12),
+        "24" => Ok(WordCount::Words24),
+        other => Err(WalletError::Custom(format!("invalid mnemonic length '{other}'; expected 12 or 24"))),
+    }
+}
+
+#[cfg(all(test, not(target_arch = "wasm32")))]
+mod tests {
+    use super::*;
+
+    /// Pin the operator-facing word-count prompt contract: empty +
+    /// explicit "12" map to `Words12`; explicit "24" maps to `Words24`;
+    /// any other input yields `WalletError::Custom` naming the supplied
+    /// value.
+    #[test]
+    fn parse_word_count_answer_accepts_default_12_and_explicit_24() {
+        assert!(matches!(parse_word_count_answer(""), Ok(WordCount::Words12)), "empty input defaults to 12");
+        assert!(matches!(parse_word_count_answer("12"), Ok(WordCount::Words12)), "explicit 12 maps to Words12");
+        assert!(matches!(parse_word_count_answer("24"), Ok(WordCount::Words24)), "explicit 24 maps to Words24");
+
+        for invalid in ["15", "abc", "42", "0", "-1", "twelve", " "] {
+            let err = parse_word_count_answer(invalid).expect_err("invalid word-count answer must reject");
+            match err {
+                WalletError::Custom(msg) => assert!(msg.contains(invalid), "error names the supplied value {invalid:?}: got {msg}"),
+                other => panic!("expected WalletError::Custom for {invalid:?}, got {other:?}"),
+            }
+        }
+    }
 }

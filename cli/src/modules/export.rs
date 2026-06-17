@@ -40,6 +40,9 @@ async fn export_multisig_account(ctx: Arc<KaspaCli>, account: Arc<MultiSig>) -> 
                 return Err(Error::WalletSecretRequired);
             }
 
+            let account_index = account.clone().as_derivation_capable()?.account_index();
+            tprintln!(ctx, "account slot: {}", account_index);
+            tprintln!(ctx, "seat indexes: {:?}", account.seat_indexes());
             tprintln!(ctx, "required signatures: {}", account.minimum_signatures());
             tprintln!(ctx, "");
 
@@ -50,11 +53,26 @@ async fn export_multisig_account(ctx: Arc<KaspaCli>, account: Arc<MultiSig>) -> 
                 let prv_key_data = prv_key_data_store.load_key_data(&wallet_secret, prv_key_data_id).await?.unwrap();
                 let mnemonic = prv_key_data.as_mnemonic(None).unwrap().unwrap();
 
-                let xpub_key: kaspa_bip32::ExtendedPublicKey<kaspa_bip32::secp256k1::PublicKey> =
-                    prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
+                let xpub_key = {
+                    let mut matched = None;
+                    if let Some(xpub_keys) = account.xpub_keys() {
+                        for xpub in xpub_keys.iter() {
+                            let seat_index = xpub.attrs().child_number.index() as u64;
+                            let derived = prv_key_data.create_xpub(None, MULTISIG_ACCOUNT_KIND.into(), seat_index).await?;
+                            if derived.to_string(Some(kaspa_bip32::Prefix::XPUB)) == xpub.to_string(Some(kaspa_bip32::Prefix::XPUB)) {
+                                matched = Some(derived);
+                                break;
+                            }
+                        }
+                    }
+                    matched.ok_or_else(|| kaspa_wallet_core::error::Error::MultisigCosignerXpubNotFound {
+                        prv_key_data_id: *prv_key_data_id,
+                        derived_xpub: String::new(),
+                    })?
+                };
 
                 tprintln!(ctx, "");
-                tprintln!(ctx, "extended public key {}:", id + 1);
+                tprintln!(ctx, "extended public key {} (seat={}):", id + 1, xpub_key.attrs().child_number.index());
                 tprintln!(ctx, "");
                 tprintln!(ctx, "{}", ctx.wallet().network_format_xpub(&xpub_key));
                 tprintln!(ctx, "");
@@ -106,8 +124,10 @@ async fn export_single_key_account(ctx: Arc<KaspaCli>, account: Arc<dyn Account>
     let prv_key_data = keydata.payload.decrypt(payment_secret.as_ref())?;
     let mnemonic = prv_key_data.as_ref().as_mnemonic()?;
 
-    let xpub_key = keydata.create_xpub(None, BIP32_ACCOUNT_KIND.into(), 0).await?; // todo it can be done concurrently
+    let account_index = account.clone().as_derivation_capable()?.account_index();
+    let xpub_key = keydata.create_xpub(None, BIP32_ACCOUNT_KIND.into(), account_index).await?; // todo it can be done concurrently
 
+    tprintln!(ctx, "account index: {}", account_index);
     tprintln!(ctx, "extended public key:");
     tprintln!(ctx, "");
     tprintln!(ctx, "{}", ctx.wallet().network_format_xpub(&xpub_key));

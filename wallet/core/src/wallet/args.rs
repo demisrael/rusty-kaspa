@@ -91,6 +91,7 @@ export interface IPrvKeyDataArgs {
 export interface IAccountCreateArgsBip32 {
     accountName?: string;
     accountIndex?: number;
+    ecdsa?: boolean;
 }
 
 /**
@@ -107,11 +108,12 @@ export interface IAccountCreateArgs {
 pub struct AccountCreateArgsBip32 {
     pub account_name: Option<String>,
     pub account_index: Option<u64>,
+    pub ecdsa: bool,
 }
 
 impl AccountCreateArgsBip32 {
-    pub fn new(account_name: Option<String>, account_index: Option<u64>) -> Self {
-        Self { account_name, account_index }
+    pub fn new(account_name: Option<String>, account_index: Option<u64>, ecdsa: bool) -> Self {
+        Self { account_name, account_index, ecdsa }
     }
 }
 
@@ -155,6 +157,8 @@ pub enum AccountCreateArgs {
         additional_xpub_keys: Vec<String>,
         name: Option<String>,
         minimum_signatures: u16,
+        ecdsa: bool,
+        account_index: Option<u64>,
     },
     Bip32Watch {
         account_args: AccountCreateArgsBip32Watch,
@@ -172,9 +176,10 @@ impl AccountCreateArgs {
         payment_secret: Option<Secret>,
         account_name: Option<String>,
         account_index: Option<u64>,
+        ecdsa: bool,
     ) -> Self {
         let prv_key_data_args = PrvKeyDataArgs { prv_key_data_id, payment_secret };
-        let account_args = AccountCreateArgsBip32 { account_name, account_index };
+        let account_args = AccountCreateArgsBip32 { account_name, account_index, ecdsa };
         AccountCreateArgs::Bip32 { prv_key_data_args, account_args }
     }
 
@@ -191,7 +196,9 @@ impl AccountCreateArgs {
         additional_xpub_keys: Vec<String>,
         name: Option<String>,
         minimum_signatures: u16,
+        ecdsa: bool,
+        account_index: Option<u64>,
     ) -> Self {
-        AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures }
+        AccountCreateArgs::Multisig { prv_key_data_args, additional_xpub_keys, name, minimum_signatures, ecdsa, account_index }
     }
 }

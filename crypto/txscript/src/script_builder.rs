@@ -126,6 +126,36 @@ impl ScriptBuilder {
         Ok(self)
     }
 
+    /// Returns the number of bytes the canonical encoding of `val` will take
+    /// when emitted via [`Self::add_i64`]. This is the int-push counterpart of
+    /// [`Self::canonical_data_size`], intended for size-prediction callers
+    /// that need to refuse a script up front (before actually building it)
+    /// when its canonical size would exceed a downstream consensus limit.
+    ///
+    /// The body mirrors `add_i64`'s encoding rule branch-for-branch so that
+    /// adding a future encoding branch in `add_i64` makes the parallel branch
+    /// here an obvious co-edit.
+    ///
+    /// `OpcodeData::<i64>::serialize` returns an error only when the encoded
+    /// bytes exceed an 8-byte `SizedEncodeInt` envelope; that case is reached
+    /// only for `i64::MIN` (whose unsigned-abs requires a 9th sign byte). All
+    /// other `i64` values are infallible, and every in-tree caller (multisig
+    /// K/N predictor) passes values well inside `1..=20`. Passing `i64::MIN`
+    /// to this size oracle is a programmer error and panics.
+    pub fn canonical_i64_size(val: i64) -> usize {
+        // Fast path mirroring `add_i64`'s small-integer branches at
+        // `script_builder.rs::add_i64`.
+        if val == 0 {
+            return 1;
+        }
+        if val == -1 || (OP_SMALL_INT_MIN_VAL as i64..=OP_SMALL_INT_MAX_VAL as i64).contains(&val) {
+            return 1;
+        }
+        let bytes: crate::data_stack::StackEntry =
+            OpcodeData::<i64>::serialize(&val).expect("OpcodeData::<i64>::serialize is infallible outside i64::MIN");
+        Self::canonical_data_size(&bytes)
+    }
+
     /// Returns the number of bytes the canonical encoding of the data will take.
     pub fn canonical_data_size(data: &[u8]) -> usize {
         let data_len = data.len();
@@ -292,7 +322,7 @@ impl ScriptBuilder {
             self.script.push(Op0);
             return Ok(self);
         }
-        if val == -1 || (1..=16).contains(&val) {
+        if val == -1 || (OP_SMALL_INT_MIN_VAL as i64..=OP_SMALL_INT_MAX_VAL as i64).contains(&val) {
             self.script.push(((Op1 as i64 - 1) + val) as u8);
             return Ok(self);
         }
@@ -783,5 +813,27 @@ mod tests {
             "adding a sequence that would exceed the maximum size of the script must fail"
         );
         assert_eq!(builder.script(), &original_result, "unexpected modified script");
+    }
+
+    /// Cross-check [`ScriptBuilder::canonical_i64_size`] against the byte
+    /// length [`ScriptBuilder::add_i64`] actually emits. The size oracle is
+    /// branch-for-branch derived from `add_i64`; this test enforces the
+    /// invariant at every relevant boundary so a future encoding-rule change
+    /// in `add_i64` co-edits with `canonical_i64_size` and is caught on the
+    /// txscript side rather than only at the wallet-side cross-check.
+    #[test]
+    fn canonical_i64_size_matches_add_i64() {
+        // Cells span Op0, Op1Negate, the small-int range (1..=16), the
+        // PUSHDATA boundary (17..=127 -> 1 data byte -> 2 total), the
+        // two-byte and three-byte ranges, and the signed-byte boundary that
+        // forces an extra zero byte.
+        let cells: &[i64] = &[0, -1, 1, 2, 16, 17, 20, 75, 76, 127, 128, 255, 256, 32767, -127, -128, i64::MAX, i64::MIN + 1];
+        for &val in cells {
+            let mut builder = ScriptBuilder::new();
+            builder.add_i64(val).expect("add_i64 succeeds for cells inside i64-but-not-MIN domain");
+            let actual = builder.script().len();
+            let predicted = ScriptBuilder::canonical_i64_size(val);
+            assert_eq!(actual, predicted, "canonical_i64_size({val}) must equal add_i64({val}).len()");
+        }
     }
 }

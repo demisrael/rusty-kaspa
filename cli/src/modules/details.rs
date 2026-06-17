@@ -10,6 +10,7 @@ impl Details {
         let account = ctx.select_account().await?.as_derivation_capable()?;
 
         let derivation = account.derivation();
+        tprintln!(ctx, "Account slot: {}", account.account_index());
 
         let manager = derivation.receive_address_manager();
         let index = manager.index() + 1;
@@ -35,7 +36,13 @@ impl Details {
             }
             tprintln!(ctx.term(), "Extended public keys:");
             xpub_keys.iter().for_each(|xpub| {
-                tprintln!(ctx.term(), "{:>4}{}", "", style(ctx.wallet().network_format_xpub(xpub)).dim());
+                tprintln!(
+                    ctx.term(),
+                    "{:>4}seat={} {}",
+                    "",
+                    xpub.attrs().child_number.index(),
+                    style(ctx.wallet().network_format_xpub(xpub)).dim()
+                );
             });
         }
 
