@@ -201,24 +201,28 @@ impl<
         f_cluster: &BlockHashSet,
         k: KType,
     ) -> SortableBlock {
-        let mut witness_block_data: SortableBlock =
-            SortableBlock { hash: conflict_genesis, blue_work: self.headers_store.get_header(conflict_genesis).unwrap().blue_work };
+        let mut max_witness = SortableBlock {
+            hash: conflict_genesis,
+            blue_work: self.headers_store.get_header(conflict_genesis).expect("conflict genesis header is present").blue_work,
+        };
 
-        // TODO[DK]: Revisit - as it only checks k - 1 against the reference block
-        let k_prime = k.saturating_sub(1);
-        let chain = self.compute_conditioned_chain(conflict_genesis, group_tips, all_tips, k_prime);
-
-        for &b in f_cluster.iter() {
-            if self.count_anticone_with_chain(b, &chain) > k_prime {
-                let curr_witness_data = SortableBlock { hash: b, blue_work: self.headers_store.get_header(b).unwrap().blue_work };
-
-                if witness_block_data.cmp(&curr_witness_data) == std::cmp::Ordering::Less {
-                    witness_block_data = curr_witness_data;
+        // Union over k' in {floor(k/2), ..., k}; each k' has its own conditioned chain.
+        for k_prime in (k / 2)..=k {
+            let chain = self.compute_conditioned_chain(conflict_genesis, group_tips, all_tips, k_prime);
+            for &b in f_cluster.iter() {
+                if self.count_anticone_with_chain(b, &chain) > k_prime {
+                    let witness = SortableBlock {
+                        hash: b,
+                        blue_work: self.headers_store.get_header(b).expect("reference-cluster block header is present").blue_work,
+                    };
+                    if max_witness < witness {
+                        max_witness = witness;
+                    }
                 }
             }
         }
 
-        witness_block_data
+        max_witness
     }
 }
 
@@ -619,5 +623,83 @@ mod tests {
 
         // The winning_index must be flipped (forward index 0 == reversed index 1, etc.)
         // But we only assert content equality since the tie-break could pick either side.
+    }
+
+    /// Pins the tie-break winner on an asymmetric conflict, exercising the witness-comparison
+    /// decision boundary rather than only the final hash tiebreak.
+    ///
+    /// At k = 4 over the shared TestDag (F = {A, B, C, Z, Y, X}), the X-side's conditioned chains
+    /// absorb F, so max(C_X) stays at the conflict-genesis baseline A (blue_work 0); the D-side's
+    /// committed chain [D, C, B, A] leaves Y as a high-rank witness, so max(C_D) = Y (blue_work 2).
+    /// argmin_i max(C_i) therefore selects the X-side - the candidate whose chain stops using
+    /// excessive rank earliest, in the paper's terms.
+    #[test]
+    fn test_tie_break_pins_winner_by_witness_comparison() {
+        let dag = TestDag::new();
+        let all_tips = vec![dag.hash_x, dag.hash_d];
+        let k: KType = 4;
+
+        // Sub-mechanism: the two sides' max(C_i) differ, and the difference is a real F witness.
+        let (f_cluster, _) = dag.tie_breaker.compute_free_coloring(dag.hash_a, &all_tips, k.isqrt());
+        let c_x = dag.tie_breaker.compute_high_rank_witnesses(dag.hash_a, &[dag.hash_x], &all_tips, &f_cluster, k);
+        let c_d = dag.tie_breaker.compute_high_rank_witnesses(dag.hash_a, &[dag.hash_d], &all_tips, &f_cluster, k);
+        assert_eq!(c_x.hash, dag.hash_a, "X-side absorbs F, so max(C_X) is the conflict-genesis baseline");
+        assert_eq!(c_d.hash, dag.hash_y, "D-side leaves Y as its top high-rank witness");
+        assert!(c_x < c_d, "the X-side's max(C) is strictly earlier than the D-side's");
+
+        // End-to-end: tie_break selects the X-side (index 0).
+        let sg_x = Arc::new(vec![dag.hash_x]);
+        let sg_d = Arc::new(vec![dag.hash_d]);
+        let subgroups = vec![
+            GroupMetadata {
+                conflict_genesis: dag.hash_z,
+                subgroup: sg_x.clone(),
+                k,
+                selected_parent: SortableBlock {
+                    hash: dag.hash_x,
+                    blue_work: dag.tie_breaker.headers_store.get_header(dag.hash_x).unwrap().blue_work,
+                },
+            },
+            GroupMetadata {
+                conflict_genesis: dag.hash_b,
+                subgroup: sg_d,
+                k,
+                selected_parent: SortableBlock {
+                    hash: dag.hash_d,
+                    blue_work: dag.tie_breaker.headers_store.get_header(dag.hash_d).unwrap().blue_work,
+                },
+            },
+        ];
+        let input = TieBreakInput { conflict_genesis: dag.hash_a, all_tips: &all_tips, subgroups: &subgroups, k };
+
+        let winner = dag.tie_breaker.tie_break(&input);
+        assert_eq!(winner, 0, "the X-side wins the tie-break");
+        assert_eq!(subgroups[winner].subgroup, sg_x, "the winning subgroup is the X-side");
+    }
+
+    /// Proves the half-range union is live: it surfaces a witness the single k' = k-1 check misses.
+    ///
+    /// On the D-side at k = 4 the conditioned chain is [D, C, B, A]; at k' = k-1 = 3 no F block's
+    /// anticone meets the chain in more than 3 blocks, so a single-k' rule would yield only the
+    /// conflict-genesis baseline. The union's lower arm (k' = 2) surfaces Y, which is exactly what
+    /// compute_high_rank_witnesses returns - a result a k-1-only check could not produce.
+    #[test]
+    fn test_union_catches_witness_below_k_minus_one() {
+        let dag = TestDag::new();
+        let all_tips = vec![dag.hash_x, dag.hash_d];
+        let k: KType = 4;
+        let (f_cluster, _) = dag.tie_breaker.compute_free_coloring(dag.hash_a, &all_tips, k.isqrt());
+
+        // The single k' = k-1 check finds no witness for the D-side: every F block's anticone meets
+        // the conditioned chain in at most k-1 blocks.
+        let chain_k_minus_1 = dag.tie_breaker.compute_conditioned_chain(dag.hash_a, &[dag.hash_d], &all_tips, k - 1);
+        let max_count_at_k_minus_1 =
+            f_cluster.iter().map(|&b| dag.tie_breaker.count_anticone_with_chain(b, &chain_k_minus_1)).max().unwrap();
+        assert!(max_count_at_k_minus_1 < k, "no F block exceeds the bound at k' = k-1, so a single-k' rule yields the baseline");
+
+        // The full union over {floor(k/2), ..., k} does surface a witness (Y), proving the lower-k' arm is live.
+        let c_d = dag.tie_breaker.compute_high_rank_witnesses(dag.hash_a, &[dag.hash_d], &all_tips, &f_cluster, k);
+        assert_eq!(c_d.hash, dag.hash_y, "the union surfaces Y through a k' below k-1");
+        assert_ne!(c_d.hash, dag.hash_a, "the union result is a real witness, not the genesis baseline");
     }
 }
