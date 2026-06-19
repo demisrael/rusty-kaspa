@@ -445,18 +445,19 @@ try_from! ( args: WalletCreateResponse, IWalletCreateResponse, {
 // ---
 
 // ---
-// NOTE: `legacy_accounts` are disabled in JS API
 declare! {
     IWalletOpenRequest,
     r#"
     /**
-     * 
+     *
      * @category Wallet API
      */
     export interface IWalletOpenRequest {
         walletSecret: string;
         filename?: string;
         accountDescriptors: boolean;
+        /** Enable legacy (KDX, kaspanet.io Web Wallet) account compatibility mode. */
+        legacyAccounts?: boolean;
     }
     "#,
 }
@@ -465,8 +466,9 @@ try_from! ( args: IWalletOpenRequest, WalletOpenRequest, {
     let wallet_secret = args.get_secret("walletSecret")?;
     let filename = args.try_get_string("filename")?;
     let account_descriptors = args.get_value("accountDescriptors")?.as_bool().unwrap_or(false);
+    let legacy_accounts = args.get_value("legacyAccounts")?.as_bool();
 
-    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts: None })
+    Ok(WalletOpenRequest { wallet_secret, filename, account_descriptors, legacy_accounts })
 });
 
 declare! {
@@ -1099,8 +1101,14 @@ try_from! (args: IAccountsCreateRequest, AccountsCreateRequest, {
                 ecdsa: args.get_bool("ecdsa").unwrap_or(false),
             }
         }
+        crate::account::LEGACY_ACCOUNT_KIND => {
+            AccountCreateArgs::Legacy {
+                prv_key_data_id: args.try_get_prv_key_data_id("prvKeyDataId")?.ok_or(Error::custom("prvKeyDataId is required"))?,
+                account_name: args.try_get_string("accountName")?,
+            }
+        }
         _ => {
-            return Err(Error::custom("only BIP32/kaspa-keypair-standard accounts are currently supported"));
+            return Err(Error::custom("only BIP32/kaspa-legacy-standard/kaspa-keypair-standard accounts are currently supported"));
         }
     };
 

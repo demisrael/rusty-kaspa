@@ -231,3 +231,88 @@ fn test_v0_padding() {
         assert_eq!(text, s);
     }
 }
+
+#[cfg(not(target_arch = "wasm32"))]
+#[cfg(test)]
+mod legacy_account_jsapi_test {
+    use super::create_master_key_from_mnemonics;
+    use crate::imports::*;
+    use crate::storage::keydata::PrvKeyDataVariantKind;
+    use crate::wallet::args::{AccountCreateArgs, PrvKeyDataCreateArgs, WalletCreateArgs};
+    use kaspa_addresses::Prefix as AddressPrefix;
+    use kaspa_bip32::Prefix;
+    use kaspa_wallet_keys::derivation::gen0::{PubkeyDerivationManagerV0, WalletDerivationManagerV0};
+    use kaspa_wallet_keys::derivation::traits::WalletDerivationManagerTrait;
+
+    // A real KDX (gen0) v0 keydata mnemonic, decrypted in `test_v0_keydata` above.
+    const KDX_MNEMONIC: &str = "interest denial place quick stay suit token shadow side ski knife entire";
+    // Pinned gen0 receive address at index 0 for KDX_MNEMONIC, derived by the audited
+    // `WalletDerivationManagerV0` path (the same derivation `hd.rs` golden-tests).
+    const KDX_GEN0_RECEIVE_0: &str = "kaspa:qz3yj0ktpegt22u7ufzyanm27pkxyfsk7g3ejphhyt2kdz64cvndy57360kwk";
+
+    // Independent reference: derive gen0 receive addresses straight from the mnemonic via
+    // the audited low-level derivation manager.
+    fn audited_gen0_receive_addresses(count: u32) -> Vec<String> {
+        let xprv = create_master_key_from_mnemonics(KDX_MNEMONIC).unwrap().to_string(Prefix::XPRV).to_string();
+        let hd = WalletDerivationManagerV0::from_master_xprv(&xprv, false, 0, None).unwrap();
+        (0..count)
+            .map(|i| {
+                let pubkey = hd.derive_receive_pubkey(i).unwrap();
+                PubkeyDerivationManagerV0::create_address(&pubkey, AddressPrefix::Mainnet, false).unwrap().to_string()
+            })
+            .collect()
+    }
+
+    /// A legacy (`kaspa-legacy-standard`) account created through the high-level `Wallet` API
+    /// (`create_account` with `AccountCreateArgs::Legacy`) derives the byte-identical gen0 receive
+    /// addresses produced by the audited gen0 derivation (`WalletDerivationManagerV0`) for the same
+    /// 12-word mnemonic.
+    #[tokio::test]
+    async fn legacy_account_reproduces_gen0_addresses() {
+        let store = Wallet::resident_store().unwrap();
+        let wallet = Arc::new(Wallet::try_new(store, None, Some(NetworkId::new(NetworkType::Mainnet))).unwrap());
+        let wallet_secret = Secret::new(b"test-secret".to_vec());
+
+        wallet
+            .create_wallet(
+                &wallet_secret,
+                WalletCreateArgs {
+                    title: None,
+                    filename: None,
+                    encryption_kind: EncryptionKind::XChaCha20Poly1305,
+                    user_hint: None,
+                    overwrite_wallet_storage: false,
+                },
+            )
+            .await
+            .unwrap();
+
+        let prv_key_data_id = wallet
+            .clone()
+            .create_prv_key_data(
+                &wallet_secret,
+                PrvKeyDataCreateArgs::new(None, None, Secret::from(KDX_MNEMONIC), PrvKeyDataVariantKind::Mnemonic),
+            )
+            .await
+            .unwrap();
+
+        let guard = wallet.guard();
+        let guard = guard.lock().await;
+
+        // Create a legacy ("kaspa-legacy-standard") account through the high-level Wallet API.
+        let account = wallet
+            .clone()
+            .create_account(&wallet_secret, AccountCreateArgs::Legacy { prv_key_data_id, account_name: None }, false, &guard)
+            .await
+            .unwrap();
+
+        let audited = audited_gen0_receive_addresses(5);
+        println!("audited gen0 receive[0..5] for KDX_MNEMONIC: {audited:#?}");
+
+        // The legacy account's receive address (index 0), derived through the high-level Wallet
+        // API, must match the audited gen0 derivation byte-for-byte and the pinned golden vector.
+        let account_receive_0 = account.receive_address().unwrap().to_string();
+        assert_eq!(account_receive_0, audited[0], "high-level legacy account receive[0] != audited gen0 receive[0]");
+        assert_eq!(audited[0], KDX_GEN0_RECEIVE_0, "audited gen0 receive[0] drifted from pinned golden vector");
+    }
+}
